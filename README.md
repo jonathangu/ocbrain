@@ -14,7 +14,8 @@ The intended shape is not a new agent runtime. It is a small, auditable pipeline
 
 ## Status
 
-V1 end-to-end local loop is implemented:
+Baseline V0 is implemented. It is useful as a working seed, but it is not the finished
+OpenClawBrain system.
 
 - SQLite ledger
 - safe historical ingest
@@ -24,6 +25,10 @@ V1 end-to-end local loop is implemented:
 - proposal markdown output
 - managed native excerpt output
 - stdio MCP server skeleton
+
+Current active work is the long-running build loop in [docs/BUILD_LOOP.md](docs/BUILD_LOOP.md).
+That loop must prove quality, runtime fit, reviewer ergonomics, and repeatable
+consolidation before `ocbrain` is considered done.
 
 ## Quick Start
 
