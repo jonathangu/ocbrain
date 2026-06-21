@@ -3,13 +3,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ocbrain.db import get_candidate, now_iso
+from ocbrain.db import get_candidate, now_iso, transition_candidate
 
 
-def write_proposal(conn, candidate_id: str, output_dir: Path) -> Path:
+def write_proposal(
+    conn,
+    candidate_id: str,
+    output_dir: Path,
+    *,
+    allow_unapproved: bool = False,
+    actor: str = "ocbrain",
+) -> Path:
     row = get_candidate(conn, candidate_id)
     if row is None:
         raise ValueError(f"candidate not found: {candidate_id}")
+    if row["status"] not in {"approved", "proposed", "applied"} and not allow_unapproved:
+        raise PermissionError(
+            f"candidate {candidate_id} must be approved before proposal generation"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = f"{row['target']}-{candidate_id}.md"
@@ -56,10 +67,15 @@ def write_proposal(conn, candidate_id: str, output_dir: Path) -> Path:
             lines.append(f"- `{loc}`: {item.get('excerpt', '')}")
 
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    conn.execute(
-        "UPDATE candidates SET status = 'proposed', updated_at = ? WHERE id = ?",
-        (now_iso(), candidate_id),
-    )
+    if row["status"] != "proposed":
+        transition_candidate(
+            conn,
+            candidate_id,
+            action="propose",
+            next_status="proposed",
+            actor=actor,
+            reason=f"proposal written to {path}",
+        )
     conn.execute(
         """
         INSERT OR IGNORE INTO artifact_links (
@@ -73,7 +89,7 @@ def write_proposal(conn, candidate_id: str, output_dir: Path) -> Path:
             "proposal",
             str(path),
             now_iso(),
-            "ocbrain",
+            actor,
         ),
     )
     conn.commit()

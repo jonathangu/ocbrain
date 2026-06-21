@@ -35,7 +35,17 @@ def test_ingest_triage_and_propose(tmp_path: Path) -> None:
     candidate_id = list_candidates(conn, target="wiki", limit=1)[0]["id"]
     proposal_dir = tmp_path / "proposals"
     assert (
-        cli.main(["--db", str(db_path), "propose", candidate_id, "--output-dir", str(proposal_dir)])
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "propose",
+                candidate_id,
+                "--output-dir",
+                str(proposal_dir),
+                "--allow-draft",
+            ]
+        )
         == 0
     )
     assert list(proposal_dir.glob("wiki-*.md"))
@@ -192,3 +202,89 @@ def test_rebuild_candidates_stales_generic_drafts(tmp_path: Path) -> None:
 
     assert old_status == "stale"
     assert any("Architecture uses MCP for shared context" in body for body in new_bodies)
+
+
+def test_review_approve_gates_proposal_generation(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    artifact = tmp_path / "brief.md"
+    artifact.write_text("# Brief\n\nArchitecture uses MCP search.\n", encoding="utf-8")
+    assert cli.main(["--db", str(db_path), "ingest", str(artifact)]) == 0
+    assert cli.main(["--db", str(db_path), "triage"]) == 0
+
+    conn = connect(db_path)
+    init_db(conn)
+    candidate_id = list_candidates(conn, target="wiki", limit=1)[0]["id"]
+    proposal_dir = tmp_path / "proposals"
+
+    try:
+        cli.main(["--db", str(db_path), "propose", candidate_id, "--output-dir", str(proposal_dir)])
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("draft proposal should require approval")
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "review",
+                "approve",
+                candidate_id,
+                "--reason",
+                "good source-backed wiki item",
+            ]
+        )
+        == 0
+    )
+    assert (
+        cli.main(
+            ["--db", str(db_path), "propose", candidate_id, "--output-dir", str(proposal_dir)]
+        )
+        == 0
+    )
+    decisions = list(
+        conn.execute("SELECT action, next_status FROM candidate_decisions ORDER BY created_at")
+    )
+    assert [row["action"] for row in decisions] == ["approve", "propose"]
+
+
+def test_review_reject_records_decision(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    seed_candidate = Candidate(
+        target=Target.WIKI,
+        title="Candidate",
+        body="Draft wiki synthesis from source: Architecture uses MCP.",
+        confidence=0.8,
+        evidence=[Evidence(uri="/tmp/source.md", excerpt="Architecture uses MCP.")],
+    )
+    conn = connect(db_path)
+    init_db(conn)
+    candidate_id = insert_candidate(conn, seed_candidate)
+    conn.commit()
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "review",
+                "reject",
+                candidate_id,
+                "--reason",
+                "duplicate",
+            ]
+        )
+        == 0
+    )
+    row = conn.execute("SELECT status FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+    decision = conn.execute(
+        "SELECT action, reason, next_status FROM candidate_decisions WHERE candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row["status"] == "rejected"
+    assert dict(decision) == {
+        "action": "reject",
+        "reason": "duplicate",
+        "next_status": "rejected",
+    }

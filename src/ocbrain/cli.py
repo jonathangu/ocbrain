@@ -15,10 +15,13 @@ from ocbrain.db import (
     init_db,
     insert_candidate,
     iter_untriaged_events,
+    list_candidate_decisions,
     list_candidates,
     mark_event_triaged,
     now_iso,
+    review_groups,
     search,
+    transition_candidate,
     upsert_event,
 )
 from ocbrain.eval import SampleSpec, evaluate, write_reports
@@ -100,7 +103,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     propose_parser.add_argument("candidate_id")
     propose_parser.add_argument("--output-dir", type=Path, default=Path("proposals"))
+    propose_parser.add_argument("--allow-draft", action="store_true")
+    propose_parser.add_argument("--actor", default="ocbrain")
     propose_parser.set_defaults(func=cmd_propose)
+
+    review_parser = subparsers.add_parser("review", help="Review candidate queue")
+    review_subparsers = review_parser.add_subparsers(dest="review_command")
+
+    review_list = review_subparsers.add_parser("list", help="List grouped candidates")
+    review_list.add_argument("--status", default="draft")
+    review_list.add_argument("--target")
+    review_list.add_argument("--limit", type=int, default=20)
+    review_list.set_defaults(func=cmd_review_list)
+
+    review_inspect = review_subparsers.add_parser("inspect", help="Inspect one candidate")
+    review_inspect.add_argument("candidate_id")
+    review_inspect.set_defaults(func=cmd_review_inspect)
+
+    for action in ("approve", "reject", "defer"):
+        action_parser = review_subparsers.add_parser(action, help=f"{action.title()} candidate")
+        action_parser.add_argument("candidate_id")
+        action_parser.add_argument("--actor", default="jon")
+        action_parser.add_argument("--reason", required=True)
+        action_parser.set_defaults(func=cmd_review_transition, review_action=action)
 
     excerpt_parser = subparsers.add_parser("excerpt", help="Write a managed native context block")
     excerpt_parser.add_argument("--output", required=True, type=Path)
@@ -361,8 +386,69 @@ def cmd_backfill_claim_keys(args: argparse.Namespace) -> int:
 
 def cmd_propose(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    path = write_proposal(conn, args.candidate_id, args.output_dir)
+    path = write_proposal(
+        conn,
+        args.candidate_id,
+        args.output_dir,
+        allow_unapproved=args.allow_draft,
+        actor=args.actor,
+    )
     output(args, {"candidate_id": args.candidate_id, "proposal": str(path)})
+    return 0
+
+
+def cmd_review_list(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    rows = [
+        dict(row)
+        for row in review_groups(
+            conn,
+            status=args.status,
+            target=args.target,
+            limit=args.limit,
+        )
+    ]
+    output(args, {"groups": rows})
+    return 0
+
+
+def cmd_review_inspect(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    candidate = conn.execute(
+        "SELECT * FROM candidates WHERE id = ?",
+        (args.candidate_id,),
+    ).fetchone()
+    if candidate is None:
+        raise ValueError(f"candidate not found: {args.candidate_id}")
+    decisions = [dict(row) for row in list_candidate_decisions(conn, args.candidate_id)]
+    output(args, {"candidate": dict(candidate), "decisions": decisions})
+    return 0
+
+
+def cmd_review_transition(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    next_status = {
+        "approve": "approved",
+        "reject": "rejected",
+        "defer": "deferred",
+    }[args.review_action]
+    decision_id = transition_candidate(
+        conn,
+        args.candidate_id,
+        action=args.review_action,
+        next_status=next_status,
+        actor=args.actor,
+        reason=args.reason,
+    )
+    conn.commit()
+    output(
+        args,
+        {
+            "candidate_id": args.candidate_id,
+            "decision_id": decision_id,
+            "status": next_status,
+        },
+    )
     return 0
 
 

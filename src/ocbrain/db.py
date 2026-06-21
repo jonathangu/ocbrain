@@ -95,6 +95,17 @@ CREATE TABLE IF NOT EXISTS invalidations (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS candidate_decisions (
+  id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  previous_status TEXT NOT NULL,
+  next_status TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   doc_id UNINDEXED,
   kind,
@@ -370,6 +381,103 @@ def list_candidates(
 
 def get_candidate(conn: sqlite3.Connection, candidate_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+
+
+def transition_candidate(
+    conn: sqlite3.Connection,
+    candidate_id: str,
+    *,
+    action: str,
+    next_status: str,
+    actor: str,
+    reason: str,
+) -> str:
+    row = get_candidate(conn, candidate_id)
+    if row is None:
+        raise ValueError(f"candidate not found: {candidate_id}")
+    previous_status = row["status"]
+    created_at = now_iso()
+    decision_id = stable_id(
+        "dec",
+        candidate_id,
+        action,
+        previous_status,
+        next_status,
+        actor,
+        reason,
+        created_at,
+    )
+    conn.execute(
+        """
+        INSERT INTO candidate_decisions (
+          id, candidate_id, action, actor, reason, previous_status, next_status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            decision_id,
+            candidate_id,
+            action,
+            actor,
+            reason,
+            previous_status,
+            next_status,
+            created_at,
+        ),
+    )
+    conn.execute(
+        "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
+        (next_status, created_at, candidate_id),
+    )
+    return decision_id
+
+
+def list_candidate_decisions(conn: sqlite3.Connection, candidate_id: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM candidate_decisions
+            WHERE candidate_id = ?
+            ORDER BY created_at ASC
+            """,
+            (candidate_id,),
+        )
+    )
+
+
+def review_groups(
+    conn: sqlite3.Connection,
+    *,
+    status: str = "draft",
+    target: str | None = None,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    clauses = ["status = ?", "target != 'ignore'"]
+    params: list[Any] = [status]
+    if target:
+        clauses.append("target = ?")
+        params.append(target)
+    params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT
+              COALESCE(NULLIF(claim_key, ''), body) AS claim_key,
+              target,
+              COUNT(*) AS count,
+              MIN(id) AS sample_candidate_id,
+              MIN(title) AS sample_title,
+              MIN(risk) AS risk,
+              MIN(confidence) AS confidence
+            FROM candidates
+            WHERE {' AND '.join(clauses)}
+            GROUP BY target, COALESCE(NULLIF(claim_key, ''), body)
+            ORDER BY count DESC, sample_title ASC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
 
 
 def counts(conn: sqlite3.Connection) -> dict[str, Any]:
