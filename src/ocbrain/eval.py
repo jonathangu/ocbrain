@@ -84,6 +84,8 @@ def sample_candidates(conn, spec: SampleSpec) -> list[Any]:
         clauses.append(f"target IN ({placeholders})")
         params.extend(spec.targets)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    clauses.append("status != 'stale'")
+    where = f"WHERE {' AND '.join(clauses)}"
     rows = list(conn.execute(f"SELECT * FROM candidates {where} ORDER BY id", params))
     rng = random.Random(spec.seed)
     if spec.per_target is not None:
@@ -220,6 +222,7 @@ def duplicate_summary(conn) -> dict[str, Any]:
               COUNT(*) AS count
             FROM candidates
             WHERE target != 'ignore'
+              AND status != 'stale'
             GROUP BY target, duplicate_key
             HAVING COUNT(*) > 1
             ORDER BY count DESC
@@ -251,6 +254,7 @@ def temporal_summary(conn) -> dict[str, Any]:
             SELECT id, target, title, created_at
             FROM candidates
             WHERE {clauses}
+              AND status != 'stale'
             ORDER BY created_at ASC
             LIMIT 50
             """,

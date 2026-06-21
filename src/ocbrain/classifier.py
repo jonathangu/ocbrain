@@ -141,8 +141,23 @@ def claim_from_evidence(evidence: list[Evidence], text: str) -> str:
 def _first_meaningful_evidence(path: Path, lines: list[str]) -> list[Evidence]:
     for index, line in enumerate(lines, start=1):
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
+        if stripped and not stripped.startswith("#") and not is_low_value_evidence_line(stripped):
             return [
                 Evidence(uri=str(path), excerpt=stripped[:500], line_start=index, line_end=index)
             ]
     return [Evidence(uri=str(path), excerpt="", line_start=None, line_end=None)]
+
+
+def is_low_value_evidence_line(stripped: str) -> bool:
+    lowered = stripped.lower()
+    if stripped in {"---", "```"}:
+        return True
+    if lowered.startswith(("- **session key**", "- session key", "session key")):
+        return True
+    if lowered.startswith(("- status:", "status:", "- source:", "source:")):
+        return True
+    if lowered.startswith(("pagetype:", "- openclaw home:")):
+        return True
+    if "brain loaded: runtime hook registered" in lowered:
+        return True
+    return lowered in {"- status: `ok`", "status: ok"}

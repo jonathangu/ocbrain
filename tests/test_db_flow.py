@@ -1,8 +1,18 @@
 from pathlib import Path
 
 from ocbrain import cli
-from ocbrain.db import EventInput, connect, counts, init_db, list_candidates, search, upsert_event
+from ocbrain.db import (
+    EventInput,
+    connect,
+    counts,
+    init_db,
+    insert_candidate,
+    list_candidates,
+    search,
+    upsert_event,
+)
 from ocbrain.ingest import IngestOptions, event_from_file
+from ocbrain.schema import Candidate, Evidence, Target
 
 
 def test_ingest_triage_and_propose(tmp_path: Path) -> None:
@@ -131,3 +141,54 @@ def test_search_scope_filter_excludes_private_rows(tmp_path: Path) -> None:
     rows = search(conn, "alpha needle", scopes=("workspace", "project", "public"))
 
     assert {row["doc_id"] for row in rows} == {"evt_workspace"}
+
+
+def test_rebuild_candidates_stales_generic_drafts(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    event = EventInput(
+        id="evt_rebuild",
+        source_type="doc",
+        source_uri="/tmp/rebuild.md",
+        content_hash="hash-rebuild",
+        title="Rebuild",
+        summary="Architecture uses MCP for shared context.",
+        body="Architecture uses MCP for shared context.",
+    )
+    assert upsert_event(conn, event)
+    old_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Old generic",
+            body=(
+                "Artifact appears to contain stable architecture or design synthesis. "
+                "Route to wiki draft rather than long-form memory."
+            ),
+            confidence=0.72,
+            evidence=[Evidence(uri="/tmp/rebuild.md", excerpt=event.summary)],
+        ),
+        event.id,
+    )
+    conn.commit()
+
+    assert cli.main(["--db", str(db_path), "rebuild-candidates"]) == 0
+    old_status = conn.execute(
+        "SELECT status FROM candidates WHERE id = ?",
+        (old_id,),
+    ).fetchone()[0]
+    assert old_status == "draft"
+
+    assert cli.main(["--db", str(db_path), "rebuild-candidates", "--apply"]) == 0
+    old_status = conn.execute("SELECT status FROM candidates WHERE id = ?", (old_id,)).fetchone()[0]
+    new_bodies = [
+        row["body"]
+        for row in conn.execute(
+            "SELECT body FROM candidates WHERE event_id = ? AND status = 'draft'",
+            (event.id,),
+        )
+    ]
+
+    assert old_status == "stale"
+    assert any("Architecture uses MCP for shared context" in body for body in new_bodies)

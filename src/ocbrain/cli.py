@@ -7,6 +7,7 @@ from pathlib import Path
 from ocbrain.classifier import classify_event, classify_text
 from ocbrain.db import (
     DEFAULT_DB_PATH,
+    EventInput,
     add_evidence,
     backfill_candidate_claim_keys,
     connect,
@@ -16,6 +17,7 @@ from ocbrain.db import (
     iter_untriaged_events,
     list_candidates,
     mark_event_triaged,
+    now_iso,
     search,
     upsert_event,
 )
@@ -61,6 +63,14 @@ def build_parser() -> argparse.ArgumentParser:
     triage_parser = subparsers.add_parser("triage", help="Classify untriaged events")
     triage_parser.add_argument("--limit", type=int)
     triage_parser.set_defaults(func=cmd_triage)
+
+    rebuild_parser = subparsers.add_parser(
+        "rebuild-candidates",
+        help="Reclassify events and stale old generic draft candidates",
+    )
+    rebuild_parser.add_argument("--limit", type=int)
+    rebuild_parser.add_argument("--apply", action="store_true")
+    rebuild_parser.set_defaults(func=cmd_rebuild_candidates)
 
     search_parser = subparsers.add_parser("search", help="Search ingested history")
     search_parser.add_argument("query")
@@ -234,6 +244,87 @@ def cmd_triage(args: argparse.Namespace) -> int:
         {"events_triaged": len(events), "candidates_inserted": inserted, "counts": counts(conn)},
     )
     return 0
+
+
+def cmd_rebuild_candidates(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    events = list(
+        conn.execute("SELECT * FROM events ORDER BY ingested_at ASC LIMIT ?", (args.limit or -1,))
+    )
+    generic_marked_stale = candidates_inserted = 0
+    for event in events:
+        event_input = event_input_from_row(event)
+        candidates = classify_event(event_input)
+        generic_ids = [
+            row["id"]
+            for row in conn.execute(
+                """
+                SELECT id, body
+                FROM candidates
+                WHERE event_id = ? AND status = 'draft'
+                """,
+                (event["id"],),
+            )
+            if is_generic_candidate_body(row["body"])
+        ]
+        if args.apply:
+            for candidate_id in generic_ids:
+                conn.execute(
+                    "UPDATE candidates SET status = 'stale', updated_at = ? WHERE id = ?",
+                    (now_iso(), candidate_id),
+                )
+            for candidate in candidates:
+                if insert_candidate(conn, candidate, event["id"]):
+                    candidates_inserted += 1
+        generic_marked_stale += len(generic_ids)
+    if args.apply:
+        conn.commit()
+    output(
+        args,
+        {
+            "apply": args.apply,
+            "events_seen": len(events),
+            "generic_candidates_to_stale": generic_marked_stale,
+            "candidates_inserted": candidates_inserted,
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def event_input_from_row(row) -> EventInput:
+    return EventInput(
+        id=row["id"],
+        source_type=row["source_type"],
+        source_uri=row["source_uri"],
+        content_hash=row["content_hash"],
+        title=row["title"],
+        summary=row["summary"],
+        body=row["body"],
+        scope=row["scope"],
+        metadata=json.loads(row["metadata_json"] or "{}"),
+        created_at=row["created_at"],
+    )
+
+
+def is_generic_candidate_body(body: str) -> bool:
+    lowered = body.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "artifact appears to",
+            "route to",
+            "create a patch suggestion only",
+            "extract only concise",
+            "no strong memory/wiki/skill/policy",
+            "from source: ---",
+            "from source: - **session key**",
+            "from source: - status:",
+            "from source: pagetype:",
+            "from source: - openclaw home:",
+            "brain loaded: runtime hook registered",
+        )
+    )
 
 
 def cmd_search(args: argparse.Namespace) -> int:

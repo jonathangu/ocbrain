@@ -35,3 +35,23 @@ def test_policy_language_is_high_risk(tmp_path: Path) -> None:
     policy = next(candidate for candidate in candidates if candidate.target == Target.POLICY)
     assert policy.risk == "high"
     assert "Never auto-apply policy or hooks" in policy.body
+
+
+def test_frontmatter_is_not_used_as_claim(tmp_path: Path) -> None:
+    artifact = tmp_path / "brief.md"
+    artifact.write_text(
+        "---\n"
+        "status: ok\n"
+        "pageType: source\n"
+        "- openclaw home: `/Users/guclaw/.openclaw`\n"
+        "---\n"
+        "# Brief\n\n"
+        "Architecture uses MCP as the shared access layer.\n",
+        encoding="utf-8",
+    )
+
+    candidates = classify_artifact(artifact)
+
+    wiki = next(candidate for candidate in candidates if candidate.target == Target.WIKI)
+    assert "Architecture uses MCP" in wiki.body
+    assert "source: ---" not in wiki.body
