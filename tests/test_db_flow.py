@@ -47,3 +47,30 @@ def test_ingest_redacts_secret_like_values(tmp_path: Path) -> None:
     assert event is not None
     assert "should_not_survive" not in event.body
     assert "[REDACTED]" in event.body
+
+
+def test_closeout_store_classifies_redacted_text(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    artifact = tmp_path / "policy.md"
+    artifact.write_text(
+        "# Rule\n\nNever store api_key = should_not_survive in evidence.\n",
+        encoding="utf-8",
+    )
+
+    assert cli.main(["--db", str(db_path), "closeout", "--input", str(artifact), "--store"]) == 0
+
+    conn = connect(db_path)
+    init_db(conn)
+    rows = list_candidates(conn, target="policy", limit=5)
+    assert rows
+    assert "should_not_survive" not in rows[0]["evidence_json"]
+    assert "[REDACTED]" in rows[0]["evidence_json"]
+
+
+def test_search_handles_punctuation_query(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    artifact = tmp_path / "brief.md"
+    artifact.write_text("# Brief\n\nArchitecture uses MCP search.\n", encoding="utf-8")
+
+    assert cli.main(["--db", str(db_path), "ingest", str(artifact)]) == 0
+    assert cli.main(["--db", str(db_path), "search", '"architecture:" NEAR/mcp']) == 0

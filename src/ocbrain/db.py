@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -253,6 +254,9 @@ def iter_untriaged_events(
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[sqlite3.Row]:
+    normalized_query = normalize_fts_query(query)
+    if not normalized_query:
+        return []
     return list(
         conn.execute(
             """
@@ -267,9 +271,14 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[sqlite
             ORDER BY rank
             LIMIT ?
             """,
-            (query, limit),
+            (normalized_query, limit),
         )
     )
+
+
+def normalize_fts_query(query: str) -> str:
+    terms = re.findall(r"[\w-]{2,}", query.lower())
+    return " OR ".join(f'"{term}"' for term in terms[:8])
 
 
 def list_candidates(

@@ -22,9 +22,10 @@ OpenClawBrain system.
 - deterministic triage
 - FTS search
 - digest/counts
+- read-only evaluation harness
 - proposal markdown output
 - managed native excerpt output
-- stdio MCP server skeleton
+- stdio MCP server skeleton, read-only by default
 
 Current active work is the long-running build loop in [docs/BUILD_LOOP.md](docs/BUILD_LOOP.md).
 That loop must prove quality, runtime fit, reviewer ergonomics, and repeatable
@@ -33,7 +34,7 @@ consolidation before `ocbrain` is considered done.
 ## Quick Start
 
 ```bash
-python -m venv .venv
+/opt/homebrew/bin/python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ocbrain closeout --input ../artifacts/openclawbrain-lite-validated-synthesis-2026-06-21.md
@@ -55,6 +56,17 @@ ocbrain --db data/ocbrain.sqlite --pretty digest
 
 The default historical profile reads safe text-like sources from workspace memory, artifacts, task artifacts/status, selected sessions, and memory-wiki. It excludes secret-bearing config names, databases, build directories, package caches, `.env`, keys, tokens, and credentials by default.
 
+## Evaluation
+
+Run the local quality and safety harness before trusting candidates:
+
+```bash
+ocbrain --db data/ocbrain.sqlite eval --per-target 40 --output-json reports/eval.json --output-md reports/eval.md
+ocbrain --db data/ocbrain.sqlite eval --sample-size 10000 --fail-on-leak --output-json reports/leak-scan.json
+```
+
+The first harness is intentionally strict about duplicate candidate templates, generic candidate bodies, stale operational facts, search index consistency, and probable secret leakage.
+
 ## Proposal And Excerpt Output
 
 ```bash
@@ -74,8 +86,9 @@ The MCP server currently exposes:
 - `brain.search`
 - `brain.digest`
 - `brain.get`
-- `brain.propose`
 - `brain://digest/current`
+
+`brain.propose` is write-capable and hidden unless the server is launched with `--allow-writes`.
 
 ## Principles
 

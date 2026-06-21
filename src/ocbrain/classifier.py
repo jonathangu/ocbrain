@@ -2,19 +2,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ocbrain.db import EventInput
+from ocbrain.ingest import IngestOptions, event_from_file
 from ocbrain.schema import Candidate, Evidence, Risk, Target
 from ocbrain.text import title_from_text
 
 
 def classify_artifact(path: Path) -> list[Candidate]:
-    """Return deterministic dry-run candidates for a markdown artifact.
+    """Return deterministic candidates from a redacted artifact envelope.
 
     This is intentionally conservative. The first real implementation can swap this
     heuristic pass for an LLM-backed classifier while keeping the output contract.
     """
-    text = path.read_text(encoding="utf-8")
-    evidence = _first_meaningful_evidence(path, text.splitlines())
-    return classify_text(text, evidence=evidence, title_hint=path.name)
+    event = event_from_file(path, IngestOptions())
+    if event is None:
+        return []
+    return classify_event(event)
+
+
+def classify_event(event: EventInput) -> list[Candidate]:
+    evidence = _first_meaningful_evidence(Path(event.source_uri), event.body.splitlines())
+    return classify_text(
+        event.body,
+        evidence=evidence,
+        title_hint=event.title,
+        source_type=event.source_type,
+    )
 
 
 def classify_text(

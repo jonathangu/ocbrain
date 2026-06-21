@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from ocbrain.classifier import classify_artifact, classify_text
+from ocbrain.classifier import classify_event, classify_text
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     add_evidence,
@@ -18,6 +18,7 @@ from ocbrain.db import (
     search,
     upsert_event,
 )
+from ocbrain.eval import SampleSpec, evaluate, write_reports
 from ocbrain.excerpt import write_excerpt
 from ocbrain.ingest import (
     IngestOptions,
@@ -92,7 +93,24 @@ def build_parser() -> argparse.ArgumentParser:
     excerpt_parser.add_argument("--limit", type=int, default=12)
     excerpt_parser.set_defaults(func=cmd_excerpt)
 
+    eval_parser = subparsers.add_parser("eval", help="Score candidate quality and safety")
+    eval_parser.add_argument("--sample-size", type=int, default=100)
+    eval_parser.add_argument("--per-target", type=int)
+    eval_parser.add_argument("--seed", type=int, default=20260621)
+    eval_parser.add_argument("--targets", help="Comma-separated target filter")
+    eval_parser.add_argument("--output-json", type=Path)
+    eval_parser.add_argument("--output-md", type=Path)
+    eval_parser.add_argument("--sample-output-limit", type=int, default=200)
+    eval_parser.add_argument("--fail-under", type=float)
+    eval_parser.add_argument("--fail-on-leak", action="store_true")
+    eval_parser.set_defaults(func=cmd_eval)
+
     mcp_parser = subparsers.add_parser("mcp", help="Run stdio MCP server")
+    mcp_parser.add_argument(
+        "--allow-writes",
+        action="store_true",
+        help="Expose write-capable MCP tools; off by default",
+    )
     mcp_parser.set_defaults(func=cmd_mcp)
 
     # Compatibility for the initial ocbrain-closeout script usage.
@@ -130,12 +148,12 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 
 def cmd_closeout(args: argparse.Namespace) -> int:
-    candidates = classify_artifact(args.input)
+    options = IngestOptions()
+    event = event_from_file(args.input, options)
+    candidates = classify_event(event) if event else []
     payload = {"input": str(args.input), "candidates": [item.to_dict() for item in candidates]}
     if args.store:
         conn = open_db(args)
-        options = IngestOptions()
-        event = event_from_file(args.input, options)
         stored_ids: list[str] = []
         if event and upsert_event(conn, event):
             for candidate in candidates:
@@ -241,8 +259,40 @@ def cmd_excerpt(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    targets = tuple(item.strip() for item in (args.targets or "").split(",") if item.strip())
+    spec = SampleSpec(
+        sample_size=args.sample_size,
+        seed=args.seed,
+        targets=targets,
+        per_target=args.per_target,
+    )
+    report = evaluate(
+        conn,
+        spec,
+        db_label=str(args.db),
+        sample_output_limit=args.sample_output_limit,
+    )
+    write_reports(report, output_json=args.output_json, output_md=args.output_md)
+    if args.output_json or args.output_md:
+        payload = {"report": report["summary"]}
+        if args.output_md:
+            payload["output_md"] = str(args.output_md)
+    else:
+        payload = report
+    if args.output_json:
+        payload = {**payload, "output_json": str(args.output_json)}
+    output(args, payload)
+    if args.fail_on_leak and report["leakage"]["probable_secret_count"]:
+        return 1
+    if args.fail_under is not None and report["summary"]["overall_score"] < args.fail_under:
+        return 1
+    return 0
+
+
 def cmd_mcp(args: argparse.Namespace) -> int:
-    return serve(args.db)
+    return serve(args.db, allow_writes=args.allow_writes)
 
 
 if __name__ == "__main__":
