@@ -63,7 +63,7 @@ def handle_request(
             if name == "brain.search":
                 query = require_string(arguments, "query")
                 limit = min(max(int(arguments.get("limit", 10)), 1), 50)
-                rows = search(conn, query, limit)
+                rows = search(conn, query, limit, scopes=("workspace", "project", "public"))
                 result = {
                     "content": [{"type": "text", "text": json.dumps([dict(row) for row in rows])}]
                 }
@@ -73,6 +73,8 @@ def handle_request(
                 row = get_candidate(conn, require_string(arguments, "id"))
                 if row is None:
                     raise ValueError(f"candidate not found: {arguments['id']}")
+                if row["scope"] == "private" and not arguments.get("include_private"):
+                    raise PermissionError("private candidate requires explicit include_private")
                 result = {"content": [{"type": "text", "text": json.dumps(dict(row))}]}
             elif name == "brain.propose":
                 if not allow_writes:

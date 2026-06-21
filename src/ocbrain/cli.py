@@ -8,6 +8,7 @@ from ocbrain.classifier import classify_event, classify_text
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     add_evidence,
+    backfill_candidate_claim_keys,
     connect,
     counts,
     init_db,
@@ -64,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser = subparsers.add_parser("search", help="Search ingested history")
     search_parser.add_argument("query")
     search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--include-private", action="store_true")
     search_parser.set_defaults(func=cmd_search)
 
     digest_parser = subparsers.add_parser("digest", help="Show ledger counts")
@@ -72,8 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
     candidates_parser = subparsers.add_parser("candidates", help="List candidates")
     candidates_parser.add_argument("--target")
     candidates_parser.add_argument("--status")
+    candidates_parser.add_argument("--scope")
     candidates_parser.add_argument("--limit", type=int, default=20)
     candidates_parser.set_defaults(func=cmd_candidates)
+
+    backfill_parser = subparsers.add_parser(
+        "backfill-claim-keys",
+        help="Derive claim keys for existing candidates from redacted evidence",
+    )
+    backfill_parser.add_argument("--limit", type=int)
+    backfill_parser.set_defaults(func=cmd_backfill_claim_keys)
 
     propose_parser = subparsers.add_parser(
         "propose", help="Write proposal markdown for a candidate"
@@ -90,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="generic",
     )
     excerpt_parser.add_argument("--scope")
+    excerpt_parser.add_argument("--status")
     excerpt_parser.add_argument("--limit", type=int, default=12)
     excerpt_parser.set_defaults(func=cmd_excerpt)
 
@@ -227,7 +238,8 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    rows = [dict(row) for row in search(conn, args.query, args.limit)]
+    scopes = None if args.include_private else ("workspace", "project", "public")
+    rows = [dict(row) for row in search(conn, args.query, args.limit, scopes=scopes)]
     output(args, {"query": args.query, "results": rows})
     return 0
 
@@ -240,8 +252,19 @@ def cmd_digest(args: argparse.Namespace) -> int:
 
 def cmd_candidates(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    rows = [dict(row) for row in list_candidates(conn, args.target, args.status, args.limit)]
+    rows = [
+        dict(row)
+        for row in list_candidates(conn, args.target, args.status, args.scope, args.limit)
+    ]
     output(args, {"candidates": rows})
+    return 0
+
+
+def cmd_backfill_claim_keys(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    updated = backfill_candidate_claim_keys(conn, args.limit)
+    conn.commit()
+    output(args, {"updated": updated, "counts": counts(conn)})
     return 0
 
 
@@ -254,7 +277,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
 
 def cmd_excerpt(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    path = write_excerpt(conn, args.output, args.runtime, args.scope, args.limit)
+    path = write_excerpt(conn, args.output, args.runtime, args.scope, args.limit, args.status)
     output(args, {"runtime": args.runtime, "output": str(path)})
     return 0
 

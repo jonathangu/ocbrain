@@ -60,6 +60,12 @@ def compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def claim_key(text: str, *, limit: int = 160) -> str:
+    normalized = compact_whitespace(text.lower())
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+    return normalized[:limit]
+
+
 def title_from_text(text: str, fallback: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()

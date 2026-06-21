@@ -12,6 +12,7 @@ from typing import Any
 
 from ocbrain.ids import stable_id
 from ocbrain.schema import Candidate, Evidence
+from ocbrain.text import claim_key
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
 
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   scope TEXT NOT NULL,
   risk TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'draft',
+  claim_key TEXT NOT NULL DEFAULT '',
   hints_json TEXT NOT NULL DEFAULT '[]',
   evidence_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
@@ -130,7 +132,14 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    ensure_column(conn, "candidates", "claim_key", "TEXT NOT NULL DEFAULT ''")
     conn.commit()
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def upsert_event(conn: sqlite3.Connection, event: EventInput) -> bool:
@@ -214,9 +223,9 @@ def insert_candidate(
             """
             INSERT INTO candidates (
               id, event_id, target, title, body, confidence, scope, risk,
-              hints_json, evidence_json, created_at, updated_at
+              claim_key, hints_json, evidence_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 candidate_id,
@@ -227,6 +236,7 @@ def insert_candidate(
                 candidate.confidence,
                 candidate.scope.value,
                 candidate.risk.value,
+                candidate.claim_key or claim_key(f"{candidate.target.value} {candidate.body}"),
                 json.dumps(candidate.hints, sort_keys=True),
                 json.dumps([item.to_dict() for item in candidate.evidence], sort_keys=True),
                 timestamp,
@@ -236,6 +246,35 @@ def insert_candidate(
     except sqlite3.IntegrityError:
         return None
     return candidate_id
+
+
+def backfill_candidate_claim_keys(conn: sqlite3.Connection, limit: int | None = None) -> int:
+    sql = """
+        SELECT id, target, body, evidence_json
+        FROM candidates
+        WHERE claim_key IS NULL OR claim_key = ''
+        ORDER BY created_at ASC
+    """
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    updated = 0
+    for row in conn.execute(sql, params):
+        evidence = json.loads(row["evidence_json"] or "[]")
+        excerpt = ""
+        for item in evidence:
+            excerpt = item.get("excerpt", "")
+            if excerpt:
+                break
+        key_source = excerpt or row["body"]
+        key = claim_key(f"{row['target']} {key_source}")
+        conn.execute(
+            "UPDATE candidates SET claim_key = ?, updated_at = ? WHERE id = ?",
+            (key, now_iso(), row["id"]),
+        )
+        updated += 1
+    return updated
 
 
 def mark_event_triaged(conn: sqlite3.Connection, event_id: str) -> None:
@@ -253,25 +292,40 @@ def iter_untriaged_events(
     yield from conn.execute(sql, params)
 
 
-def search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[sqlite3.Row]:
+def search(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 10,
+    scopes: tuple[str, ...] | None = None,
+) -> list[sqlite3.Row]:
     normalized_query = normalize_fts_query(query)
     if not normalized_query:
         return []
+    scope_clause = ""
+    params: list[Any] = [normalized_query]
+    if scopes:
+        placeholders = ",".join("?" for _ in scopes)
+        scope_clause = f"AND events.scope IN ({placeholders})"
+        params.extend(scopes)
+    params.append(limit)
     return list(
         conn.execute(
-            """
+            f"""
             SELECT
-              doc_id,
-              kind,
-              title,
+              search_index.doc_id,
+              search_index.kind,
+              search_index.title,
               snippet(search_index, 3, '[', ']', ' ... ', 12) AS snippet,
-              path
+              search_index.path,
+              events.scope
             FROM search_index
+            JOIN events ON events.id = search_index.doc_id
             WHERE search_index MATCH ?
+            {scope_clause}
             ORDER BY rank
             LIMIT ?
             """,
-            (normalized_query, limit),
+            params,
         )
     )
 
@@ -285,6 +339,7 @@ def list_candidates(
     conn: sqlite3.Connection,
     target: str | None = None,
     status: str | None = None,
+    scope: str | None = None,
     limit: int = 20,
 ) -> list[sqlite3.Row]:
     clauses: list[str] = []
@@ -295,6 +350,9 @@ def list_candidates(
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if scope:
+        clauses.append("scope = ?")
+        params.append(scope)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     params.append(limit)
     return list(

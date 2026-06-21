@@ -47,6 +47,7 @@ class Candidate:
     risk: Risk = Risk.LOW
     evidence: list[Evidence] = field(default_factory=list)
     hints: list[str] = field(default_factory=list)
+    claim_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

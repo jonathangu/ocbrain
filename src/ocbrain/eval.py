@@ -210,9 +210,17 @@ def duplicate_summary(conn) -> dict[str, Any]:
     rows = list(
         conn.execute(
             """
-            SELECT target, body, COUNT(*) AS count
+            SELECT
+              target,
+              CASE
+                WHEN claim_key IS NOT NULL AND claim_key != '' THEN claim_key
+                ELSE body
+              END AS duplicate_key,
+              MIN(body) AS body,
+              COUNT(*) AS count
             FROM candidates
-            GROUP BY target, body
+            WHERE target != 'ignore'
+            GROUP BY target, duplicate_key
             HAVING COUNT(*) > 1
             ORDER BY count DESC
             LIMIT 20

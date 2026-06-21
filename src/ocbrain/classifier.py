@@ -5,7 +5,7 @@ from pathlib import Path
 from ocbrain.db import EventInput
 from ocbrain.ingest import IngestOptions, event_from_file
 from ocbrain.schema import Candidate, Evidence, Risk, Target
-from ocbrain.text import title_from_text
+from ocbrain.text import claim_key, compact_whitespace, title_from_text
 
 
 def classify_artifact(path: Path) -> list[Candidate]:
@@ -39,6 +39,7 @@ def classify_text(
 ) -> list[Candidate]:
     title = title_from_text(text, title_hint)
     candidates: list[Candidate] = []
+    claim = claim_from_evidence(evidence, text)
 
     lower = text.lower()
     if any(
@@ -57,13 +58,11 @@ def classify_text(
             Candidate(
                 target=Target.WIKI,
                 title=f"Wiki synthesis: {title}",
-                body=(
-                    "Artifact appears to contain stable architecture or design synthesis. "
-                    "Route to wiki draft rather than long-form memory."
-                ),
+                body=f"Draft wiki synthesis from source: {claim}",
                 confidence=0.72,
                 evidence=evidence,
                 hints=["draft-only", "preserve provenance"],
+                claim_key=claim_key(f"wiki {claim}"),
             )
         )
 
@@ -72,12 +71,10 @@ def classify_text(
             Candidate(
                 target=Target.MEMORY,
                 title=f"Operational fact candidate: {title}",
-                body=(
-                    "Artifact appears to include dated operational state or version facts. "
-                    "Extract only concise source-backed facts."
-                ),
+                body=f"Stage operational fact from source: {claim}",
                 confidence=0.68,
                 evidence=evidence,
+                claim_key=claim_key(f"memory {claim}"),
             )
         )
 
@@ -89,14 +86,12 @@ def classify_text(
             Candidate(
                 target=Target.SKILL,
                 title=f"Skill proposal candidate: {title}",
-                body=(
-                    "Artifact appears to describe repeatable behavior. "
-                    "Route through Skill Workshop as a pending proposal."
-                ),
+                body=f"Draft repeatable workflow from source: {claim}",
                 confidence=0.62,
                 risk=Risk.MEDIUM,
                 evidence=evidence,
                 hints=["proposal-first", "do-not-auto-apply"],
+                claim_key=claim_key(f"skill {claim}"),
             )
         )
 
@@ -107,14 +102,12 @@ def classify_text(
             Candidate(
                 target=Target.POLICY,
                 title=f"Constraint candidate: {title}",
-                body=(
-                    "Artifact appears to contain constraints or enforcement language. "
-                    "Create a patch suggestion only; do not auto-apply."
-                ),
+                body=f"Patch-suggestion constraint from source: {claim}",
                 confidence=0.55,
                 risk=Risk.HIGH,
                 evidence=evidence,
                 hints=["patch-suggestion-only"],
+                claim_key=claim_key(f"policy {claim}"),
             )
         )
 
@@ -126,6 +119,7 @@ def classify_text(
                 body="No strong memory/wiki/skill/policy candidate was detected.",
                 confidence=0.5,
                 evidence=evidence,
+                claim_key=claim_key(f"ignore {claim}"),
             )
         )
 
@@ -134,6 +128,14 @@ def classify_text(
             candidate.hints.append("session-derived")
 
     return candidates
+
+
+def claim_from_evidence(evidence: list[Evidence], text: str) -> str:
+    for item in evidence:
+        excerpt = compact_whitespace(item.excerpt)
+        if excerpt:
+            return excerpt[:320]
+    return compact_whitespace(text)[:320]
 
 
 def _first_meaningful_evidence(path: Path, lines: list[str]) -> list[Evidence]:

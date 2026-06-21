@@ -12,7 +12,9 @@ def test_design_artifact_routes_to_wiki(tmp_path: Path) -> None:
 
     candidates = classify_artifact(artifact)
 
-    assert any(candidate.target == Target.WIKI for candidate in candidates)
+    wiki = next(candidate for candidate in candidates if candidate.target == Target.WIKI)
+    assert "Architecture uses MCP" in wiki.body
+    assert wiki.claim_key
 
 
 def test_empty_noise_routes_to_ignore(tmp_path: Path) -> None:
@@ -32,3 +34,4 @@ def test_policy_language_is_high_risk(tmp_path: Path) -> None:
 
     policy = next(candidate for candidate in candidates if candidate.target == Target.POLICY)
     assert policy.risk == "high"
+    assert "Never auto-apply policy or hooks" in policy.body
