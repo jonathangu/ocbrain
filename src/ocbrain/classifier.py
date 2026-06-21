@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ocbrain.schema import Candidate, Evidence, Risk, Target
+from ocbrain.text import title_from_text
 
 
 def classify_artifact(path: Path) -> list[Candidate]:
@@ -12,16 +13,37 @@ def classify_artifact(path: Path) -> list[Candidate]:
     heuristic pass for an LLM-backed classifier while keeping the output contract.
     """
     text = path.read_text(encoding="utf-8")
-    lines = text.splitlines()
-    evidence = _first_meaningful_evidence(path, lines)
+    evidence = _first_meaningful_evidence(path, text.splitlines())
+    return classify_text(text, evidence=evidence, title_hint=path.name)
+
+
+def classify_text(
+    text: str,
+    *,
+    evidence: list[Evidence],
+    title_hint: str = "artifact",
+    source_type: str | None = None,
+) -> list[Candidate]:
+    title = title_from_text(text, title_hint)
     candidates: list[Candidate] = []
 
     lower = text.lower()
-    if any(token in lower for token in ("architecture", "design", "mcp", "wiki", "skill")):
+    if any(
+        token in lower
+        for token in (
+            "architecture",
+            "design",
+            "mcp",
+            "wiki",
+            "shared brain",
+            "openclawbrain",
+            "consolidation",
+        )
+    ):
         candidates.append(
             Candidate(
                 target=Target.WIKI,
-                title="Architecture synthesis candidate",
+                title=f"Wiki synthesis: {title}",
                 body=(
                     "Artifact appears to contain stable architecture or design synthesis. "
                     "Route to wiki draft rather than long-form memory."
@@ -36,7 +58,7 @@ def classify_artifact(path: Path) -> list[Candidate]:
         candidates.append(
             Candidate(
                 target=Target.MEMORY,
-                title="Operational version/state facts",
+                title=f"Operational fact candidate: {title}",
                 body=(
                     "Artifact appears to include dated operational state or version facts. "
                     "Extract only concise source-backed facts."
@@ -46,11 +68,14 @@ def classify_artifact(path: Path) -> list[Candidate]:
             )
         )
 
-    if any(token in lower for token in ("repeatable", "workflow", "procedure", "skill proposal")):
+    if any(
+        token in lower
+        for token in ("repeatable", "workflow", "procedure", "skill proposal", "runbook")
+    ):
         candidates.append(
             Candidate(
                 target=Target.SKILL,
-                title="Repeatable workflow candidate",
+                title=f"Skill proposal candidate: {title}",
                 body=(
                     "Artifact appears to describe repeatable behavior. "
                     "Route through Skill Workshop as a pending proposal."
@@ -62,11 +87,13 @@ def classify_artifact(path: Path) -> list[Candidate]:
             )
         )
 
-    if any(token in lower for token in ("must", "never", "policy", "constraint", "hook")):
+    if any(
+        token in lower for token in ("must", "never", "policy", "constraint", "hook", "forbid")
+    ):
         candidates.append(
             Candidate(
                 target=Target.POLICY,
-                title="Constraint candidate",
+                title=f"Constraint candidate: {title}",
                 body=(
                     "Artifact appears to contain constraints or enforcement language. "
                     "Create a patch suggestion only; do not auto-apply."
@@ -82,12 +109,16 @@ def classify_artifact(path: Path) -> list[Candidate]:
         candidates.append(
             Candidate(
                 target=Target.IGNORE,
-                title="No durable candidate found",
+                title=f"No durable candidate: {title}",
                 body="No strong memory/wiki/skill/policy candidate was detected.",
                 confidence=0.5,
                 evidence=evidence,
             )
         )
+
+    if source_type == "session":
+        for candidate in candidates:
+            candidate.hints.append("session-derived")
 
     return candidates
 
@@ -96,5 +127,7 @@ def _first_meaningful_evidence(path: Path, lines: list[str]) -> list[Evidence]:
     for index, line in enumerate(lines, start=1):
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            return [Evidence(uri=str(path), excerpt=stripped[:500], line_start=index, line_end=index)]
+            return [
+                Evidence(uri=str(path), excerpt=stripped[:500], line_start=index, line_end=index)
+            ]
     return [Evidence(uri=str(path), excerpt="", line_start=None, line_end=None)]

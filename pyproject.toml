@@ -19,6 +19,7 @@ dev = [
 ]
 
 [project.scripts]
+ocbrain = "ocbrain.cli:main"
 ocbrain-closeout = "ocbrain.cli:main"
 
 [tool.pytest.ini_options]
