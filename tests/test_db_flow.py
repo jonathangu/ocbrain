@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from ocbrain import cli
@@ -288,3 +289,190 @@ def test_review_reject_records_decision(tmp_path: Path) -> None:
         "reason": "duplicate",
         "next_status": "rejected",
     }
+
+
+def test_review_list_filters_low_value_groups_by_default(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    low_value = Candidate(
+        target=Target.WIKI,
+        title="Wiki synthesis: STATUS ok",
+        body="Draft wiki synthesis from source: STATUS ok",
+        confidence=0.72,
+        evidence=[Evidence(uri="/tmp/status.md", excerpt="STATUS ok")],
+        claim_key="wiki status ok",
+    )
+    useful = Candidate(
+        target=Target.WIKI,
+        title="Wiki synthesis: MCP search",
+        body="Draft wiki synthesis from source: MCP search supports compact retrieval.",
+        confidence=0.72,
+        evidence=[Evidence(uri="/tmp/mcp.md", excerpt="MCP search supports compact retrieval.")],
+        claim_key="wiki mcp search supports compact retrieval",
+    )
+    assert insert_candidate(conn, low_value)
+    assert insert_candidate(conn, useful)
+    conn.commit()
+
+    assert cli.main(["--db", str(db_path), "--pretty", "review", "list"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [group["claim_key"] for group in payload["groups"]] == [
+        "wiki mcp search supports compact retrieval"
+    ]
+
+    assert (
+        cli.main(["--db", str(db_path), "--pretty", "review", "list", "--include-low-value"])
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert {group["claim_key"] for group in payload["groups"]} == {
+        "wiki status ok",
+        "wiki mcp search supports compact retrieval",
+    }
+
+
+def test_review_group_transition_records_each_candidate(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    for index, uri in enumerate(("/tmp/a.md", "/tmp/b.md"), start=1):
+        assert insert_candidate(
+            conn,
+            Candidate(
+                target=Target.WIKI,
+                title=f"Wiki synthesis: MCP search {index}",
+                body=(
+                    "Draft wiki synthesis from source: MCP search supports "
+                    f"compact retrieval example {index}."
+                ),
+                confidence=0.72,
+                evidence=[
+                    Evidence(uri=uri, excerpt=f"MCP search supports compact retrieval {index}.")
+                ],
+                claim_key="wiki mcp search supports compact retrieval",
+            ),
+        )
+    conn.commit()
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "review",
+                "approve-group",
+                "--target",
+                "wiki",
+                "--claim-key",
+                "wiki mcp search supports compact retrieval",
+                "--reason",
+                "reviewed duplicate source-backed group",
+            ]
+        )
+        == 0
+    )
+
+    statuses = [row["status"] for row in conn.execute("SELECT status FROM candidates")]
+    decisions = list(conn.execute("SELECT action, next_status FROM candidate_decisions"))
+    assert statuses == ["approved", "approved"]
+    assert [row["action"] for row in decisions] == ["approve_group", "approve_group"]
+    assert {row["next_status"] for row in decisions} == {"approved"}
+
+
+def test_excerpt_defaults_to_reviewed_candidates(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    draft_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Draft item",
+            body="Draft wiki synthesis from source: still needs review.",
+            confidence=0.72,
+            evidence=[Evidence(uri="/tmp/draft.md", excerpt="still needs review")],
+        ),
+    )
+    approved_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Approved item",
+            body="Draft wiki synthesis from source: reviewed context.",
+            confidence=0.72,
+            evidence=[Evidence(uri="/tmp/approved.md", excerpt="reviewed context")],
+        ),
+    )
+    conn.execute("UPDATE candidates SET status = 'approved' WHERE id = ?", (approved_id,))
+    conn.commit()
+
+    excerpt = tmp_path / "AGENTS.md"
+    assert (
+        cli.main(["--db", str(db_path), "excerpt", "--runtime", "codex", "--output", str(excerpt)])
+        == 0
+    )
+    text = excerpt.read_text(encoding="utf-8")
+    assert approved_id in text
+    assert draft_id not in text
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "excerpt",
+                "--runtime",
+                "codex",
+                "--output",
+                str(excerpt),
+                "--include-draft",
+            ]
+        )
+        == 0
+    )
+    text = excerpt.read_text(encoding="utf-8")
+    assert approved_id in text
+    assert draft_id in text
+
+
+def test_proposal_output_is_idempotent_after_approval(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    candidate_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Approved item",
+            body="Draft wiki synthesis from source: reviewed context.",
+            confidence=0.72,
+            evidence=[Evidence(uri="/tmp/approved.md", excerpt="reviewed context")],
+        ),
+    )
+    conn.execute("UPDATE candidates SET status = 'approved' WHERE id = ?", (candidate_id,))
+    conn.commit()
+    proposal_dir = tmp_path / "proposals"
+
+    assert (
+        cli.main(
+            ["--db", str(db_path), "propose", candidate_id, "--output-dir", str(proposal_dir)]
+        )
+        == 0
+    )
+    path = next(proposal_dir.glob("wiki-*.md"))
+    first = path.read_text(encoding="utf-8")
+    assert "proposal_hash:" in first
+
+    assert (
+        cli.main(
+            ["--db", str(db_path), "propose", candidate_id, "--output-dir", str(proposal_dir)]
+        )
+        == 0
+    )
+    second = path.read_text(encoding="utf-8")
+    decisions = list(conn.execute("SELECT action FROM candidate_decisions"))
+
+    assert first == second
+    assert [row["action"] for row in decisions] == ["propose"]

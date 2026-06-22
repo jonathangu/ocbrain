@@ -15,6 +15,7 @@ from ocbrain.schema import Candidate, Evidence
 from ocbrain.text import claim_key
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
+REVIEWED_OUTPUT_STATUSES = ("approved", "proposed", "applied")
 
 
 SCHEMA = """
@@ -352,7 +353,11 @@ def list_candidates(
     status: str | None = None,
     scope: str | None = None,
     limit: int = 20,
+    *,
+    statuses: tuple[str, ...] | None = None,
 ) -> list[sqlite3.Row]:
+    if status and statuses:
+        raise ValueError("pass either status or statuses, not both")
     clauses: list[str] = []
     params: list[Any] = []
     if target:
@@ -361,6 +366,10 @@ def list_candidates(
     if status:
         clauses.append("status = ?")
         params.append(status)
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(statuses)
     if scope:
         clauses.append("scope = ?")
         params.append(scope)
@@ -451,14 +460,15 @@ def review_groups(
     status: str = "draft",
     target: str | None = None,
     limit: int = 20,
+    include_low_value: bool = False,
 ) -> list[sqlite3.Row]:
     clauses = ["status = ?", "target != 'ignore'"]
     params: list[Any] = [status]
     if target:
         clauses.append("target = ?")
         params.append(target)
-    params.append(limit)
-    return list(
+    params.append(max(limit * 20, limit))
+    rows = list(
         conn.execute(
             f"""
             SELECT
@@ -476,6 +486,94 @@ def review_groups(
             LIMIT ?
             """,
             params,
+        )
+    )
+    if include_low_value:
+        return rows[:limit]
+    return [row for row in rows if not is_low_value_review_group(row["target"], row["claim_key"])][
+        :limit
+    ]
+
+
+def review_group_candidates(
+    conn: sqlite3.Connection,
+    *,
+    target: str,
+    claim_key: str,
+    status: str = "draft",
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    sql = """
+        SELECT *
+        FROM candidates
+        WHERE status = ?
+          AND target = ?
+          AND COALESCE(NULLIF(claim_key, ''), body) = ?
+        ORDER BY confidence DESC, created_at ASC, id ASC
+    """
+    params: list[Any] = [status, target, claim_key]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return list(conn.execute(sql, params))
+
+
+def transition_candidate_group(
+    conn: sqlite3.Connection,
+    *,
+    target: str,
+    claim_key: str,
+    status: str,
+    action: str,
+    next_status: str,
+    actor: str,
+    reason: str,
+    limit: int | None = None,
+) -> list[str]:
+    rows = review_group_candidates(
+        conn,
+        target=target,
+        claim_key=claim_key,
+        status=status,
+        limit=limit,
+    )
+    decision_ids: list[str] = []
+    for row in rows:
+        decision_ids.append(
+            transition_candidate(
+                conn,
+                row["id"],
+                action=action,
+                next_status=next_status,
+                actor=actor,
+                reason=reason,
+            )
+        )
+    return decision_ids
+
+
+def is_low_value_review_group(target: str, claim_key: str) -> bool:
+    normalized = re.sub(r"\s+", " ", claim_key.lower()).strip()
+    if not normalized:
+        return True
+    target_prefix = f"{target} "
+    body = normalized.removeprefix(target_prefix).strip()
+    if body in {"", target, "status ok", "openclawbrain"}:
+        return True
+    if re.fullmatch(r"date \d{4} \d{2} \d{2}", body):
+        return True
+    if body in {"true", "false", "null", "ok"}:
+        return True
+    if len(body.split()) <= 1:
+        return True
+    return any(
+        marker in body
+        for marker in (
+            "brain loaded runtime hook registered",
+            "openclawbrain brain not yet loaded",
+            "session key",
+            "pagetype",
+            "openclaw home",
         )
     )
 

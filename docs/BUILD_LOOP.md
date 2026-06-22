@@ -106,5 +106,9 @@ Exit evidence:
 
 ## Current Next Action
 
-Run Loop 0 audits in parallel, then reconcile the findings into the Loop 1 implementation
-plan.
+Start Loop 3 runtime integration proof after Loop 2 review/output gates land:
+
+- generate compact runtime excerpt samples from a controlled reviewed subset
+- smoke MCP reads against representative queries
+- document install/config path without enabling live writes or cron
+- keep Loop 4 extraction/backfill quality queued for the next historical pass

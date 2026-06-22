@@ -19,9 +19,11 @@ from ocbrain.db import (
     list_candidates,
     mark_event_triaged,
     now_iso,
+    review_group_candidates,
     review_groups,
     search,
     transition_candidate,
+    transition_candidate_group,
     upsert_event,
 )
 from ocbrain.eval import SampleSpec, evaluate, write_reports
@@ -114,11 +116,21 @@ def build_parser() -> argparse.ArgumentParser:
     review_list.add_argument("--status", default="draft")
     review_list.add_argument("--target")
     review_list.add_argument("--limit", type=int, default=20)
+    review_list.add_argument("--include-low-value", action="store_true")
     review_list.set_defaults(func=cmd_review_list)
 
     review_inspect = review_subparsers.add_parser("inspect", help="Inspect one candidate")
     review_inspect.add_argument("candidate_id")
     review_inspect.set_defaults(func=cmd_review_inspect)
+
+    review_inspect_group = review_subparsers.add_parser(
+        "inspect-group", help="Inspect candidates in one grouped claim"
+    )
+    review_inspect_group.add_argument("--target", required=True)
+    review_inspect_group.add_argument("--claim-key", required=True)
+    review_inspect_group.add_argument("--status", default="draft")
+    review_inspect_group.add_argument("--limit", type=int, default=20)
+    review_inspect_group.set_defaults(func=cmd_review_inspect_group)
 
     for action in ("approve", "reject", "defer"):
         action_parser = review_subparsers.add_parser(action, help=f"{action.title()} candidate")
@@ -126,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         action_parser.add_argument("--actor", default="jon")
         action_parser.add_argument("--reason", required=True)
         action_parser.set_defaults(func=cmd_review_transition, review_action=action)
+
+        group_parser = review_subparsers.add_parser(
+            f"{action}-group", help=f"{action.title()} all candidates in one grouped claim"
+        )
+        group_parser.add_argument("--target", required=True)
+        group_parser.add_argument("--claim-key", required=True)
+        group_parser.add_argument("--status", default="draft")
+        group_parser.add_argument("--actor", default="jon")
+        group_parser.add_argument("--reason", required=True)
+        group_parser.add_argument("--limit", type=int)
+        group_parser.set_defaults(func=cmd_review_transition_group, review_action=action)
 
     excerpt_parser = subparsers.add_parser("excerpt", help="Write a managed native context block")
     excerpt_parser.add_argument("--output", required=True, type=Path)
@@ -136,6 +159,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     excerpt_parser.add_argument("--scope")
     excerpt_parser.add_argument("--status")
+    excerpt_parser.add_argument(
+        "--include-draft",
+        action="store_true",
+        help="Allow draft/deferred candidates in the generated context block",
+    )
     excerpt_parser.add_argument("--limit", type=int, default=12)
     excerpt_parser.set_defaults(func=cmd_excerpt)
 
@@ -406,6 +434,7 @@ def cmd_review_list(args: argparse.Namespace) -> int:
             status=args.status,
             target=args.target,
             limit=args.limit,
+            include_low_value=args.include_low_value,
         )
     ]
     output(args, {"groups": rows})
@@ -422,6 +451,31 @@ def cmd_review_inspect(args: argparse.Namespace) -> int:
         raise ValueError(f"candidate not found: {args.candidate_id}")
     decisions = [dict(row) for row in list_candidate_decisions(conn, args.candidate_id)]
     output(args, {"candidate": dict(candidate), "decisions": decisions})
+    return 0
+
+
+def cmd_review_inspect_group(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    rows = [
+        dict(row)
+        for row in review_group_candidates(
+            conn,
+            target=args.target,
+            claim_key=args.claim_key,
+            status=args.status,
+            limit=args.limit,
+        )
+    ]
+    output(
+        args,
+        {
+            "target": args.target,
+            "claim_key": args.claim_key,
+            "status": args.status,
+            "count": len(rows),
+            "candidates": rows,
+        },
+    )
     return 0
 
 
@@ -452,9 +506,50 @@ def cmd_review_transition(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review_transition_group(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    next_status = {
+        "approve": "approved",
+        "reject": "rejected",
+        "defer": "deferred",
+    }[args.review_action]
+    decision_ids = transition_candidate_group(
+        conn,
+        target=args.target,
+        claim_key=args.claim_key,
+        status=args.status,
+        action=f"{args.review_action}_group",
+        next_status=next_status,
+        actor=args.actor,
+        reason=args.reason,
+        limit=args.limit,
+    )
+    conn.commit()
+    output(
+        args,
+        {
+            "target": args.target,
+            "claim_key": args.claim_key,
+            "previous_status": args.status,
+            "status": next_status,
+            "changed": len(decision_ids),
+            "decision_ids": decision_ids,
+        },
+    )
+    return 0
+
+
 def cmd_excerpt(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    path = write_excerpt(conn, args.output, args.runtime, args.scope, args.limit, args.status)
+    path = write_excerpt(
+        conn,
+        args.output,
+        args.runtime,
+        args.scope,
+        args.limit,
+        args.status,
+        include_draft=args.include_draft,
+    )
     output(args, {"runtime": args.runtime, "output": str(path)})
     return 0
 
