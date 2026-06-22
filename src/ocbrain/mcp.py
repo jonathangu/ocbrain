@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ocbrain.db import connect, counts, get_candidate, init_db, search
+from ocbrain.db import REVIEWED_OUTPUT_STATUSES, connect, counts, get_candidate, init_db, search
 from ocbrain.proposals import write_proposal
 
 INSTRUCTIONS = (
@@ -75,6 +75,11 @@ def handle_request(
                     raise ValueError(f"candidate not found: {arguments['id']}")
                 if row["scope"] == "private" and not arguments.get("include_private"):
                     raise PermissionError("private candidate requires explicit include_private")
+                if (
+                    row["status"] not in REVIEWED_OUTPUT_STATUSES
+                    and not arguments.get("include_draft")
+                ):
+                    raise PermissionError("draft candidate requires explicit include_draft")
                 result = {"content": [{"type": "text", "text": json.dumps(dict(row))}]}
             elif name == "brain.propose":
                 if not allow_writes:
@@ -149,7 +154,11 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
             "description": "Get one candidate by id.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"id": {"type": "string"}},
+                "properties": {
+                    "id": {"type": "string"},
+                    "include_draft": {"type": "boolean"},
+                    "include_private": {"type": "boolean"},
+                },
                 "required": ["id"],
             },
         },

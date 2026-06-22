@@ -31,6 +31,9 @@ Current active work is the long-running build loop in [docs/BUILD_LOOP.md](docs/
 That loop must prove quality, runtime fit, reviewer ergonomics, and repeatable
 consolidation before `ocbrain` is considered done.
 
+Runtime integration proof notes live in
+[docs/RUNTIME_INTEGRATION.md](docs/RUNTIME_INTEGRATION.md).
+
 ## Quick Start
 
 ```bash
@@ -71,6 +74,7 @@ The first harness is intentionally strict about duplicate candidate templates, g
 
 ```bash
 ocbrain --db data/ocbrain.sqlite candidates --target wiki --limit 5
+ocbrain --db data/ocbrain.sqlite review approve <candidate_id> --reason "source-backed"
 ocbrain --db data/ocbrain.sqlite propose <candidate_id> --output-dir proposals
 ocbrain --db data/ocbrain.sqlite excerpt --runtime codex --output /tmp/AGENTS.md --limit 10
 ```
@@ -88,7 +92,9 @@ The MCP server currently exposes:
 - `brain.get`
 - `brain://digest/current`
 
-`brain.propose` is write-capable and hidden unless the server is launched with `--allow-writes`.
+`brain.get` serves reviewed candidates by default; draft/private candidates require
+explicit inspection flags. `brain.propose` is write-capable and hidden unless the
+server is launched with `--allow-writes`.
 
 ## Principles
 

@@ -90,3 +90,59 @@ def test_mcp_get_private_candidate_requires_explicit_flag(tmp_path):
     )
 
     assert response["error"]["code"] == -32001
+
+
+def test_mcp_get_draft_candidate_requires_explicit_flag(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    candidate_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Draft note",
+            body="Draft note body",
+            confidence=0.8,
+        ),
+    )
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.get", "arguments": {"id": candidate_id}},
+        },
+    )
+
+    assert response["error"]["code"] == -32001
+    assert "include_draft" in response["error"]["message"]
+
+
+def test_mcp_get_approved_candidate_by_default(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    candidate_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Approved note",
+            body="Approved note body",
+            confidence=0.8,
+        ),
+    )
+    conn.execute("UPDATE candidates SET status = 'approved' WHERE id = ?", (candidate_id,))
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.get", "arguments": {"id": candidate_id}},
+        },
+    )
+
+    assert response["result"]["content"][0]["type"] == "text"
