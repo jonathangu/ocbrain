@@ -306,7 +306,7 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
         },
         {
             "name": "brain.feedback",
-            "description": "Record whether served ocbrain context was useful.",
+            "description": "Record retrieval usefulness or approve/reject human-gated knowledge.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
