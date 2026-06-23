@@ -205,6 +205,71 @@ def test_rebuild_candidates_stales_generic_drafts(tmp_path: Path) -> None:
     assert any("Architecture uses MCP for shared context" in body for body in new_bodies)
 
 
+def test_backfill_preview_uses_copy_and_reports_diff(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    event = EventInput(
+        id="evt_preview",
+        source_type="doc",
+        source_uri="/tmp/preview.md",
+        content_hash="hash-preview",
+        title="Preview",
+        summary="Architecture uses MCP for compact reviewed context.",
+        body="Architecture uses MCP for compact reviewed context.",
+    )
+    assert upsert_event(conn, event)
+    old_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.POLICY,
+            title="Old generic",
+            body=(
+                "Artifact appears to contain stable architecture or design synthesis. "
+                "Route to wiki draft rather than long-form memory."
+            ),
+            confidence=0.72,
+            evidence=[Evidence(uri="/tmp/preview.md", excerpt=event.summary)],
+        ),
+        event.id,
+    )
+    conn.commit()
+
+    output_dir = tmp_path / "preview"
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "--pretty",
+                "backfill-preview",
+                "--output-dir",
+                str(output_dir),
+                "--sample-size",
+                "10",
+                "--allow-score-drop",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["preview_db"].endswith("backfill-preview.sqlite")
+    assert payload["rebuild"]["generic_candidates_to_stale"] == 1
+    assert payload["distribution_diff"]
+    assert (output_dir / "backfill-preview.json").exists()
+
+    source_status = conn.execute("SELECT status FROM candidates WHERE id = ?", (old_id,)).fetchone()
+    preview_conn = connect(output_dir / "backfill-preview.sqlite")
+    init_db(preview_conn)
+    preview_status = preview_conn.execute(
+        "SELECT status FROM candidates WHERE id = ?",
+        (old_id,),
+    ).fetchone()
+
+    assert source_status["status"] == "draft"
+    assert preview_status["status"] == "stale"
+
+
 def test_review_approve_gates_proposal_generation(tmp_path: Path) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     artifact = tmp_path / "brief.md"

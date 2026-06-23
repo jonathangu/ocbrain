@@ -77,6 +77,20 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument("--apply", action="store_true")
     rebuild_parser.set_defaults(func=cmd_rebuild_candidates)
 
+    backfill_preview_parser = subparsers.add_parser(
+        "backfill-preview",
+        help="Apply a candidate rebuild to a copied DB and report before/after quality",
+    )
+    backfill_preview_parser.add_argument("--output-dir", required=True, type=Path)
+    backfill_preview_parser.add_argument("--limit", type=int)
+    backfill_preview_parser.add_argument("--sample-size", type=int, default=160)
+    backfill_preview_parser.add_argument("--per-target", type=int, default=40)
+    backfill_preview_parser.add_argument("--seed", type=int, default=20260621)
+    backfill_preview_parser.add_argument("--min-score-delta", type=float, default=0.0)
+    backfill_preview_parser.add_argument("--allow-score-drop", action="store_true")
+    backfill_preview_parser.add_argument("--fail-on-leak", action="store_true")
+    backfill_preview_parser.set_defaults(func=cmd_backfill_preview)
+
     search_parser = subparsers.add_parser("search", help="Search ingested history")
     search_parser.add_argument("query")
     search_parser.add_argument("--limit", type=int, default=10)
@@ -301,8 +315,20 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
 def cmd_rebuild_candidates(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    result = rebuild_candidates(conn, limit=args.limit, apply=args.apply)
+    output(
+        args,
+        {
+            **result,
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def rebuild_candidates(conn, *, limit: int | None = None, apply: bool = False) -> dict:
     events = list(
-        conn.execute("SELECT * FROM events ORDER BY ingested_at ASC LIMIT ?", (args.limit or -1,))
+        conn.execute("SELECT * FROM events ORDER BY ingested_at ASC LIMIT ?", (limit or -1,))
     )
     generic_marked_stale = candidates_inserted = 0
     for event in events:
@@ -320,7 +346,7 @@ def cmd_rebuild_candidates(args: argparse.Namespace) -> int:
             )
             if is_generic_candidate_body(row["body"])
         ]
-        if args.apply:
+        if apply:
             for candidate_id in generic_ids:
                 conn.execute(
                     "UPDATE candidates SET status = 'stale', updated_at = ? WHERE id = ?",
@@ -330,19 +356,170 @@ def cmd_rebuild_candidates(args: argparse.Namespace) -> int:
                 if insert_candidate(conn, candidate, event["id"]):
                     candidates_inserted += 1
         generic_marked_stale += len(generic_ids)
-    if args.apply:
+    if apply:
         conn.commit()
-    output(
-        args,
-        {
-            "apply": args.apply,
-            "events_seen": len(events),
-            "generic_candidates_to_stale": generic_marked_stale,
-            "candidates_inserted": candidates_inserted,
-            "counts": counts(conn),
-        },
+    return {
+        "apply": apply,
+        "events_seen": len(events),
+        "generic_candidates_to_stale": generic_marked_stale,
+        "candidates_inserted": candidates_inserted,
+    }
+
+
+def cmd_backfill_preview(args: argparse.Namespace) -> int:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    preview_db = args.output_dir / "backfill-preview.sqlite"
+    if preview_db.exists():
+        preview_db.unlink()
+
+    source_conn = open_db(args)
+    preview_conn = connect(preview_db)
+    source_conn.backup(preview_conn)
+    init_db(preview_conn)
+
+    spec = SampleSpec(
+        sample_size=args.sample_size,
+        seed=args.seed,
+        per_target=args.per_target,
     )
-    return 0
+    before_distribution = candidate_distribution(source_conn)
+    before_report = evaluate(
+        source_conn,
+        spec,
+        db_label=str(args.db),
+        sample_output_limit=120,
+    )
+    rebuild_result = rebuild_candidates(preview_conn, limit=args.limit, apply=True)
+    after_distribution = candidate_distribution(preview_conn)
+    after_report = evaluate(
+        preview_conn,
+        spec,
+        db_label=str(preview_db),
+        sample_output_limit=120,
+    )
+
+    before_score = before_report["summary"]["overall_score"]
+    after_score = after_report["summary"]["overall_score"]
+    score_delta = round(after_score - before_score, 3)
+    leak_count = after_report["leakage"]["probable_secret_count"]
+    score_ok = args.allow_score_drop or score_delta >= args.min_score_delta
+    leak_ok = not args.fail_on_leak or leak_count == 0
+    passed = score_ok and leak_ok
+    payload = {
+        "gate": {
+            "passed": passed,
+            "score_ok": score_ok,
+            "leak_ok": leak_ok,
+            "min_score_delta": args.min_score_delta,
+            "allow_score_drop": args.allow_score_drop,
+        },
+        "source_db": str(args.db),
+        "preview_db": str(preview_db),
+        "score_delta": score_delta,
+        "before": {
+            "summary": before_report["summary"],
+            "distribution": before_distribution,
+        },
+        "after": {
+            "summary": after_report["summary"],
+            "distribution": after_distribution,
+        },
+        "rebuild": {
+            **rebuild_result,
+            "counts": counts(preview_conn),
+        },
+        "distribution_diff": distribution_diff(before_distribution, after_distribution),
+    }
+    summary_path = args.output_dir / "backfill-preview.json"
+    before_report_path = args.output_dir / "backfill-preview-before.json"
+    after_report_path = args.output_dir / "backfill-preview-after.json"
+    summary_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    before_report_path.write_text(
+        json.dumps(before_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    after_report_path.write_text(
+        json.dumps(after_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    output(args, {**payload, "output_json": str(summary_path)})
+    return 0 if passed else 1
+
+
+def candidate_distribution(conn) -> dict[str, object]:
+    active_by_source_target_status = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+              COALESCE(events.source_type, 'none') AS source_type,
+              candidates.target,
+              candidates.status,
+              COUNT(*) AS count
+            FROM candidates
+            LEFT JOIN events ON events.id = candidates.event_id
+            WHERE candidates.status != 'stale'
+            GROUP BY source_type, candidates.target, candidates.status
+            ORDER BY count DESC, source_type, candidates.target, candidates.status
+            """
+        )
+    ]
+    by_status = {
+        row["status"]: row["count"]
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM candidates GROUP BY status ORDER BY status"
+        )
+    }
+    active_by_target = {
+        row["target"]: row["count"]
+        for row in conn.execute(
+            """
+            SELECT target, COUNT(*) AS count
+            FROM candidates
+            WHERE status != 'stale'
+            GROUP BY target
+            ORDER BY count DESC
+            """
+        )
+    }
+    return {
+        "by_status": by_status,
+        "active_by_target": active_by_target,
+        "active_by_source_target_status": active_by_source_target_status,
+    }
+
+
+def distribution_diff(
+    before: dict[str, object],
+    after: dict[str, object],
+) -> list[dict[str, object]]:
+    def keyed_rows(distribution: dict[str, object]) -> dict[tuple[str, str, str], int]:
+        rows = distribution["active_by_source_target_status"]
+        return {
+            (row["source_type"], row["target"], row["status"]): row["count"]
+            for row in rows
+        }
+
+    before_rows = keyed_rows(before)
+    after_rows = keyed_rows(after)
+    diffs = []
+    for key in sorted(set(before_rows) | set(after_rows)):
+        before_count = before_rows.get(key, 0)
+        after_count = after_rows.get(key, 0)
+        delta = after_count - before_count
+        if delta:
+            source_type, target, status = key
+            diffs.append(
+                {
+                    "source_type": source_type,
+                    "target": target,
+                    "status": status,
+                    "before": before_count,
+                    "after": after_count,
+                    "delta": delta,
+                }
+            )
+    return sorted(diffs, key=lambda item: abs(item["delta"]), reverse=True)
 
 
 def event_input_from_row(row) -> EventInput:

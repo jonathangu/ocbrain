@@ -106,9 +106,9 @@ Exit evidence:
 
 ## Current Next Action
 
-Start Loop 3 runtime integration proof after Loop 2 review/output gates land:
+Continue Loop 4 historical backfill iterations:
 
-- generate compact runtime excerpt samples from a controlled reviewed subset
-- smoke MCP reads against representative queries
-- document install/config path without enabling live writes or cron
-- keep Loop 4 extraction/backfill quality queued for the next historical pass
+- use `backfill-preview` for copied-DB rebuilds and before/after eval gates
+- improve evidence/title alignment after boilerplate skipping
+- add temporal invalidation heuristics for current/latest/installed/version facts
+- keep scheduled dry-run readiness queued until historical quality is stable
