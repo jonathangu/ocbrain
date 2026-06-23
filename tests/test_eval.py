@@ -3,6 +3,7 @@ from pathlib import Path
 
 from ocbrain import cli
 from ocbrain.db import EventInput, connect, init_db, insert_candidate, upsert_event
+from ocbrain.eval import confidence_score, evidence_score
 from ocbrain.schema import Candidate, Evidence, Risk, Target
 
 
@@ -83,3 +84,53 @@ def test_eval_fail_on_leak_returns_nonzero(tmp_path: Path) -> None:
 
     assert cli.main(["--db", str(db_path), "eval", "--sample-size", "1", "--fail-on-leak"]) == 1
 
+
+def test_confidence_score_rewards_conservative_target_bands() -> None:
+    assert (
+        confidence_score(
+            {
+                "target": "policy",
+                "risk": "high",
+                "status": "draft",
+                "confidence": 0.55,
+            }
+        )
+        == 1.0
+    )
+    assert (
+        confidence_score(
+            {
+                "target": "policy",
+                "risk": "high",
+                "status": "draft",
+                "confidence": 0.92,
+            }
+        )
+        < 0.5
+    )
+
+
+def test_evidence_score_uses_title_and_body_claim_alignment() -> None:
+    evidence = [
+        {
+            "uri": "/tmp/source.md",
+            "excerpt": "Architecture uses MCP search for compact reviewed context.",
+        }
+    ]
+    aligned = {
+        "title": "Wiki synthesis: Architecture uses MCP search for compact reviewed context.",
+        "body": (
+            "Draft wiki synthesis from source: "
+            "Architecture uses MCP search for compact reviewed context."
+        ),
+    }
+    misaligned = {
+        "title": "Wiki synthesis: STATUS ok",
+        "body": (
+            "Draft wiki synthesis from source: "
+            "Architecture uses MCP search for compact reviewed context."
+        ),
+    }
+
+    assert evidence_score(evidence, aligned) > evidence_score(evidence, misaligned)
+    assert evidence_score(evidence, aligned) >= 0.85

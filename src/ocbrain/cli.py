@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from ocbrain.classifier import classify_event, classify_text
+from ocbrain.classifier import classify_event, classify_text, is_low_value_evidence_line
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     EventInput,
@@ -340,24 +340,24 @@ def rebuild_candidates(conn, *, limit: int | None = None, apply: bool = False) -
     events = list(
         conn.execute("SELECT * FROM events ORDER BY ingested_at ASC LIMIT ?", (limit or -1,))
     )
-    generic_marked_stale = candidates_inserted = 0
+    draft_candidates_to_stale = candidates_inserted = 0
     for event in events:
         event_input = event_input_from_row(event)
         candidates = classify_event(event_input)
-        generic_ids = [
+        stale_ids = [
             row["id"]
             for row in conn.execute(
                 """
-                SELECT id, body
+                SELECT id, title, body
                 FROM candidates
                 WHERE event_id = ? AND status = 'draft'
                 """,
                 (event["id"],),
             )
-            if is_generic_candidate_body(row["body"])
+            if is_stale_rebuild_candidate(row)
         ]
         if apply:
-            for candidate_id in generic_ids:
+            for candidate_id in stale_ids:
                 conn.execute(
                     "UPDATE candidates SET status = 'stale', updated_at = ? WHERE id = ?",
                     (now_iso(), candidate_id),
@@ -365,13 +365,14 @@ def rebuild_candidates(conn, *, limit: int | None = None, apply: bool = False) -
             for candidate in candidates:
                 if insert_candidate(conn, candidate, event["id"]):
                     candidates_inserted += 1
-        generic_marked_stale += len(generic_ids)
+        draft_candidates_to_stale += len(stale_ids)
     if apply:
         conn.commit()
     return {
         "apply": apply,
         "events_seen": len(events),
-        "generic_candidates_to_stale": generic_marked_stale,
+        "generic_candidates_to_stale": draft_candidates_to_stale,
+        "draft_candidates_to_stale": draft_candidates_to_stale,
         "candidates_inserted": candidates_inserted,
     }
 
@@ -637,6 +638,20 @@ def is_generic_candidate_body(body: str) -> bool:
             "from source: - owner:",
         )
     )
+
+
+def is_stale_rebuild_candidate(row) -> bool:
+    return is_generic_candidate_body(row["body"]) or has_low_value_candidate_title(row["title"])
+
+
+def has_low_value_candidate_title(title: str) -> bool:
+    if ": " not in title:
+        return False
+    _, suffix = title.split(": ", 1)
+    suffix = suffix.strip()
+    if not suffix:
+        return True
+    return is_low_value_evidence_line(suffix)
 
 
 def cmd_search(args: argparse.Namespace) -> int:

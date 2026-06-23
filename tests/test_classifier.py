@@ -118,6 +118,9 @@ def test_status_log_boilerplate_is_not_used_as_claim(tmp_path: Path) -> None:
 
     memory = next(candidate for candidate in candidates if candidate.target == Target.MEMORY)
     assert "lifecycle attach=attached" in memory.body
+    assert memory.title == (
+        "Operational fact candidate: lifecycle attach=attached learner=yes watch=watching"
+    )
     assert "source: STATUS ok" not in memory.body
 
 
@@ -138,5 +141,23 @@ def test_plugin_inspect_boilerplate_is_not_used_as_claim(tmp_path: Path) -> None
 
     memory = next(candidate for candidate in candidates if candidate.target == Target.MEMORY)
     assert "Version: 0.4.40" in memory.body
+    assert memory.title == "Operational fact candidate: Version: 0.4.40"
     assert "source: OpenClawBrain" not in memory.body
     assert "source: Format: openclaw" not in memory.body
+
+
+def test_candidate_title_uses_evidence_claim_not_document_header(tmp_path: Path) -> None:
+    artifact = tmp_path / "proof.md"
+    artifact.write_text(
+        "# Operator Proof\n\n"
+        "STATUS ok\n"
+        "Architecture uses MCP search for compact reviewed context.\n",
+        encoding="utf-8",
+    )
+
+    candidates = classify_artifact(artifact)
+
+    wiki = next(candidate for candidate in candidates if candidate.target == Target.WIKI)
+    assert wiki.title == (
+        "Wiki synthesis: Architecture uses MCP search for compact reviewed context."
+    )

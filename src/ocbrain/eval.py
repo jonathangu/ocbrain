@@ -152,14 +152,22 @@ def evidence_score(evidence: list[dict[str, Any]], row) -> float:
         return 0.0
     best = 0.0
     title_terms = meaningful_terms(row["title"])
+    body_terms = meaningful_terms(claim_text_from_body(row["body"]))
     for item in evidence:
         excerpt = item.get("excerpt", "")
         uri = item.get("uri", "")
         if not excerpt or not uri:
             best = max(best, 0.2)
             continue
-        overlap = len(title_terms & meaningful_terms(excerpt))
-        best = max(best, 0.6 + min(overlap, 2) * 0.2)
+        excerpt_terms = meaningful_terms(excerpt)
+        title_overlap = len(title_terms & excerpt_terms)
+        body_overlap = len(body_terms & excerpt_terms)
+        score = 0.5
+        if title_overlap:
+            score += min(title_overlap, 3) * 0.12
+        if body_overlap:
+            score += min(body_overlap, 4) * 0.035
+        best = max(best, score)
     return min(best, 1.0)
 
 
@@ -167,7 +175,32 @@ def confidence_score(row) -> float:
     confidence = float(row["confidence"])
     if confidence < 0.0 or confidence > 1.0:
         return 0.0
-    return 0.5
+    target = row["target"]
+    risk = row["risk"]
+    status = row["status"]
+
+    if target == "ignore":
+        low, high = 0.35, 0.6
+    elif risk == "high":
+        low, high = 0.45, 0.65
+    elif target == "skill":
+        low, high = 0.55, 0.72
+    else:
+        low, high = 0.62, 0.82
+
+    if status in {"approved", "applied"}:
+        high = min(0.95, high + 0.12)
+        low = min(low + 0.08, high)
+
+    if low <= confidence <= high:
+        return 1.0
+
+    distance = low - confidence if confidence < low else confidence - high
+    if distance <= 0.1:
+        return 0.7
+    if distance <= 0.25:
+        return 0.4
+    return 0.1
 
 
 def actionability_score(row) -> float:
@@ -201,6 +234,10 @@ def notes_for(
         notes.append("missing evidence")
     if dimensions["review_actionability"] < 0.7:
         notes.append("candidate body is generic or not directly approvable")
+    if dimensions["confidence_calibration"] < 0.7:
+        notes.append("candidate confidence is outside calibrated target/risk/status band")
+    if dimensions["evidence_grounding"] < 0.7:
+        notes.append("candidate title/body weakly align with evidence excerpt")
     if row["target"] == "policy" and "patch-suggestion-only" not in hints:
         notes.append("policy candidate lacks patch-suggestion-only hint")
     if row["scope"] == "private" and row["status"] not in {"approved", "applied"}:
@@ -427,6 +464,15 @@ def meaningful_terms(text: str) -> set[str]:
         for term in re.findall(r"[a-z0-9]{4,}", text.lower())
         if term not in {"candidate", "artifact", "appears", "route", "source", "backed"}
     }
+
+
+def claim_text_from_body(body: str) -> str:
+    return re.sub(
+        r"(?i)^(draft wiki synthesis|stage operational fact|draft repeatable workflow|"
+        r"patch-suggestion constraint) from source:\s*",
+        "",
+        body,
+    )
 
 
 def verdict(score: float, probable_secret_count: int = 0) -> str:

@@ -206,6 +206,64 @@ def test_rebuild_candidates_stales_generic_drafts(tmp_path: Path) -> None:
     assert any("Architecture uses MCP for shared context" in body for body in new_bodies)
 
 
+def test_rebuild_candidates_stales_low_value_titles(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    event = EventInput(
+        id="evt_status_title",
+        source_type="artifact",
+        source_uri="/tmp/status.log",
+        content_hash="hash-status-title",
+        title="STATUS ok",
+        summary=(
+            "STATUS ok\n"
+            "Architecture uses MCP search for compact reviewed context."
+        ),
+        body=(
+            "STATUS ok\n"
+            "Architecture uses MCP search for compact reviewed context."
+        ),
+    )
+    assert upsert_event(conn, event)
+    old_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Wiki synthesis: STATUS ok",
+            body=(
+                "Draft wiki synthesis from source: "
+                "Architecture uses MCP search for compact reviewed context."
+            ),
+            confidence=0.72,
+            evidence=[
+                Evidence(
+                    uri="/tmp/status.log",
+                    excerpt="Architecture uses MCP search for compact reviewed context.",
+                    line_start=2,
+                    line_end=2,
+                )
+            ],
+            claim_key="wiki architecture uses mcp search for compact reviewed context",
+        ),
+        event.id,
+    )
+    conn.commit()
+
+    assert cli.main(["--db", str(db_path), "rebuild-candidates", "--apply"]) == 0
+    old_status = conn.execute("SELECT status FROM candidates WHERE id = ?", (old_id,)).fetchone()[0]
+    titles = [
+        row["title"]
+        for row in conn.execute(
+            "SELECT title FROM candidates WHERE event_id = ? AND status = 'draft'",
+            (event.id,),
+        )
+    ]
+
+    assert old_status == "stale"
+    assert "Wiki synthesis: Architecture uses MCP search for compact reviewed context." in titles
+
+
 def test_backfill_preview_uses_copy_and_reports_diff(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = connect(db_path)

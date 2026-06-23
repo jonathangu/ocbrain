@@ -38,14 +38,14 @@ def classify_text(
     title_hint: str = "artifact",
     source_type: str | None = None,
 ) -> list[Candidate]:
-    title = title_from_text(text, title_hint)
+    source_title = title_from_text(text, title_hint)
     candidates: list[Candidate] = []
     claim = claim_from_evidence(evidence, text)
     if not claim or is_low_value_claim(claim):
         return [
             Candidate(
                 target=Target.IGNORE,
-                title=f"No durable candidate: {title}",
+                title=f"No durable candidate: {source_title}",
                 body="No strong memory/wiki/skill/policy candidate was detected.",
                 confidence=0.5,
                 evidence=evidence,
@@ -69,7 +69,7 @@ def classify_text(
         candidates.append(
             Candidate(
                 target=Target.WIKI,
-                title=f"Wiki synthesis: {title}",
+                title=candidate_title("Wiki synthesis", claim, source_title),
                 body=f"Draft wiki synthesis from source: {claim}",
                 confidence=0.72,
                 evidence=evidence,
@@ -82,7 +82,7 @@ def classify_text(
         candidates.append(
             Candidate(
                 target=Target.MEMORY,
-                title=f"Operational fact candidate: {title}",
+                title=candidate_title("Operational fact candidate", claim, source_title),
                 body=f"Stage operational fact from source: {claim}",
                 confidence=0.68,
                 evidence=evidence,
@@ -97,7 +97,7 @@ def classify_text(
         candidates.append(
             Candidate(
                 target=Target.SKILL,
-                title=f"Skill proposal candidate: {title}",
+                title=candidate_title("Skill proposal candidate", claim, source_title),
                 body=f"Draft repeatable workflow from source: {claim}",
                 confidence=0.62,
                 risk=Risk.MEDIUM,
@@ -113,7 +113,7 @@ def classify_text(
         candidates.append(
             Candidate(
                 target=Target.POLICY,
-                title=f"Constraint candidate: {title}",
+                title=candidate_title("Constraint candidate", claim, source_title),
                 body=f"Patch-suggestion constraint from source: {claim}",
                 confidence=0.55,
                 risk=Risk.HIGH,
@@ -127,7 +127,7 @@ def classify_text(
         candidates.append(
             Candidate(
                 target=Target.IGNORE,
-                title=f"No durable candidate: {title}",
+                title=f"No durable candidate: {source_title}",
                 body="No strong memory/wiki/skill/policy candidate was detected.",
                 confidence=0.5,
                 evidence=evidence,
@@ -140,6 +140,28 @@ def classify_text(
             candidate.hints.append("session-derived")
 
     return candidates
+
+
+def candidate_title(prefix: str, claim: str, fallback: str) -> str:
+    return f"{prefix}: {title_from_claim(claim, fallback)}"
+
+
+def title_from_claim(claim: str, fallback: str) -> str:
+    normalized = compact_whitespace(claim)
+    if not normalized:
+        return fallback[:160]
+
+    normalized = normalized.lstrip("-* ").strip()
+    metadata_match = re.fullmatch(r"(?i)(title|summary|task|objective)\s*:\s*(.+)", normalized)
+    if metadata_match:
+        normalized = metadata_match.group(2).strip()
+    normalized = normalized.strip("\"'` ")
+
+    sentence = re.split(r"(?<=[.!?])\s+", normalized, maxsplit=1)[0]
+    words = sentence.split()
+    if len(words) > 14:
+        sentence = " ".join(words[:14])
+    return sentence[:120] or fallback[:160]
 
 
 def claim_from_evidence(evidence: list[Evidence], text: str) -> str:
