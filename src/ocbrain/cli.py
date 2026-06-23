@@ -28,6 +28,7 @@ from ocbrain.db import (
 )
 from ocbrain.eval import SampleSpec, evaluate, write_reports
 from ocbrain.excerpt import write_excerpt
+from ocbrain.ids import stable_id
 from ocbrain.ingest import (
     IngestOptions,
     default_history_roots,
@@ -37,6 +38,7 @@ from ocbrain.ingest import (
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
 from ocbrain.schema import Evidence
+from ocbrain.temporal import temporal_supersession_groups
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -90,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
     backfill_preview_parser.add_argument("--allow-score-drop", action="store_true")
     backfill_preview_parser.add_argument("--fail-on-leak", action="store_true")
     backfill_preview_parser.set_defaults(func=cmd_backfill_preview)
+
+    invalidate_temporal_parser = subparsers.add_parser(
+        "invalidate-temporal",
+        help="Mark older duplicate temporal facts stale and record invalidations",
+    )
+    invalidate_temporal_parser.add_argument("--limit", type=int)
+    invalidate_temporal_parser.add_argument("--apply", action="store_true")
+    invalidate_temporal_parser.set_defaults(func=cmd_invalidate_temporal)
 
     search_parser = subparsers.add_parser("search", help="Search ingested history")
     search_parser.add_argument("query")
@@ -520,6 +530,66 @@ def distribution_diff(
                 }
             )
     return sorted(diffs, key=lambda item: abs(item["delta"]), reverse=True)
+
+
+def cmd_invalidate_temporal(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    groups = temporal_supersession_groups(conn, limit=args.limit)
+    invalidations = []
+    for group in groups:
+        reason = f"superseded temporal fact: {group['subject_key']}"
+        for old_candidate_id in group["stale_candidate_ids"]:
+            invalidation_id = stable_invalidation_id(
+                old_candidate_id,
+                group["keep_candidate_id"],
+                reason,
+            )
+            invalidations.append(
+                {
+                    "id": invalidation_id,
+                    "old_candidate_id": old_candidate_id,
+                    "new_candidate_id": group["keep_candidate_id"],
+                    "reason": reason,
+                }
+            )
+            if args.apply:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO invalidations (
+                      id, old_candidate_id, new_candidate_id, reason, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        invalidation_id,
+                        old_candidate_id,
+                        group["keep_candidate_id"],
+                        reason,
+                        now_iso(),
+                    ),
+                )
+                conn.execute(
+                    "UPDATE candidates SET status = 'stale', updated_at = ? WHERE id = ?",
+                    (now_iso(), old_candidate_id),
+                )
+    if args.apply:
+        conn.commit()
+    output(
+        args,
+        {
+            "apply": args.apply,
+            "groups": groups,
+            "invalidations": invalidations,
+            "groups_seen": len(groups),
+            "candidates_to_stale": len(invalidations),
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def stable_invalidation_id(old_candidate_id: str, new_candidate_id: str, reason: str) -> str:
+    return stable_id("inv", old_candidate_id, new_candidate_id, reason)
 
 
 def event_input_from_row(row) -> EventInput:

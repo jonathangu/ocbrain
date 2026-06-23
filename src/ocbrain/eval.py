@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ocbrain.db import counts, now_iso
+from ocbrain.temporal import temporal_supersession_groups
 from ocbrain.text import find_probable_secret_leaks
 
 GENERIC_BODY_MARKERS = (
@@ -18,7 +19,6 @@ GENERIC_BODY_MARKERS = (
     "extract only concise",
     "no strong memory/wiki/skill/policy",
 )
-STALE_TERMS = ("latest", "current", "installed", "version", "checked", "today", "now")
 
 
 @dataclass(frozen=True)
@@ -247,23 +247,11 @@ def duplicate_summary(conn) -> dict[str, Any]:
 
 
 def temporal_summary(conn) -> dict[str, Any]:
-    clauses = " OR ".join("LOWER(title || ' ' || body) LIKE ?" for _ in STALE_TERMS)
-    rows = list(
-        conn.execute(
-            f"""
-            SELECT id, target, title, created_at
-            FROM candidates
-            WHERE {clauses}
-              AND status != 'stale'
-            ORDER BY created_at ASC
-            LIMIT 50
-            """,
-            tuple(f"%{term}%" for term in STALE_TERMS),
-        )
-    )
+    groups = temporal_supersession_groups(conn, limit=50)
     return {
-        "stale_risk_count_sample": len(rows),
-        "sample": [dict(row) for row in rows[:10]],
+        "stale_risk_count_sample": sum(len(group["stale_candidate_ids"]) for group in groups),
+        "supersession_group_count_sample": len(groups),
+        "sample": groups[:10],
     }
 
 

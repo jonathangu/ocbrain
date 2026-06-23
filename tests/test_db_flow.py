@@ -270,6 +270,77 @@ def test_backfill_preview_uses_copy_and_reports_diff(tmp_path: Path, capsys) -> 
     assert preview_status["status"] == "stale"
 
 
+def test_invalidate_temporal_records_supersession(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    old_event = EventInput(
+        id="evt_old_version",
+        source_type="artifact",
+        source_uri="/tmp/old.md",
+        content_hash="hash-old",
+        title="Old install",
+        summary="OpenClawBrain installed version 0.4.40",
+        body="OpenClawBrain installed version 0.4.40",
+        created_at="2026-04-09T00:00:00Z",
+    )
+    new_event = EventInput(
+        id="evt_new_version",
+        source_type="artifact",
+        source_uri="/tmp/new.md",
+        content_hash="hash-new",
+        title="New install",
+        summary="OpenClawBrain installed version 0.4.42",
+        body="OpenClawBrain installed version 0.4.42",
+        created_at="2026-04-11T00:00:00Z",
+    )
+    assert upsert_event(conn, old_event)
+    assert upsert_event(conn, new_event)
+    old_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.MEMORY,
+            title="Operational fact candidate: OpenClawBrain installed version",
+            body="Stage operational fact from source: OpenClawBrain installed version 0.4.40",
+            confidence=0.68,
+            evidence=[Evidence(uri="/tmp/old.md", excerpt=old_event.summary)],
+        ),
+        old_event.id,
+    )
+    new_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.MEMORY,
+            title="Operational fact candidate: OpenClawBrain installed version",
+            body="Stage operational fact from source: OpenClawBrain installed version 0.4.42",
+            confidence=0.68,
+            evidence=[Evidence(uri="/tmp/new.md", excerpt=new_event.summary)],
+        ),
+        new_event.id,
+    )
+    conn.commit()
+
+    assert cli.main(["--db", str(db_path), "--pretty", "invalidate-temporal"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["candidates_to_stale"] == 1
+    assert payload["invalidations"][0]["old_candidate_id"] == old_id
+    assert payload["invalidations"][0]["new_candidate_id"] == new_id
+    assert conn.execute("SELECT status FROM candidates WHERE id = ?", (old_id,)).fetchone()[
+        "status"
+    ] == "draft"
+
+    assert cli.main(["--db", str(db_path), "invalidate-temporal", "--apply"]) == 0
+    assert conn.execute("SELECT status FROM candidates WHERE id = ?", (old_id,)).fetchone()[
+        "status"
+    ] == "stale"
+    assert conn.execute("SELECT status FROM candidates WHERE id = ?", (new_id,)).fetchone()[
+        "status"
+    ] == "draft"
+    invalidation = conn.execute("SELECT * FROM invalidations").fetchone()
+    assert invalidation["old_candidate_id"] == old_id
+    assert invalidation["new_candidate_id"] == new_id
+
+
 def test_review_approve_gates_proposal_generation(tmp_path: Path) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     artifact = tmp_path / "brief.md"
