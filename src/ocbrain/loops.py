@@ -51,7 +51,7 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
     tripwires.extend(error_tripwires(envelopes, options))
     families = experiment_family_summaries(valid_envelopes)
     primary = primary_metric_summary(valid_envelopes)
-    candidates = candidate_summaries(valid_envelopes, families, primary)
+    knowledge_candidates = knowledge_candidate_summaries(valid_envelopes, families, primary)
     status = derive_run_status(valid_envelopes, errors, tripwires)
 
     return {
@@ -70,7 +70,7 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
         "metrics": {"primary": primary},
         "tripwires": tripwires,
         "experiment_families": families,
-        "candidates": candidates,
+        "knowledge_candidates": knowledge_candidates,
         "envelopes": {
             "seen": len(result_paths),
             "valid": len(valid_envelopes),
@@ -134,7 +134,7 @@ def write_loop_ingest(conn: sqlite3.Connection, options: LoopIngestOptions) -> d
                 occurred_at=timestamp,
             ),
         )
-    for candidate_summary in result["candidates"]:
+    for candidate_summary in result["knowledge_candidates"]:
         knowledge_from_candidate_summary(
             conn,
             candidate_summary,
@@ -145,7 +145,7 @@ def write_loop_ingest(conn: sqlite3.Connection, options: LoopIngestOptions) -> d
     refresh_family_scores(conn, loop_id, result["experiment_families"], timestamp)
     conn.commit()
     result["dry_run"] = False
-    knowledge_candidate_count = len(result["candidates"]) + (
+    knowledge_candidate_count = len(result["knowledge_candidates"]) + (
         1 if result["metrics"]["primary"] else 0
     )
     result["applied"] = {
@@ -730,12 +730,12 @@ def classify_family(attempts: int, kept: int, failed: int, guardrail_failures: i
     return "unclear"
 
 
-def candidate_summaries(
+def knowledge_candidate_summaries(
     envelopes: list[dict[str, Any]],
     families: list[dict[str, Any]],
     primary: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
+    knowledge_candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
 
     if primary and primary.get("delta") not in (None, 0, "0"):
@@ -745,7 +745,9 @@ def candidate_summaries(
             f"({primary['delta']}, {primary['direction']}) in loop {first_data['loop_id']} "
             f"run {first_data['run_id']}."
         )
-        candidates.append(candidate("memory", "Loop metric baseline changed", body, 0.82))
+        knowledge_candidates.append(
+            knowledge_candidate("memory", "Loop metric baseline changed", body, 0.82)
+        )
         seen.add(("memory", claim_key(body)))
 
     for family in families:
@@ -758,8 +760,8 @@ def candidate_summaries(
             )
             key = (target, claim_key(body))
             if key not in seen:
-                candidates.append(
-                    candidate(target, f"Loop family: {family['name']}", body, 0.8)
+                knowledge_candidates.append(
+                    knowledge_candidate(target, f"Loop family: {family['name']}", body, 0.8)
                 )
                 seen.add(key)
         if family["kept"] >= 3 and family["guardrail_failures"] == 0:
@@ -770,8 +772,8 @@ def candidate_summaries(
             )
             key = ("skill", claim_key(body))
             if key not in seen:
-                candidates.append(
-                    candidate(
+                knowledge_candidates.append(
+                    knowledge_candidate(
                         "skill",
                         f"Procedure: {family['name']}",
                         body,
@@ -790,8 +792,8 @@ def candidate_summaries(
             key = (target, claim_key(body))
             if key in seen:
                 continue
-            candidates.append(
-                candidate(
+            knowledge_candidates.append(
+                knowledge_candidate(
                     target,
                     title_from_body(body),
                     body,
@@ -801,10 +803,10 @@ def candidate_summaries(
                 )
             )
             seen.add(key)
-    return candidates
+    return knowledge_candidates
 
 
-def candidate(
+def knowledge_candidate(
     target: str,
     title: str,
     body: str,

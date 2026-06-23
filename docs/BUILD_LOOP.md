@@ -46,28 +46,29 @@ Exit evidence:
 - at least three independent audit artifacts
 - repo tests still pass
 
-### Loop 1: Quality Harness
+### Loop 1: Final Core Quality Harness
 
-Goal: create an eval harness that samples ingested candidates and grades target,
-evidence, confidence, redaction, duplicate, and actionability quality.
-
-Exit evidence:
-
-- repeatable CLI command for evaluation
-- JSON/Markdown report output
-- tests for evaluator logic
-- baseline report over the local historical DB
-
-### Loop 2: Consolidation Review UX
-
-Goal: make candidate review practical for a human/operator before any live writes.
+Goal: keep tests focused on the final evidence/knowledge core: typed values,
+identity-spine dedupe, source-backed rendering, privacy gates, and human-gated
+capability proposals.
 
 Exit evidence:
 
-- review queue CLI
-- approve/reject/defer commands
-- proposal grouping/deduplication
-- audit trail for decisions
+- repeatable test/ruff/compileall commands
+- tests for evidence/knowledge/link behavior
+- tests for human-gated proposal-first behavior
+- tests proving legacy table removal
+
+### Loop 2: Knowledge Proposal UX
+
+Goal: make human-gated knowledge practical to inspect before any live writes.
+
+Exit evidence:
+
+- proposal markdown for human-gated knowledge rows
+- stale/supersession operations over `knowledge`
+- evidence links included in proposals
+- no live skill/policy/wiki/memory apply
 
 ### Loop 3: Runtime Integration Proof
 
@@ -81,17 +82,17 @@ Exit evidence:
 - documented install/config path
 - no live mutation unless explicitly approved
 
-### Loop 4: Historical Backfill Iterations
+### Loop 4: Runtime Install And Public Surface
 
-Goal: run multiple bounded passes over history, improve filters/classifiers, and track
-how quality changes over time.
+Goal: publish and install the lightweight brain, then update public surfaces to
+point at `ocbrain`.
 
 Exit evidence:
 
-- before/after candidate distributions
-- false positive/false negative examples
-- redaction leakage audit
-- narrowed ingestion profiles by source type
+- public GitHub repo
+- local MCP install for Codex/Claude/OpenClaw
+- MCP smoke proof
+- public site updates
 
 ### Loop 5: Loop-Aware Brain Ingest
 
@@ -103,7 +104,7 @@ Exit evidence:
 
 - `ocbrain.loop_result.v1` envelope validation
 - dry-run `brain-loop-ingest` command
-- deterministic run summary, metric, experiment-family, candidate, and tripwire output
+- deterministic run summary, metric, experiment-family, knowledge, and tripwire output
 - tests proving dry-run ingest writes nothing
 - explicit `--apply` mode writes loop-tagged evidence/knowledge rows and is idempotent
 - `family_scores` rollup is derivable from loop-tagged rows
@@ -121,7 +122,8 @@ Exit evidence:
 
 ## Current Next Action
 
-Continue Loop 5 loop-aware brain ingest:
+Continue Loop 5 final-spec work:
 
-- add loop digest/wiki draft writers before any human-gated promotion
+- add prune/heal jobs over `knowledge`
+- add liveness watcher wiring over runner ledger/deadman timestamps
 - keep scheduled dry-run readiness queued until loop evidence ingestion is stable

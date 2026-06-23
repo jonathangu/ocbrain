@@ -92,7 +92,7 @@ def write_result(
     return result_path
 
 
-def test_loop_ingest_reconstructs_counts_and_candidates(tmp_path: Path) -> None:
+def test_loop_ingest_reconstructs_counts_and_knowledge_candidates(tmp_path: Path) -> None:
     artifacts = tmp_path / "loops" / "artifacts" / "repo-quality-loop" / "2026-06-23-nightly"
     write_result(artifacts, "exp_001", decision="kept", delta=-8)
     write_result(artifacts, "exp_002", decision="kept", delta=-4)
@@ -113,8 +113,9 @@ def test_loop_ingest_reconstructs_counts_and_candidates(tmp_path: Path) -> None:
     assert result["metrics"]["primary"]["name"] == "typecheck_errors"
     assert result["metrics"]["primary"]["best"] == 9
     assert result["experiment_families"][0]["status"] == "promising"
-    assert any(candidate["target"] == "skill" for candidate in result["candidates"]) is False
-    assert any("typecheck_narrowing" in candidate["body"] for candidate in result["candidates"])
+    knowledge_candidates = result["knowledge_candidates"]
+    assert any(candidate["target"] == "skill" for candidate in knowledge_candidates) is False
+    assert any("typecheck_narrowing" in candidate["body"] for candidate in knowledge_candidates)
 
 
 def test_loop_ingest_reports_missing_artifact_tripwire(tmp_path: Path) -> None:
@@ -153,12 +154,12 @@ def test_loop_ingest_proposes_skill_after_repeated_success(tmp_path: Path) -> No
         )
     )
 
-    skill_candidates = [
-        candidate for candidate in result["candidates"] if candidate["target"] == "skill"
+    skill_knowledge_candidates = [
+        candidate for candidate in result["knowledge_candidates"] if candidate["target"] == "skill"
     ]
-    assert skill_candidates
-    assert skill_candidates[0]["status"] == "proposal_only"
-    assert "typecheck_narrowing" in skill_candidates[0]["body"]
+    assert skill_knowledge_candidates
+    assert skill_knowledge_candidates[0]["status"] == "proposal_only"
+    assert "typecheck_narrowing" in skill_knowledge_candidates[0]["body"]
 
 
 def test_loop_ingest_rejects_invalid_envelope(tmp_path: Path) -> None:

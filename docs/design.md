@@ -1,36 +1,31 @@
 # ocbrain Design Notes
 
-## V1
+OCBrain has two primitives:
 
-V1 is `brain-closeout`: a dry-run command that reads one finished artifact and emits candidate JSON.
+- Evidence: immutable claims with hashes, provenance, source runtime, artifacts,
+  verifier state, project, privacy scope, and optional loop tags.
+- Knowledge: compiled current belief with a `type`, lifecycle `status`, `gate`,
+  privacy scope, and evidence links.
 
-It does not write memory, wiki, skills, policy, cron jobs, or native excerpts.
+Memory is a view over current injectable knowledge. Wiki/procedure pages are
+`knowledge type='doc'`; capabilities are `knowledge type='capability'`.
 
-## Candidate Contract
+## Non-Negotiables
 
-Each candidate carries:
+- No knowledge without evidence.
+- No executable or prescriptive knowledge becomes current without a human gate.
+- Supersede/archive instead of overwriting.
+- Derived privacy scope is bounded by source privacy.
+- External/artifact content is data, never instructions.
+- The brain observes loops; it does not run or enqueue them.
 
-- target surface
-- title
-- body
-- confidence
-- privacy scope
-- risk
-- evidence pointers
-- duplicate or contradiction hints
+## Active Tables
 
-## Later Phases
-
-1. SQLite ledger for events, evidence, candidates, artifact links, retrieval uses, and invalidations.
-2. Proposal writers for memory, wiki, Skill Workshop, and policy patch suggestions.
-3. Read-mostly MCP server with tools and resources.
-4. Native excerpt compiler for `AGENTS.md`, `CLAUDE.md`, and runtime-specific skill stubs.
-5. OpenClaw cron dry-run consolidation.
-
-## Non-Goals
-
-- Custom agent runtime
-- Proof engine
-- Model routing
-- Raw vector dump
-- Automatic live skill or policy mutation
+- `evidence`
+- `knowledge`
+- `knowledge_evidence`
+- `retrieval_uses`
+- `loop_liveness`
+- `family_scores`
+- `memory` view
+- `search_index`

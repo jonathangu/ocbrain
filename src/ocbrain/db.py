@@ -4,39 +4,26 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from ocbrain.ids import stable_id
-from ocbrain.schema import Candidate, Evidence
-from ocbrain.text import claim_key
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
-REVIEWED_OUTPUT_STATUSES = ("approved", "proposed", "applied")
+PUBLIC_SCOPES = ("workspace", "project", "public")
 
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
-CREATE TABLE IF NOT EXISTS events (
-  id TEXT PRIMARY KEY,
-  source_type TEXT NOT NULL,
-  source_uri TEXT NOT NULL,
-  content_hash TEXT NOT NULL,
-  title TEXT NOT NULL,
-  summary TEXT NOT NULL,
-  body TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'workspace',
-  metadata_json TEXT NOT NULL DEFAULT '{}',
-  created_at TEXT,
-  ingested_at TEXT NOT NULL,
-  triaged_at TEXT,
-  UNIQUE(source_uri, content_hash)
-);
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS candidates;
+DROP TABLE IF EXISTS artifact_links;
+DROP TABLE IF EXISTS invalidations;
+DROP TABLE IF EXISTS candidate_decisions;
+DROP TABLE IF EXISTS legacy_evidence;
 
 CREATE TABLE IF NOT EXISTS evidence (
   id TEXT PRIMARY KEY,
@@ -105,68 +92,21 @@ CREATE TABLE IF NOT EXISTS knowledge_evidence (
   PRIMARY KEY (knowledge_id, evidence_id, relation)
 );
 
-CREATE TABLE IF NOT EXISTS candidates (
-  id TEXT PRIMARY KEY,
-  event_id TEXT REFERENCES events(id) ON DELETE SET NULL,
-  target TEXT NOT NULL,
-  title TEXT NOT NULL,
-  body TEXT NOT NULL,
-  confidence REAL NOT NULL,
-  scope TEXT NOT NULL,
-  risk TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'draft',
-  claim_key TEXT NOT NULL DEFAULT '',
-  hints_json TEXT NOT NULL DEFAULT '[]',
-  evidence_json TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  UNIQUE(event_id, target, title, body)
-);
-
-CREATE TABLE IF NOT EXISTS artifact_links (
-  id TEXT PRIMARY KEY,
-  candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-  surface TEXT NOT NULL,
-  uri TEXT NOT NULL,
-  line_start INTEGER,
-  line_end INTEGER,
-  applied_at TEXT,
-  applied_by TEXT
-);
-
 CREATE TABLE IF NOT EXISTS retrieval_uses (
   id TEXT PRIMARY KEY,
-  artifact_or_candidate_id TEXT NOT NULL,
   knowledge_id TEXT REFERENCES knowledge(id),
-  runtime TEXT,
   served_to_runtime TEXT,
-  query TEXT,
   task_ref TEXT,
   affected_decision INTEGER,
   corrected INTEGER,
-  outcome TEXT,
+  outcome TEXT CHECK (
+    outcome IN (
+      'improved','failed','neutral','unknown',
+      'served','helpful','used','irrelevant','ignored','harmful'
+    )
+  ) DEFAULT 'unknown',
   note TEXT,
-  served_at TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS invalidations (
-  id TEXT PRIMARY KEY,
-  old_candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-  new_candidate_id TEXT REFERENCES candidates(id) ON DELETE SET NULL,
-  reason TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS candidate_decisions (
-  id TEXT PRIMARY KEY,
-  candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
-  action TEXT NOT NULL,
-  actor TEXT NOT NULL,
-  reason TEXT NOT NULL,
-  previous_status TEXT NOT NULL,
-  next_status TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  served_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS loop_liveness (
@@ -212,20 +152,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
 """
 
 
-@dataclass(frozen=True)
-class EventInput:
-    id: str
-    source_type: str
-    source_uri: str
-    content_hash: str
-    title: str
-    summary: str
-    body: str
-    scope: str = "workspace"
-    metadata: dict[str, Any] | None = None
-    created_at: str | None = None
-
-
 def now_iso() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -238,108 +164,8 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    migrate_legacy_evidence_table(conn)
     conn.executescript(SCHEMA)
-    ensure_column(conn, "candidates", "claim_key", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "retrieval_uses", "knowledge_id", "TEXT")
-    ensure_column(conn, "retrieval_uses", "served_to_runtime", "TEXT")
-    ensure_column(conn, "retrieval_uses", "task_ref", "TEXT")
-    ensure_column(conn, "retrieval_uses", "affected_decision", "INTEGER")
-    ensure_column(conn, "retrieval_uses", "corrected", "INTEGER")
-    ensure_column(conn, "retrieval_uses", "served_at", "TEXT")
     conn.commit()
-
-
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
-    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def migrate_legacy_evidence_table(conn: sqlite3.Connection) -> None:
-    columns = table_columns(conn, "evidence")
-    if columns and "claim" not in columns:
-        conn.execute("ALTER TABLE evidence RENAME TO legacy_evidence")
-
-
-def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
-def upsert_event(conn: sqlite3.Connection, event: EventInput) -> bool:
-    ingested_at = now_iso()
-    try:
-        conn.execute(
-            """
-            INSERT INTO events (
-              id, source_type, source_uri, content_hash, title, summary, body,
-              scope, metadata_json, created_at, ingested_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.id,
-                event.source_type,
-                event.source_uri,
-                event.content_hash,
-                event.title,
-                event.summary,
-                event.body,
-                event.scope,
-                json.dumps(event.metadata or {}, sort_keys=True),
-                event.created_at,
-                ingested_at,
-            ),
-        )
-    except sqlite3.IntegrityError:
-        return False
-
-    upsert_search_index(
-        conn,
-        event.id,
-        event.source_type,
-        event.title,
-        event.body,
-        event.source_uri,
-    )
-    return True
-
-
-def add_evidence(conn: sqlite3.Connection, event_id: str, evidence: Evidence, kind: str) -> str:
-    event = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-    evidence_id = stable_id(
-        "evd",
-        evidence.uri,
-        event["content_hash"] if event else event_id,
-        evidence.excerpt,
-    )
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO evidence (
-          id, source_type, source_runtime, source_uri, content_hash, claim,
-          artifact_uri, artifact_hash, verifier_status, loop_tags, project,
-          privacy_scope, occurred_at, ingested_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            evidence_id,
-            kind,
-            None,
-            evidence.uri,
-            event["content_hash"] if event else stable_id("hash", evidence.excerpt),
-            evidence.excerpt,
-            evidence.uri,
-            None,
-            "not_required",
-            None,
-            None,
-            event["scope"] if event else "workspace",
-            event["created_at"] if event else None,
-            now_iso(),
-        ),
-    )
-    return evidence_id
 
 
 def upsert_evidence(
@@ -368,13 +194,16 @@ def upsert_evidence(
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_uri, content_hash) DO UPDATE SET
+          source_type = excluded.source_type,
+          source_runtime = excluded.source_runtime,
           claim = excluded.claim,
           artifact_uri = excluded.artifact_uri,
           artifact_hash = excluded.artifact_hash,
           verifier_status = excluded.verifier_status,
           loop_tags = excluded.loop_tags,
           project = excluded.project,
-          privacy_scope = excluded.privacy_scope
+          privacy_scope = excluded.privacy_scope,
+          occurred_at = excluded.occurred_at
         """,
         (
             evidence_id,
@@ -396,7 +225,7 @@ def upsert_evidence(
     upsert_search_index(
         conn,
         evidence_id,
-        source_type,
+        f"evidence:{source_type}",
         claim[:160],
         claim,
         source_uri or artifact_uri or evidence_id,
@@ -433,6 +262,7 @@ def upsert_knowledge(
     privacy_scope: str = "workspace",
     approved_by: str | None = None,
 ) -> str:
+    validate_knowledge_value(knowledge_type, value_numeric, value_text, value_bool)
     if knowledge_type == "value":
         knowledge_id = stable_id("know", subject or "", predicate or "", project or "")
     else:
@@ -526,6 +356,19 @@ def upsert_knowledge(
     return knowledge_id
 
 
+def validate_knowledge_value(
+    knowledge_type: str,
+    value_numeric: float | None,
+    value_text: str | None,
+    value_bool: bool | None,
+) -> None:
+    if knowledge_type != "value":
+        return
+    set_count = sum(value is not None for value in (value_numeric, value_text, value_bool))
+    if set_count != 1:
+        raise ValueError("value knowledge must set exactly one typed value field")
+
+
 def link_knowledge_evidence(
     conn: sqlite3.Connection,
     knowledge_id: str,
@@ -544,10 +387,6 @@ def link_knowledge_evidence(
     )
 
 
-def knowledge_search_body(**kwargs: Any) -> str:
-    return " ".join(str(value) for value in kwargs.values() if value is not None)
-
-
 def upsert_search_index(
     conn: sqlite3.Connection,
     doc_id: str,
@@ -563,172 +402,50 @@ def upsert_search_index(
     )
 
 
-def log_retrieval_use(
-    conn: sqlite3.Connection,
-    artifact_or_candidate_id: str,
-    *,
-    runtime: str | None = None,
-    query: str | None = None,
-    outcome: str | None = None,
-    note: str | None = None,
-) -> str:
-    created_at = now_iso()
-    sequence = conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
-    retrieval_id = stable_id(
-        "ret",
-        artifact_or_candidate_id,
-        runtime or "",
-        query or "",
-        outcome or "",
-        note or "",
-        created_at,
-        str(sequence),
-    )
-    conn.execute(
-        """
-        INSERT INTO retrieval_uses (
-          id, artifact_or_candidate_id, knowledge_id, runtime, served_to_runtime,
-          query, outcome, note, served_at, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            retrieval_id,
-            artifact_or_candidate_id,
-            artifact_or_candidate_id if artifact_or_candidate_id.startswith("know_") else None,
-            runtime,
-            runtime,
-            query,
-            outcome,
-            note,
-            created_at,
-            created_at,
-        ),
-    )
-    return retrieval_id
-
-
-def update_retrieval_use_feedback(
-    conn: sqlite3.Connection,
-    retrieval_use_id: str,
-    *,
-    outcome: str,
-    note: str | None = None,
-) -> bool:
-    cursor = conn.execute(
-        """
-        UPDATE retrieval_uses
-        SET outcome = ?, note = ?
-        WHERE id = ?
-        """,
-        (outcome, note, retrieval_use_id),
-    )
-    return cursor.rowcount > 0
-
-
-def insert_candidate(
-    conn: sqlite3.Connection, candidate: Candidate, event_id: str | None = None
-) -> str | None:
-    candidate_id = stable_id(
-        "cand",
-        event_id or "",
-        candidate.target.value,
-        candidate.title,
-        candidate.body,
-    )
-    timestamp = now_iso()
-    try:
-        conn.execute(
-            """
-            INSERT INTO candidates (
-              id, event_id, target, title, body, confidence, scope, risk,
-              claim_key, hints_json, evidence_json, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                candidate_id,
-                event_id,
-                candidate.target.value,
-                candidate.title,
-                candidate.body,
-                candidate.confidence,
-                candidate.scope.value,
-                candidate.risk.value,
-                candidate.claim_key or claim_key(f"{candidate.target.value} {candidate.body}"),
-                json.dumps(candidate.hints, sort_keys=True),
-                json.dumps([item.to_dict() for item in candidate.evidence], sort_keys=True),
-                timestamp,
-                timestamp,
-            ),
-        )
-    except sqlite3.IntegrityError:
-        return None
-    return candidate_id
-
-
-def backfill_candidate_claim_keys(conn: sqlite3.Connection, limit: int | None = None) -> int:
-    sql = """
-        SELECT id, target, body, evidence_json
-        FROM candidates
-        WHERE claim_key IS NULL OR claim_key = ''
-        ORDER BY created_at ASC
-    """
-    params: tuple[Any, ...] = ()
-    if limit is not None:
-        sql += " LIMIT ?"
-        params = (limit,)
-    updated = 0
-    for row in conn.execute(sql, params):
-        evidence = json.loads(row["evidence_json"] or "[]")
-        excerpt = ""
-        for item in evidence:
-            excerpt = item.get("excerpt", "")
-            if excerpt:
-                break
-        key_source = excerpt or row["body"]
-        key = claim_key(f"{row['target']} {key_source}")
-        conn.execute(
-            "UPDATE candidates SET claim_key = ?, updated_at = ? WHERE id = ?",
-            (key, now_iso(), row["id"]),
-        )
-        updated += 1
-    return updated
-
-
-def mark_event_triaged(conn: sqlite3.Connection, event_id: str) -> None:
-    conn.execute("UPDATE events SET triaged_at = ? WHERE id = ?", (now_iso(), event_id))
-
-
-def iter_untriaged_events(
-    conn: sqlite3.Connection, limit: int | None = None
-) -> Iterable[sqlite3.Row]:
-    sql = "SELECT * FROM events WHERE triaged_at IS NULL ORDER BY ingested_at ASC"
-    params: tuple[Any, ...] = ()
-    if limit is not None:
-        sql += " LIMIT ?"
-        params = (limit,)
-    yield from conn.execute(sql, params)
+def knowledge_search_body(**kwargs: Any) -> str:
+    return " ".join(str(value) for value in kwargs.values() if value is not None)
 
 
 def search(
     conn: sqlite3.Connection,
     query: str,
     limit: int = 10,
-    scopes: tuple[str, ...] | None = None,
+    scopes: tuple[str, ...] | None = PUBLIC_SCOPES,
+    filters: dict[str, Any] | None = None,
 ) -> list[sqlite3.Row]:
     normalized_query = normalize_fts_query(query)
     if not normalized_query:
         return []
-    scope_clause = ""
+    clauses = ["search_index MATCH ?"]
     params: list[Any] = [normalized_query]
     if scopes:
         placeholders = ",".join("?" for _ in scopes)
-        scope_clause = (
-            "AND COALESCE(events.scope, knowledge.privacy_scope, evidence.privacy_scope) "
-            f"IN ({placeholders})"
+        clauses.append(
+            f"COALESCE(knowledge.privacy_scope, evidence.privacy_scope) IN ({placeholders})"
         )
         params.extend(scopes)
+    filters = filters or {}
+    if filters.get("project"):
+        clauses.append("(knowledge.project = ? OR evidence.project = ?)")
+        params.extend([filters["project"], filters["project"]])
+    if filters.get("type"):
+        clauses.append("knowledge.type = ?")
+        params.append(filters["type"])
+    if filters.get("status"):
+        clauses.append("knowledge.status = ?")
+        params.append(filters["status"])
+    if filters.get("loop_id"):
+        clauses.append(
+            "(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)"
+        )
+        needle = f'%\"loop_id\": \"{filters["loop_id"]}\"%'
+        params.extend([needle, needle])
+    if filters.get("family"):
+        clauses.append(
+            "(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)"
+        )
+        needle = f'%\"family\": \"{filters["family"]}\"%'
+        params.extend([needle, needle])
     params.append(limit)
     return list(
         conn.execute(
@@ -739,13 +456,11 @@ def search(
               search_index.title,
               snippet(search_index, 3, '[', ']', ' ... ', 12) AS snippet,
               search_index.path,
-              COALESCE(events.scope, knowledge.privacy_scope, evidence.privacy_scope) AS scope
+              COALESCE(knowledge.privacy_scope, evidence.privacy_scope) AS scope
             FROM search_index
-            LEFT JOIN events ON events.id = search_index.doc_id
             LEFT JOIN knowledge ON knowledge.id = search_index.doc_id
             LEFT JOIN evidence ON evidence.id = search_index.doc_id
-            WHERE search_index MATCH ?
-            {scope_clause}
+            WHERE {' AND '.join(clauses)}
             ORDER BY rank
             LIMIT ?
             """,
@@ -757,51 +472,6 @@ def search(
 def normalize_fts_query(query: str) -> str:
     terms = re.findall(r"[\w-]{2,}", query.lower())
     return " OR ".join(f'"{term}"' for term in terms[:8])
-
-
-def list_candidates(
-    conn: sqlite3.Connection,
-    target: str | None = None,
-    status: str | None = None,
-    scope: str | None = None,
-    limit: int = 20,
-    *,
-    statuses: tuple[str, ...] | None = None,
-) -> list[sqlite3.Row]:
-    if status and statuses:
-        raise ValueError("pass either status or statuses, not both")
-    clauses: list[str] = []
-    params: list[Any] = []
-    if target:
-        clauses.append("target = ?")
-        params.append(target)
-    if status:
-        clauses.append("status = ?")
-        params.append(status)
-    if statuses:
-        placeholders = ",".join("?" for _ in statuses)
-        clauses.append(f"status IN ({placeholders})")
-        params.extend(statuses)
-    if scope:
-        clauses.append("scope = ?")
-        params.append(scope)
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    params.append(limit)
-    return list(
-        conn.execute(
-            f"""
-            SELECT * FROM candidates
-            {where}
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            params,
-        )
-    )
-
-
-def get_candidate(conn: sqlite3.Connection, candidate_id: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
 
 
 def get_knowledge(conn: sqlite3.Connection, knowledge_id: str) -> sqlite3.Row | None:
@@ -840,7 +510,7 @@ def list_current_knowledge(
     conn: sqlite3.Connection,
     *,
     project: str | None = None,
-    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    scopes: tuple[str, ...] = PUBLIC_SCOPES,
     limit: int = 20,
     knowledge_type: str | None = None,
     doc_kind: str | None = None,
@@ -882,11 +552,47 @@ def list_current_knowledge(
     )
 
 
+def list_knowledge(
+    conn: sqlite3.Connection,
+    *,
+    status: str | None = None,
+    knowledge_type: str | None = None,
+    scopes: tuple[str, ...] | None = PUBLIC_SCOPES,
+    limit: int = 20,
+) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if knowledge_type:
+        clauses.append("type = ?")
+        params.append(knowledge_type)
+    if scopes:
+        placeholders = ",".join("?" for _ in scopes)
+        clauses.append(f"privacy_scope IN ({placeholders})")
+        params.extend(scopes)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM knowledge
+            {where}
+            ORDER BY updated_at DESC, id ASC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+
+
 def get_current_doc(
     conn: sqlite3.Connection,
     *,
     slug: str,
-    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    scopes: tuple[str, ...] = PUBLIC_SCOPES,
     doc_kind: str | None = None,
 ) -> sqlite3.Row | None:
     clauses = ["status = 'current'", "type = 'doc'", "slug = ?"]
@@ -962,38 +668,43 @@ def knowledge_digest(
     conn: sqlite3.Connection,
     *,
     project: str | None = None,
-    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    scopes: tuple[str, ...] = PUBLIC_SCOPES,
     limit: int = 12,
 ) -> dict[str, Any]:
-    values = list_current_knowledge(
-        conn,
-        project=project,
-        scopes=scopes,
-        limit=limit,
-        knowledge_type="value",
-    )
-    docs = list_current_knowledge(
-        conn,
-        project=project,
-        scopes=scopes,
-        limit=limit,
-        knowledge_type="doc",
-    )
-    capabilities = list_current_knowledge(
-        conn,
-        project=project,
-        scopes=scopes,
-        limit=limit,
-        knowledge_type="capability",
-    )
-    injected = list_current_knowledge(
-        conn,
-        project=project,
-        scopes=scopes,
-        limit=limit,
-        inject_only=True,
-    )
-    family_rows = [
+    return {
+        "counts": counts(conn),
+        "project": project,
+        "scopes": list(scopes),
+        "memory": [
+            knowledge_summary(row)
+            for row in list_current_knowledge(
+                conn, project=project, scopes=scopes, limit=limit, inject_only=True
+            )
+        ],
+        "values": [
+            knowledge_summary(row)
+            for row in list_current_knowledge(
+                conn, project=project, scopes=scopes, limit=limit, knowledge_type="value"
+            )
+        ],
+        "documents": [
+            knowledge_summary(row)
+            for row in list_current_knowledge(
+                conn, project=project, scopes=scopes, limit=limit, knowledge_type="doc"
+            )
+        ],
+        "capabilities": [
+            knowledge_summary(row)
+            for row in list_current_knowledge(
+                conn, project=project, scopes=scopes, limit=limit, knowledge_type="capability"
+            )
+        ],
+        "loop_families": loop_family_rows(conn, limit=limit),
+    }
+
+
+def loop_family_rows(conn: sqlite3.Connection, *, limit: int = 12) -> list[dict[str, Any]]:
+    return [
         dict(row)
         for row in conn.execute(
             """
@@ -1005,16 +716,6 @@ def knowledge_digest(
             (limit,),
         )
     ]
-    return {
-        "counts": counts(conn),
-        "project": project,
-        "scopes": list(scopes),
-        "memory": [knowledge_summary(row) for row in injected],
-        "values": [knowledge_summary(row) for row in values],
-        "documents": [knowledge_summary(row) for row in docs],
-        "capabilities": [knowledge_summary(row) for row in capabilities],
-        "loop_families": family_rows,
-    }
 
 
 def render_doc_markdown(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
@@ -1044,6 +745,57 @@ def render_doc_markdown(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def log_retrieval_use(
+    conn: sqlite3.Connection,
+    knowledge_id: str | None,
+    *,
+    runtime: str | None = None,
+    task_ref: str | None = None,
+    outcome: str = "served",
+    note: str | None = None,
+) -> str:
+    created_at = now_iso()
+    sequence = conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
+    retrieval_id = stable_id(
+        "ret",
+        knowledge_id or "",
+        runtime or "",
+        task_ref or "",
+        outcome,
+        note or "",
+        created_at,
+        str(sequence),
+    )
+    conn.execute(
+        """
+        INSERT INTO retrieval_uses (
+          id, knowledge_id, served_to_runtime, task_ref, outcome, note, served_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (retrieval_id, knowledge_id, runtime, task_ref, outcome, note, created_at),
+    )
+    return retrieval_id
+
+
+def update_retrieval_use_feedback(
+    conn: sqlite3.Connection,
+    retrieval_use_id: str,
+    *,
+    outcome: str,
+    note: str | None = None,
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE retrieval_uses
+        SET outcome = ?, note = ?
+        WHERE id = ?
+        """,
+        (outcome, note, retrieval_use_id),
+    )
+    return cursor.rowcount > 0
+
+
 def mark_knowledge_stale(
     conn: sqlite3.Connection,
     knowledge_id: str,
@@ -1063,214 +815,43 @@ def mark_knowledge_stale(
     return cursor.rowcount > 0
 
 
-def transition_candidate(
+def approve_knowledge(
     conn: sqlite3.Connection,
-    candidate_id: str,
+    knowledge_id: str,
     *,
-    action: str,
-    next_status: str,
     actor: str,
-    reason: str,
-) -> str:
-    row = get_candidate(conn, candidate_id)
-    if row is None:
-        raise ValueError(f"candidate not found: {candidate_id}")
-    previous_status = row["status"]
-    created_at = now_iso()
-    decision_id = stable_id(
-        "dec",
-        candidate_id,
-        action,
-        previous_status,
-        next_status,
-        actor,
-        reason,
-        created_at,
-    )
-    conn.execute(
+) -> bool:
+    cursor = conn.execute(
         """
-        INSERT INTO candidate_decisions (
-          id, candidate_id, action, actor, reason, previous_status, next_status, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        UPDATE knowledge
+        SET status = 'current',
+            approved_by = ?,
+            updated_at = ?
+        WHERE id = ? AND gate = 'human' AND status = 'candidate'
         """,
-        (
-            decision_id,
-            candidate_id,
-            action,
-            actor,
-            reason,
-            previous_status,
-            next_status,
-            created_at,
-        ),
+        (actor, now_iso(), knowledge_id),
     )
-    conn.execute(
-        "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
-        (next_status, created_at, candidate_id),
-    )
-    return decision_id
-
-
-def list_candidate_decisions(conn: sqlite3.Connection, candidate_id: str) -> list[sqlite3.Row]:
-    return list(
-        conn.execute(
-            """
-            SELECT * FROM candidate_decisions
-            WHERE candidate_id = ?
-            ORDER BY created_at ASC
-            """,
-            (candidate_id,),
-        )
-    )
-
-
-def review_groups(
-    conn: sqlite3.Connection,
-    *,
-    status: str = "draft",
-    target: str | None = None,
-    limit: int = 20,
-    include_low_value: bool = False,
-) -> list[sqlite3.Row]:
-    clauses = ["status = ?", "target != 'ignore'"]
-    params: list[Any] = [status]
-    if target:
-        clauses.append("target = ?")
-        params.append(target)
-    params.append(max(limit * 20, limit))
-    rows = list(
-        conn.execute(
-            f"""
-            SELECT
-              COALESCE(NULLIF(claim_key, ''), body) AS claim_key,
-              target,
-              COUNT(*) AS count,
-              MIN(id) AS sample_candidate_id,
-              MIN(title) AS sample_title,
-              MIN(risk) AS risk,
-              MIN(confidence) AS confidence
-            FROM candidates
-            WHERE {' AND '.join(clauses)}
-            GROUP BY target, COALESCE(NULLIF(claim_key, ''), body)
-            ORDER BY count DESC, sample_title ASC
-            LIMIT ?
-            """,
-            params,
-        )
-    )
-    if include_low_value:
-        return rows[:limit]
-    return [row for row in rows if not is_low_value_review_group(row["target"], row["claim_key"])][
-        :limit
-    ]
-
-
-def review_group_candidates(
-    conn: sqlite3.Connection,
-    *,
-    target: str,
-    claim_key: str,
-    status: str = "draft",
-    limit: int | None = None,
-) -> list[sqlite3.Row]:
-    sql = """
-        SELECT *
-        FROM candidates
-        WHERE status = ?
-          AND target = ?
-          AND COALESCE(NULLIF(claim_key, ''), body) = ?
-        ORDER BY confidence DESC, created_at ASC, id ASC
-    """
-    params: list[Any] = [status, target, claim_key]
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-    return list(conn.execute(sql, params))
-
-
-def transition_candidate_group(
-    conn: sqlite3.Connection,
-    *,
-    target: str,
-    claim_key: str,
-    status: str,
-    action: str,
-    next_status: str,
-    actor: str,
-    reason: str,
-    limit: int | None = None,
-) -> list[str]:
-    rows = review_group_candidates(
-        conn,
-        target=target,
-        claim_key=claim_key,
-        status=status,
-        limit=limit,
-    )
-    decision_ids: list[str] = []
-    for row in rows:
-        decision_ids.append(
-            transition_candidate(
-                conn,
-                row["id"],
-                action=action,
-                next_status=next_status,
-                actor=actor,
-                reason=reason,
-            )
-        )
-    return decision_ids
-
-
-def is_low_value_review_group(target: str, claim_key: str) -> bool:
-    normalized = re.sub(r"\s+", " ", claim_key.lower()).strip()
-    if not normalized:
-        return True
-    target_prefix = f"{target} "
-    body = normalized.removeprefix(target_prefix).strip()
-    if body in {"", target, "status ok", "openclawbrain"}:
-        return True
-    if re.fullmatch(r"date \d{4} \d{2} \d{2}", body):
-        return True
-    if body in {"true", "false", "null", "ok"}:
-        return True
-    if len(body.split()) <= 1:
-        return True
-    return any(
-        marker in body
-        for marker in (
-            "brain loaded runtime hook registered",
-            "openclawbrain brain not yet loaded",
-            "session key",
-            "pagetype",
-            "openclaw home",
-        )
-    )
+    return cursor.rowcount > 0
 
 
 def counts(conn: sqlite3.Connection) -> dict[str, Any]:
-    event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    candidate_count = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
     evidence_count = conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
     knowledge_count = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
-    by_target = {
-        row["target"]: row["count"]
-        for row in conn.execute(
-            "SELECT target, COUNT(*) AS count FROM candidates GROUP BY target ORDER BY target"
-        )
-    }
     by_knowledge_type = {
         row["type"]: row["count"]
         for row in conn.execute(
             "SELECT type, COUNT(*) AS count FROM knowledge GROUP BY type ORDER BY type"
         )
     }
+    by_status = {
+        row["status"]: row["count"]
+        for row in conn.execute(
+            "SELECT status, COUNT(*) AS count FROM knowledge GROUP BY status ORDER BY status"
+        )
+    }
     return {
-        "events": event_count,
-        "candidates": candidate_count,
         "evidence": evidence_count,
         "knowledge": knowledge_count,
-        "by_target": by_target,
         "by_knowledge_type": by_knowledge_type,
+        "by_status": by_status,
     }
