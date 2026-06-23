@@ -213,28 +213,72 @@ def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
     second_payload = json.loads(capsys.readouterr().out)
 
     conn = connect(db_path)
-    assert first_payload["applied"]["items"] == 2
-    assert second_payload["applied"]["items"] == 2
-    assert conn.execute("SELECT COUNT(*) FROM loop_runs").fetchone()[0] == 1
-    assert conn.execute("SELECT COUNT(*) FROM loop_items").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM loop_iterations").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM loop_metrics").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM loop_artifacts").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM loop_tripwires").fetchone()[0] == 1
+    assert first_payload["applied"]["evidence"] == 4
+    assert second_payload["applied"]["evidence"] == 4
+    assert conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM knowledge WHERE type = 'value'").fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM family_scores").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE source_type = 'loop_tripwire'"
+    ).fetchone()[0] == 1
 
 
-def test_loop_tables_exist_after_init(tmp_path: Path) -> None:
+def test_loop_success_skill_candidate_is_human_gated(tmp_path: Path, capsys) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(artifacts, "exp_001", decision="kept", delta=-8)
+    write_result(artifacts, "exp_002", decision="kept", delta=-4)
+    write_result(artifacts, "exp_003", decision="kept", delta=-2)
+    db_path = tmp_path / "ocbrain.sqlite"
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "loop-ingest",
+                "--loop-id",
+                "repo-quality-loop",
+                "--run-id",
+                "2026-06-23-nightly",
+                "--artifacts",
+                str(artifacts),
+                "--apply",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    conn = connect(db_path)
+    row = conn.execute("SELECT * FROM knowledge WHERE type = 'capability'").fetchone()
+    assert row["gate"] == "human"
+    assert row["status"] == "candidate"
+
+
+def test_final_core_tables_exist_after_init_without_parallel_loop_schema(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
 
     tables = {
         row["name"]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'loop_%'"
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
+    }
+    views = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'view'")
     }
 
     assert {
+        "evidence",
+        "knowledge",
+        "knowledge_evidence",
+        "loop_liveness",
+        "family_scores",
+    } <= tables
+    assert "memory" in views
+    assert not {
         "loop_programs",
         "loop_runs",
         "loop_items",
@@ -243,4 +287,4 @@ def test_loop_tables_exist_after_init(tmp_path: Path) -> None:
         "loop_artifacts",
         "loop_tripwires",
         "loop_candidate_links",
-    } <= tables
+    } & tables

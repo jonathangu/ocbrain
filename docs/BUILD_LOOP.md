@@ -96,7 +96,8 @@ Exit evidence:
 ### Loop 5: Loop-Aware Brain Ingest
 
 Goal: make ocbrain understand autonomous loop result envelopes without becoming
-the loop runner.
+the loop runner, using the final evidence/knowledge core instead of parallel
+loop tables.
 
 Exit evidence:
 
@@ -104,7 +105,8 @@ Exit evidence:
 - dry-run `brain-loop-ingest` command
 - deterministic run summary, metric, experiment-family, candidate, and tripwire output
 - tests proving dry-run ingest writes nothing
-- explicit `--apply` mode writes only loop audit/index tables and is idempotent
+- explicit `--apply` mode writes loop-tagged evidence/knowledge rows and is idempotent
+- `family_scores` rollup is derivable from loop-tagged rows
 
 ### Loop 6: Scheduler Readiness
 
@@ -121,5 +123,5 @@ Exit evidence:
 
 Continue Loop 5 loop-aware brain ingest:
 
-- add loop digest/wiki draft writers before any live memory/wiki/skill/policy mutation
+- add loop digest/wiki draft writers before any human-gated promotion
 - keep scheduled dry-run readiness queued until loop evidence ingestion is stable

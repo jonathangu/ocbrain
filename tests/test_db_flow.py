@@ -8,9 +8,12 @@ from ocbrain.db import (
     counts,
     init_db,
     insert_candidate,
+    link_knowledge_evidence,
     list_candidates,
     search,
     upsert_event,
+    upsert_evidence,
+    upsert_knowledge,
 )
 from ocbrain.excerpt import write_excerpt
 from ocbrain.ingest import IngestOptions, event_from_file
@@ -153,6 +156,59 @@ def test_search_scope_filter_excludes_private_rows(tmp_path: Path) -> None:
     rows = search(conn, "alpha needle", scopes=("workspace", "project", "public"))
 
     assert {row["doc_id"] for row in rows} == {"evt_workspace"}
+
+
+def test_core_identity_spine_dedupes_value_across_runtime_evidence(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    codex_evidence = upsert_evidence(
+        conn,
+        source_type="closeout",
+        source_runtime="codex",
+        source_uri="/tmp/codex.json",
+        content_hash="hash-codex",
+        claim="Codex uses the shared ocbrain MCP server.",
+    )
+    claude_evidence = upsert_evidence(
+        conn,
+        source_type="closeout",
+        source_runtime="claude_code",
+        source_uri="/tmp/claude.json",
+        content_hash="hash-claude",
+        claim="Claude Code uses the shared ocbrain MCP server.",
+    )
+
+    first_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime_memory",
+        predicate="shared_brain_enabled",
+        value_bool=True,
+        status="current",
+        inject=True,
+        confidence=0.9,
+    )
+    second_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime_memory",
+        predicate="shared_brain_enabled",
+        value_bool=True,
+        status="current",
+        inject=True,
+        confidence=0.91,
+    )
+    link_knowledge_evidence(conn, first_id, codex_evidence)
+    link_knowledge_evidence(conn, second_id, claude_evidence)
+    conn.commit()
+
+    assert first_id == second_id
+    assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM knowledge_evidence").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0] == 1
 
 
 def test_rebuild_candidates_stales_generic_drafts(tmp_path: Path) -> None:

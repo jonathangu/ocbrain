@@ -40,13 +40,69 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE TABLE IF NOT EXISTS evidence (
   id TEXT PRIMARY KEY,
-  event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL,
-  uri TEXT NOT NULL,
-  excerpt TEXT NOT NULL,
-  line_start INTEGER,
-  line_end INTEGER,
-  created_at TEXT NOT NULL
+  source_type TEXT NOT NULL,
+  source_runtime TEXT,
+  source_uri TEXT,
+  content_hash TEXT NOT NULL,
+  claim TEXT NOT NULL,
+  artifact_uri TEXT,
+  artifact_hash TEXT,
+  verifier_status TEXT CHECK (
+    verifier_status IN ('unknown','passed','failed','not_required')
+  ) DEFAULT 'unknown',
+  loop_tags TEXT,
+  project TEXT,
+  privacy_scope TEXT CHECK (
+    privacy_scope IN ('private','workspace','project','public')
+  ) DEFAULT 'workspace',
+  occurred_at TEXT,
+  ingested_at TEXT NOT NULL,
+  UNIQUE(source_uri, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS knowledge (
+  id TEXT PRIMARY KEY,
+  type TEXT CHECK (type IN ('value','doc','capability')) NOT NULL,
+  subject TEXT,
+  predicate TEXT,
+  value_numeric REAL,
+  value_text TEXT,
+  value_bool INTEGER,
+  unit TEXT,
+  target_value REAL,
+  slug TEXT,
+  title TEXT,
+  body_uri TEXT,
+  doc_kind TEXT,
+  status TEXT CHECK (
+    status IN ('candidate','current','superseded','stale','archived')
+  ) DEFAULT 'candidate',
+  superseded_by TEXT REFERENCES knowledge(id),
+  invalidation_reason TEXT,
+  gate TEXT CHECK (gate IN ('auto','human')) NOT NULL,
+  prescriptive INTEGER DEFAULT 0,
+  inject INTEGER DEFAULT 0,
+  risk TEXT CHECK (risk IN ('low','medium','high','critical')) DEFAULT 'low',
+  confidence REAL,
+  content_hash TEXT,
+  loop_tags TEXT,
+  project TEXT,
+  privacy_scope TEXT CHECK (
+    privacy_scope IN ('private','workspace','project','public')
+  ) DEFAULT 'workspace',
+  approved_by TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS knowledge_evidence (
+  knowledge_id TEXT NOT NULL REFERENCES knowledge(id),
+  evidence_id TEXT NOT NULL REFERENCES evidence(id),
+  relation TEXT CHECK (
+    relation IN ('supports','contradicts','derived_from','supersedes')
+  ),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (knowledge_id, evidence_id, relation)
 );
 
 CREATE TABLE IF NOT EXISTS candidates (
@@ -81,10 +137,16 @@ CREATE TABLE IF NOT EXISTS artifact_links (
 CREATE TABLE IF NOT EXISTS retrieval_uses (
   id TEXT PRIMARY KEY,
   artifact_or_candidate_id TEXT NOT NULL,
+  knowledge_id TEXT REFERENCES knowledge(id),
   runtime TEXT,
+  served_to_runtime TEXT,
   query TEXT,
+  task_ref TEXT,
+  affected_decision INTEGER,
+  corrected INTEGER,
   outcome TEXT,
   note TEXT,
+  served_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -107,203 +169,38 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
   created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS loop_programs (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  project TEXT,
-  owner TEXT,
-  objective TEXT NOT NULL,
-  primary_metric_name TEXT,
-  primary_metric_direction TEXT CHECK (
-    primary_metric_direction IN ('higher_is_better','lower_is_better','target','boolean')
-  ),
-  baseline_value TEXT,
-  baseline_measured_at TEXT,
-  guardrails_json TEXT,
-  allowed_scope_json TEXT,
-  blocked_actions_json TEXT,
-  budget_json TEXT,
-  schedule_json TEXT,
-  verifier_ref TEXT,
-  status TEXT CHECK (
-    status IN ('draft','enabled','paused','disabled','archived')
-  ) DEFAULT 'draft',
-  risk TEXT CHECK (risk IN ('low','medium','high','critical')) DEFAULT 'medium',
-  privacy_scope TEXT CHECK (
-    privacy_scope IN ('private','workspace','project','public')
-  ) DEFAULT 'workspace',
-  definition_uri TEXT,
-  content_hash TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS loop_liveness (
+  loop_id TEXT NOT NULL,
+  run_id TEXT,
+  last_heartbeat_at TEXT,
+  last_ledger_write_at TEXT,
+  expected_interval_seconds INTEGER,
+  deadman_due_at TEXT,
+  PRIMARY KEY (loop_id, run_id)
 );
 
-CREATE TABLE IF NOT EXISTS loop_runs (
-  id TEXT PRIMARY KEY,
-  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
-  trigger_type TEXT CHECK (
-    trigger_type IN ('heartbeat','cron','manual','taskflow','api','unknown')
+CREATE TABLE IF NOT EXISTS family_scores (
+  loop_id TEXT NOT NULL,
+  family TEXT NOT NULL,
+  attempts INTEGER,
+  kept INTEGER,
+  reverted INTEGER,
+  approach_failures INTEGER,
+  verifier_pass_rate REAL,
+  mean_primary_delta REAL,
+  recency TEXT,
+  state TEXT CHECK (
+    state IN ('promising','exhausted','blocked','risky','stale','untried')
   ),
-  trigger_ref TEXT,
-  orchestrator_session_uri TEXT,
-  backlog_snapshot_uri TEXT,
-  backlog_snapshot_hash TEXT,
-  started_at TEXT,
-  ended_at TEXT,
-  status TEXT CHECK (
-    status IN (
-      'planned','running','completed','failed','paused','cancelled','wedged','needs_review'
-    )
-  ),
-  budget_used_json TEXT,
-  summary TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  refreshed_at TEXT,
+  PRIMARY KEY (loop_id, family)
 );
 
-CREATE TABLE IF NOT EXISTS loop_items (
-  id TEXT PRIMARY KEY,
-  loop_run_id TEXT NOT NULL REFERENCES loop_runs(id),
-  external_backlog_id TEXT,
-  spec_uri TEXT,
-  spec_hash TEXT,
-  experiment_family TEXT,
-  status TEXT CHECK (
-    status IN (
-      'pending','claimed','running','done','failed','skipped','reverted','needs_review','stale'
-    )
-  ),
-  claimed_by TEXT,
-  worker_session_uri TEXT,
-  timeout_seconds INTEGER,
-  claimed_at TEXT,
-  started_at TEXT,
-  ended_at TEXT,
-  final_decision TEXT CHECK (
-    final_decision IN ('kept','reverted','failed','skipped','needs_review','unknown')
-  ),
-  failure_reason TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS loop_iterations (
-  id TEXT PRIMARY KEY,
-  loop_item_id TEXT NOT NULL REFERENCES loop_items(id),
-  loop_run_id TEXT NOT NULL REFERENCES loop_runs(id),
-  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
-  hypothesis TEXT,
-  mechanism TEXT,
-  experiment_family TEXT,
-  change_summary TEXT,
-  changed_files_json TEXT,
-  eval_command TEXT,
-  guardrail_commands_json TEXT,
-  verifier_command TEXT,
-  verifier_passed INTEGER CHECK (verifier_passed IN (0,1)),
-  baseline_value TEXT,
-  result_value TEXT,
-  delta_value TEXT,
-  decision TEXT CHECK (decision IN ('kept','reverted','failed','needs_review','skipped')),
-  lesson_summary TEXT,
-  next_candidate TEXT,
-  started_at TEXT,
-  ended_at TEXT,
-  duration_seconds INTEGER,
-  tokens_used INTEGER,
-  cost_estimate REAL,
-  tool_profile TEXT,
-  privacy_scope TEXT CHECK (
-    privacy_scope IN ('private','workspace','project','public')
-  ) DEFAULT 'workspace',
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS loop_metrics (
-  id TEXT PRIMARY KEY,
-  loop_iteration_id TEXT REFERENCES loop_iterations(id),
-  loop_run_id TEXT REFERENCES loop_runs(id),
-  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
-  metric_name TEXT NOT NULL,
-  metric_kind TEXT CHECK (
-    metric_kind IN ('primary','guardrail','cost','latency','quality','safety','operational')
-  ),
-  direction TEXT CHECK (direction IN ('higher_is_better','lower_is_better','target','boolean')),
-  unit TEXT,
-  baseline_value REAL,
-  result_value REAL,
-  delta_value REAL,
-  passed INTEGER CHECK (passed IN (0,1)),
-  measured_at TEXT NOT NULL,
-  evidence_uri TEXT,
-  evidence_hash TEXT
-);
-
-CREATE TABLE IF NOT EXISTS loop_artifacts (
-  id TEXT PRIMARY KEY,
-  loop_iteration_id TEXT REFERENCES loop_iterations(id),
-  loop_run_id TEXT REFERENCES loop_runs(id),
-  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
-  kind TEXT CHECK (
-    kind IN (
-      'diff','patch','benchmark','eval','log','report','screenshot','verifier','model','config',
-      'other'
-    )
-  ),
-  uri TEXT NOT NULL,
-  hash TEXT,
-  size_bytes INTEGER,
-  verifier_status TEXT CHECK (
-    verifier_status IN ('unknown','passed','failed','not_required')
-  ) DEFAULT 'unknown',
-  privacy_scope TEXT CHECK (
-    privacy_scope IN ('private','workspace','project','public')
-  ) DEFAULT 'workspace',
-  produced_at TEXT,
-  ingested_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS loop_tripwires (
-  id TEXT PRIMARY KEY,
-  loop_id TEXT REFERENCES loop_programs(id),
-  loop_run_id TEXT REFERENCES loop_runs(id),
-  loop_item_id TEXT REFERENCES loop_items(id),
-  kind TEXT CHECK (
-    kind IN (
-      'stale_running_item',
-      'heartbeat_starved',
-      'no_ledger_writes',
-      'verifier_failure_streak',
-      'approval_gate_reached',
-      'cost_spike',
-      'regression_streak',
-      'dangerous_action_attempt',
-      'artifact_missing',
-      'config_or_secret_risk',
-      'other'
-    )
-  ),
-  severity TEXT CHECK (severity IN ('info','warning','high','critical')),
-  status TEXT CHECK (status IN ('open','acknowledged','resolved','ignored')) DEFAULT 'open',
-  message TEXT,
-  evidence_uri TEXT,
-  opened_at TEXT NOT NULL,
-  resolved_at TEXT,
-  resolved_by TEXT
-);
-
-CREATE TABLE IF NOT EXISTS loop_candidate_links (
-  id TEXT PRIMARY KEY,
-  candidate_id TEXT NOT NULL REFERENCES candidates(id),
-  loop_id TEXT REFERENCES loop_programs(id),
-  loop_run_id TEXT REFERENCES loop_runs(id),
-  loop_iteration_id TEXT REFERENCES loop_iterations(id),
-  relation TEXT CHECK (
-    relation IN ('derived_from','supports','contradicts','supersedes','invalidates')
-  ),
-  created_at TEXT NOT NULL
-);
+CREATE VIEW IF NOT EXISTS memory AS
+ SELECT id, type, subject, predicate, value_numeric, value_text, value_bool,
+        title, body_uri, project, privacy_scope
+ FROM knowledge
+ WHERE status='current' AND inject=1;
 
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   doc_id UNINDEXED,
@@ -341,8 +238,15 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    migrate_legacy_evidence_table(conn)
     conn.executescript(SCHEMA)
     ensure_column(conn, "candidates", "claim_key", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "retrieval_uses", "knowledge_id", "TEXT")
+    ensure_column(conn, "retrieval_uses", "served_to_runtime", "TEXT")
+    ensure_column(conn, "retrieval_uses", "task_ref", "TEXT")
+    ensure_column(conn, "retrieval_uses", "affected_decision", "INTEGER")
+    ensure_column(conn, "retrieval_uses", "corrected", "INTEGER")
+    ensure_column(conn, "retrieval_uses", "served_at", "TEXT")
     conn.commit()
 
 
@@ -350,6 +254,16 @@ def ensure_column(conn: sqlite3.Connection, table: str, column: str, definition:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_legacy_evidence_table(conn: sqlite3.Connection) -> None:
+    columns = table_columns(conn, "evidence")
+    if columns and "claim" not in columns:
+        conn.execute("ALTER TABLE evidence RENAME TO legacy_evidence")
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def upsert_event(conn: sqlite3.Connection, event: EventInput) -> bool:
@@ -380,41 +294,273 @@ def upsert_event(conn: sqlite3.Connection, event: EventInput) -> bool:
     except sqlite3.IntegrityError:
         return False
 
-    conn.execute(
-        "INSERT INTO search_index (doc_id, kind, title, body, path) VALUES (?, ?, ?, ?, ?)",
-        (event.id, event.source_type, event.title, event.body, event.source_uri),
+    upsert_search_index(
+        conn,
+        event.id,
+        event.source_type,
+        event.title,
+        event.body,
+        event.source_uri,
     )
     return True
 
 
 def add_evidence(conn: sqlite3.Connection, event_id: str, evidence: Evidence, kind: str) -> str:
+    event = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
     evidence_id = stable_id(
         "evd",
-        event_id,
         evidence.uri,
+        event["content_hash"] if event else event_id,
         evidence.excerpt,
-        str(evidence.line_start),
-        str(evidence.line_end),
     )
     conn.execute(
         """
         INSERT OR IGNORE INTO evidence (
-          id, event_id, kind, uri, excerpt, line_start, line_end, created_at
+          id, source_type, source_runtime, source_uri, content_hash, claim,
+          artifact_uri, artifact_hash, verifier_status, loop_tags, project,
+          privacy_scope, occurred_at, ingested_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             evidence_id,
-            event_id,
             kind,
+            None,
             evidence.uri,
+            event["content_hash"] if event else stable_id("hash", evidence.excerpt),
             evidence.excerpt,
-            evidence.line_start,
-            evidence.line_end,
+            evidence.uri,
+            None,
+            "not_required",
+            None,
+            None,
+            event["scope"] if event else "workspace",
+            event["created_at"] if event else None,
             now_iso(),
         ),
     )
     return evidence_id
+
+
+def upsert_evidence(
+    conn: sqlite3.Connection,
+    *,
+    source_type: str,
+    claim: str,
+    content_hash: str,
+    source_uri: str | None = None,
+    source_runtime: str | None = None,
+    artifact_uri: str | None = None,
+    artifact_hash: str | None = None,
+    verifier_status: str = "unknown",
+    loop_tags: dict[str, Any] | None = None,
+    project: str | None = None,
+    privacy_scope: str = "workspace",
+    occurred_at: str | None = None,
+) -> str:
+    evidence_id = stable_id("evd", source_uri or "", content_hash)
+    conn.execute(
+        """
+        INSERT INTO evidence (
+          id, source_type, source_runtime, source_uri, content_hash, claim,
+          artifact_uri, artifact_hash, verifier_status, loop_tags, project,
+          privacy_scope, occurred_at, ingested_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_uri, content_hash) DO UPDATE SET
+          claim = excluded.claim,
+          artifact_uri = excluded.artifact_uri,
+          artifact_hash = excluded.artifact_hash,
+          verifier_status = excluded.verifier_status,
+          loop_tags = excluded.loop_tags,
+          project = excluded.project,
+          privacy_scope = excluded.privacy_scope
+        """,
+        (
+            evidence_id,
+            source_type,
+            source_runtime,
+            source_uri,
+            content_hash,
+            claim,
+            artifact_uri,
+            artifact_hash,
+            verifier_status,
+            json.dumps(loop_tags, sort_keys=True) if loop_tags else None,
+            project,
+            privacy_scope,
+            occurred_at,
+            now_iso(),
+        ),
+    )
+    upsert_search_index(
+        conn,
+        evidence_id,
+        source_type,
+        claim[:160],
+        claim,
+        source_uri or artifact_uri or evidence_id,
+    )
+    return evidence_id
+
+
+def upsert_knowledge(
+    conn: sqlite3.Connection,
+    *,
+    knowledge_type: str,
+    gate: str,
+    subject: str | None = None,
+    predicate: str | None = None,
+    value_numeric: float | None = None,
+    value_text: str | None = None,
+    value_bool: bool | None = None,
+    unit: str | None = None,
+    target_value: float | None = None,
+    slug: str | None = None,
+    title: str | None = None,
+    body_uri: str | None = None,
+    doc_kind: str | None = None,
+    status: str = "candidate",
+    superseded_by: str | None = None,
+    invalidation_reason: str | None = None,
+    prescriptive: bool = False,
+    inject: bool = False,
+    risk: str = "low",
+    confidence: float | None = None,
+    content_hash: str | None = None,
+    loop_tags: dict[str, Any] | None = None,
+    project: str | None = None,
+    privacy_scope: str = "workspace",
+    approved_by: str | None = None,
+) -> str:
+    if knowledge_type == "value":
+        knowledge_id = stable_id("know", subject or "", predicate or "", project or "")
+    else:
+        knowledge_id = stable_id("know", slug or title or "", knowledge_type, project or "")
+    timestamp = now_iso()
+    if prescriptive or knowledge_type == "capability" or risk in {"high", "critical"}:
+        gate = "human"
+        if status == "current" and not approved_by:
+            status = "candidate"
+    conn.execute(
+        """
+        INSERT INTO knowledge (
+          id, type, subject, predicate, value_numeric, value_text, value_bool,
+          unit, target_value, slug, title, body_uri, doc_kind, status,
+          superseded_by, invalidation_reason, gate, prescriptive, inject, risk,
+          confidence, content_hash, loop_tags, project, privacy_scope, approved_by,
+          created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          value_numeric = excluded.value_numeric,
+          value_text = excluded.value_text,
+          value_bool = excluded.value_bool,
+          unit = excluded.unit,
+          target_value = excluded.target_value,
+          title = excluded.title,
+          body_uri = excluded.body_uri,
+          doc_kind = excluded.doc_kind,
+          status = excluded.status,
+          superseded_by = excluded.superseded_by,
+          invalidation_reason = excluded.invalidation_reason,
+          gate = excluded.gate,
+          prescriptive = excluded.prescriptive,
+          inject = excluded.inject,
+          risk = excluded.risk,
+          confidence = excluded.confidence,
+          content_hash = excluded.content_hash,
+          loop_tags = excluded.loop_tags,
+          privacy_scope = excluded.privacy_scope,
+          approved_by = excluded.approved_by,
+          updated_at = excluded.updated_at
+        """,
+        (
+            knowledge_id,
+            knowledge_type,
+            subject,
+            predicate,
+            value_numeric,
+            value_text,
+            1 if value_bool is True else 0 if value_bool is False else None,
+            unit,
+            target_value,
+            slug,
+            title,
+            body_uri,
+            doc_kind,
+            status,
+            superseded_by,
+            invalidation_reason,
+            gate,
+            1 if prescriptive else 0,
+            1 if inject else 0,
+            risk,
+            confidence,
+            content_hash,
+            json.dumps(loop_tags, sort_keys=True) if loop_tags else None,
+            project,
+            privacy_scope,
+            approved_by,
+            timestamp,
+            timestamp,
+        ),
+    )
+    upsert_search_index(
+        conn,
+        knowledge_id,
+        f"knowledge:{knowledge_type}",
+        title or subject or slug or knowledge_id,
+        knowledge_search_body(
+            knowledge_type=knowledge_type,
+            subject=subject,
+            predicate=predicate,
+            value_numeric=value_numeric,
+            value_text=value_text,
+            value_bool=value_bool,
+            title=title,
+            body_uri=body_uri,
+        ),
+        body_uri or knowledge_id,
+    )
+    return knowledge_id
+
+
+def link_knowledge_evidence(
+    conn: sqlite3.Connection,
+    knowledge_id: str,
+    evidence_id: str,
+    *,
+    relation: str = "supports",
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO knowledge_evidence (
+          knowledge_id, evidence_id, relation, created_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (knowledge_id, evidence_id, relation, now_iso()),
+    )
+
+
+def knowledge_search_body(**kwargs: Any) -> str:
+    return " ".join(str(value) for value in kwargs.values() if value is not None)
+
+
+def upsert_search_index(
+    conn: sqlite3.Connection,
+    doc_id: str,
+    kind: str,
+    title: str,
+    body: str,
+    path: str,
+) -> None:
+    conn.execute("DELETE FROM search_index WHERE doc_id = ?", (doc_id,))
+    conn.execute(
+        "INSERT INTO search_index (doc_id, kind, title, body, path) VALUES (?, ?, ?, ?, ?)",
+        (doc_id, kind, title, body, path),
+    )
 
 
 def log_retrieval_use(
@@ -441,17 +587,21 @@ def log_retrieval_use(
     conn.execute(
         """
         INSERT INTO retrieval_uses (
-          id, artifact_or_candidate_id, runtime, query, outcome, note, created_at
+          id, artifact_or_candidate_id, knowledge_id, runtime, served_to_runtime,
+          query, outcome, note, served_at, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             retrieval_id,
             artifact_or_candidate_id,
+            artifact_or_candidate_id if artifact_or_candidate_id.startswith("know_") else None,
+            runtime,
             runtime,
             query,
             outcome,
             note,
+            created_at,
             created_at,
         ),
     )
@@ -574,7 +724,10 @@ def search(
     params: list[Any] = [normalized_query]
     if scopes:
         placeholders = ",".join("?" for _ in scopes)
-        scope_clause = f"AND events.scope IN ({placeholders})"
+        scope_clause = (
+            "AND COALESCE(events.scope, knowledge.privacy_scope, evidence.privacy_scope) "
+            f"IN ({placeholders})"
+        )
         params.extend(scopes)
     params.append(limit)
     return list(
@@ -586,9 +739,11 @@ def search(
               search_index.title,
               snippet(search_index, 3, '[', ']', ' ... ', 12) AS snippet,
               search_index.path,
-              events.scope
+              COALESCE(events.scope, knowledge.privacy_scope, evidence.privacy_scope) AS scope
             FROM search_index
-            JOIN events ON events.id = search_index.doc_id
+            LEFT JOIN events ON events.id = search_index.doc_id
+            LEFT JOIN knowledge ON knowledge.id = search_index.doc_id
+            LEFT JOIN evidence ON evidence.id = search_index.doc_id
             WHERE search_index MATCH ?
             {scope_clause}
             ORDER BY rank
@@ -647,6 +802,10 @@ def list_candidates(
 
 def get_candidate(conn: sqlite3.Connection, candidate_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+
+
+def get_knowledge(conn: sqlite3.Connection, knowledge_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM knowledge WHERE id = ?", (knowledge_id,)).fetchone()
 
 
 def transition_candidate(
@@ -838,10 +997,25 @@ def is_low_value_review_group(target: str, claim_key: str) -> bool:
 def counts(conn: sqlite3.Connection) -> dict[str, Any]:
     event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
     candidate_count = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+    evidence_count = conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
+    knowledge_count = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
     by_target = {
         row["target"]: row["count"]
         for row in conn.execute(
             "SELECT target, COUNT(*) AS count FROM candidates GROUP BY target ORDER BY target"
         )
     }
-    return {"events": event_count, "candidates": candidate_count, "by_target": by_target}
+    by_knowledge_type = {
+        row["type"]: row["count"]
+        for row in conn.execute(
+            "SELECT type, COUNT(*) AS count FROM knowledge GROUP BY type ORDER BY type"
+        )
+    }
+    return {
+        "events": event_count,
+        "candidates": candidate_count,
+        "evidence": evidence_count,
+        "knowledge": knowledge_count,
+        "by_target": by_target,
+        "by_knowledge_type": by_knowledge_type,
+    }

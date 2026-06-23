@@ -2,30 +2,27 @@
 
 Lightweight shared memory for Codex, Claude, and OpenClaw.
 
-`ocbrain` is the small, auditable OpenClawBrain runtime that turns historical
-agent work into source-backed knowledge, serves it through MCP, and records
-which retrieved memories actually helped. It is installed locally on this Mac
-mini for Codex, Claude Code, and OpenClaw so each runtime can search the same
-historical ledger instead of living in separate memory silos.
+`ocbrain` is the small, auditable OpenClawBrain runtime that turns runtime
+evidence into source-backed current knowledge, serves it through MCP, and
+records which retrieved knowledge actually helped. It is installed locally on
+this Mac mini for Codex, Claude Code, and OpenClaw so each runtime can use the
+same brain instead of living in separate memory silos.
 
-The consolidation pipeline starts with one narrow job: take a completed work
-artifact and produce structured dry-run candidates for the right durable surface:
+The core model has two primitives:
 
-- `memory`: evidence, facts, preferences, decisions
-- `wiki`: compiled belief and stable synthesis
-- `skill`: repeatable behavior, proposal-first
-- `policy`: constraints, patch-suggestion only
-- `ignore`: noise, duplicates, unsafe, or not future-useful
+- `evidence`: immutable, append-only, hash-pinned claims about what happened.
+- `knowledge`: compiled current belief with a type, lifecycle, and gate.
 
-The intended shape is not a new chat agent. It is the shared knowledge layer
-behind the agents: evidence in, compact retrieval out, feedback back into the
-ledger, and proposal-first writes for durable memory/wiki/skill/policy changes.
+Memory is a view over current injectable knowledge. Wiki/procedure pages are
+`knowledge type='doc'`; skills are `knowledge type='capability'`. The hard gate
+is readable versus executable or prescriptive: capabilities, high-risk items,
+and prescriptive constraints stay human-gated.
 
 ## Status
 
 Lightweight runtime V0 is installed and working locally.
 
-- SQLite ledger
+- SQLite ledger with `evidence`, `knowledge`, `knowledge_evidence`, and `memory`
 - safe historical ingest
 - deterministic triage
 - FTS search
@@ -35,7 +32,7 @@ Lightweight runtime V0 is installed and working locally.
 - managed native excerpt output
 - stdio MCP server, read-only by default
 - local retrieval-use feedback logging
-- dry-run loop result envelope ingest
+- loop result envelope ingest into tagged evidence/knowledge rows
 
 Installed local hosts:
 
@@ -46,7 +43,7 @@ Installed local hosts:
 
 Current active work is still tracked by the long-running build loop in
 [docs/BUILD_LOOP.md](docs/BUILD_LOOP.md). The repo is intentionally conservative:
-live memory/wiki/skill/policy mutation remains proposal-first, and the MCP server
+capability and prescriptive knowledge remain human-gated, and the MCP server
 does not expose write-capable proposal tools unless it is explicitly launched
 with `--allow-writes`.
 
@@ -118,9 +115,9 @@ The MCP server currently exposes:
 - `brain.feedback`
 - `brain://digest/current`
 
-`brain.get` serves reviewed candidates by default; draft/private candidates require
-explicit inspection flags. `brain.propose` is write-capable and hidden unless the
-server is launched with `--allow-writes`.
+`brain.get` serves current knowledge and reviewed legacy candidates by default;
+candidate/private objects require explicit inspection flags. `brain.propose` is
+write-capable and hidden unless the server is launched with `--allow-writes`.
 
 `brain.search` and `brain.get` return `retrieval_use_id` values. Call
 `brain.feedback` with one of `helpful`, `used`, `irrelevant`, `ignored`, or
@@ -142,11 +139,11 @@ brain-loop-ingest \
 The envelope schema is `ocbrain.loop_result.v1` in each item `result.json`.
 Dry-run ingest validates envelopes, reconstructs done/failed/kept/reverted
 counts, summarizes the primary metric and experiment families, opens missing
-artifact tripwires in the output, and stages proposal-only skill/policy
-candidates.
+artifact tripwires in the output, and stages candidates.
 
-An explicit `--apply` mode writes only the loop audit/index tables with stable
-IDs, so re-ingesting the same run is idempotent:
+An explicit `--apply` mode writes loop-tagged `evidence` and `knowledge` rows
+with stable IDs, refreshes the derivable `family_scores` rollup, and keeps
+re-ingest idempotent:
 
 ```bash
 brain-loop-ingest \
@@ -157,15 +154,15 @@ brain-loop-ingest \
   --json
 ```
 
-It does not enqueue work, run loops, write skills, apply policy, or mutate
-memory/wiki/skill/policy surfaces.
+It does not enqueue work, run loops, install capabilities, apply policy, or
+turn human-gated knowledge current.
 
 ## Principles
 
-- Memory stores evidence.
-- Wiki compiles belief.
-- Skills compile behavior.
-- Policy constrains behavior.
+- Evidence precedes belief.
+- Knowledge compiles current belief from evidence.
+- Memory is the injected view over current knowledge.
+- Capabilities and prescriptive constraints are human-gated.
 - MCP is the shared access layer.
 - Native files are the high-adherence layer.
-- Skills and policy are proposal-first, never silent auto-mutation.
+- Supersede and archive; do not overwrite or silently delete.

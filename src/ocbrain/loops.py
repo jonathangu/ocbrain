@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ocbrain.db import now_iso
+from ocbrain.db import (
+    link_knowledge_evidence,
+    now_iso,
+    upsert_evidence,
+    upsert_knowledge,
+)
 from ocbrain.ids import content_hash, stable_id
 from ocbrain.text import claim_key, compact_whitespace
 
@@ -88,125 +93,50 @@ def write_loop_ingest(conn: sqlite3.Connection, options: LoopIngestOptions) -> d
     valid_envelopes = [envelope for envelope in envelopes if not envelope["errors"]]
     loop_id = options.loop_id
     run_row_id = result["loop_run_row_id"]
-    run_summary = json.dumps(result["summary"], sort_keys=True)
-    first = valid_envelopes[0]["data"] if valid_envelopes else {}
-
-    conn.execute(
-        """
-        INSERT INTO loop_programs (
-          id, name, project, owner, objective, primary_metric_name,
-          primary_metric_direction, baseline_value, verifier_ref, status,
-          risk, privacy_scope, definition_uri, content_hash, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          name = excluded.name,
-          project = excluded.project,
-          objective = excluded.objective,
-          primary_metric_name = excluded.primary_metric_name,
-          primary_metric_direction = excluded.primary_metric_direction,
-          baseline_value = excluded.baseline_value,
-          verifier_ref = excluded.verifier_ref,
-          privacy_scope = excluded.privacy_scope,
-          definition_uri = excluded.definition_uri,
-          content_hash = excluded.content_hash,
-          updated_at = excluded.updated_at
-        """,
-        (
-            loop_id,
-            loop_id,
-            first.get("project"),
-            None,
-            first.get("objective") or f"Loop program {loop_id}",
-            first.get("eval", {}).get("metric_name"),
-            first.get("eval", {}).get("direction"),
-            str(first.get("eval", {}).get("baseline_value")),
-            first.get("verifier", {}).get("command"),
-            "draft",
-            "medium",
-            first.get("privacy_scope", "workspace"),
-            str(options.artifacts_root),
-            content_hash(json.dumps(result, sort_keys=True)),
-            timestamp,
-            timestamp,
-        ),
-    )
-    conn.execute(
-        """
-        INSERT INTO loop_runs (
-          id, loop_id, trigger_type, trigger_ref, backlog_snapshot_uri,
-          started_at, ended_at, status, budget_used_json, summary, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          trigger_ref = excluded.trigger_ref,
-          backlog_snapshot_uri = excluded.backlog_snapshot_uri,
-          status = excluded.status,
-          budget_used_json = excluded.budget_used_json,
-          summary = excluded.summary,
-          updated_at = excluded.updated_at
-        """,
-        (
-            run_row_id,
-            loop_id,
-            "unknown",
-            options.run_id,
-            str(options.backlog) if options.backlog else None,
-            first.get("started_at"),
-            first.get("ended_at"),
-            result["run_status"],
-            None,
-            run_summary,
-            timestamp,
-            timestamp,
-        ),
-    )
-    delete_run_children(conn, run_row_id)
+    evidence_ids = []
     for envelope in valid_envelopes:
-        write_envelope_rows(conn, envelope, loop_id, run_row_id, timestamp)
+        evidence_ids.extend(write_envelope_rows(conn, envelope, loop_id, run_row_id, timestamp))
     for tripwire in result["tripwires"]:
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO loop_tripwires (
-              id, loop_id, loop_run_id, loop_item_id, kind, severity, status,
-              message, evidence_uri, opened_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                tripwire["id"],
-                loop_id,
-                run_row_id,
-                stable_id("litem", loop_id, options.run_id, tripwire["loop_item_id"]),
-                tripwire["kind"],
-                tripwire["severity"],
-                tripwire["status"],
-                tripwire["message"],
-                tripwire["evidence_uri"],
-                timestamp,
+        evidence_ids.append(
+            upsert_evidence(
+                conn,
+                source_type="loop_tripwire",
+                source_uri=tripwire["evidence_uri"],
+                content_hash=content_hash(json.dumps(tripwire, sort_keys=True)),
+                claim=tripwire["message"],
+                verifier_status="not_required",
+                loop_tags={
+                    "loop_id": loop_id,
+                    "run_id": options.run_id,
+                    "item_id": tripwire["loop_item_id"],
+                    "tripwire": tripwire["kind"],
+                },
+                privacy_scope="workspace",
+                occurred_at=timestamp,
             ),
         )
+    for candidate_summary in result["candidates"]:
+        knowledge_from_candidate_summary(
+            conn,
+            candidate_summary,
+            loop_id=loop_id,
+            run_id=options.run_id,
+            content_hash_value=content_hash(json.dumps(candidate_summary, sort_keys=True)),
+        )
+    refresh_family_scores(conn, loop_id, result["experiment_families"], timestamp)
     conn.commit()
     result["dry_run"] = False
+    knowledge_candidate_count = len(result["candidates"]) + (
+        1 if result["metrics"]["primary"] else 0
+    )
     result["applied"] = {
-        "loop_program_id": loop_id,
+        "loop_id": loop_id,
         "loop_run_id": run_row_id,
-        "items": len(valid_envelopes),
+        "evidence": len(set(evidence_ids)),
+        "knowledge_candidates": knowledge_candidate_count,
         "tripwires": len(result["tripwires"]),
     }
     return result
-
-
-def delete_run_children(conn: sqlite3.Connection, run_row_id: str) -> None:
-    for table in (
-        "loop_candidate_links",
-        "loop_tripwires",
-        "loop_artifacts",
-        "loop_metrics",
-        "loop_iterations",
-        "loop_items",
-    ):
-        conn.execute(f"DELETE FROM {table} WHERE loop_run_id = ?", (run_row_id,))
 
 
 def write_envelope_rows(
@@ -215,156 +145,252 @@ def write_envelope_rows(
     loop_id: str,
     run_row_id: str,
     timestamp: str,
-) -> None:
+) -> list[str]:
     data = envelope["data"]
     external_item_id = data["item_id"]
-    item_id = stable_id("litem", loop_id, data["run_id"], external_item_id)
-    iteration_id = stable_id("liter", loop_id, data["run_id"], external_item_id)
-    decision = data.get("decision") or "unknown"
-    status = {
-        "kept": "done",
-        "reverted": "reverted",
-        "failed": "failed",
-        "skipped": "skipped",
-        "needs_review": "needs_review",
-    }.get(decision, "needs_review")
     eval_payload = data["eval"]
     verifier = data["verifier"]
-
-    conn.execute(
-        """
-        INSERT INTO loop_items (
-          id, loop_run_id, external_backlog_id, spec_uri, spec_hash, experiment_family,
-          status, claimed_by, worker_session_uri, timeout_seconds, claimed_at, started_at,
-          ended_at, final_decision, failure_reason, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            item_id,
-            run_row_id,
-            external_item_id,
-            str(envelope["path"]),
-            result_hash(envelope["path"]),
-            data.get("experiment_family"),
-            status,
-            None,
-            data.get("worker_session_uri"),
-            None,
-            None,
-            data.get("started_at"),
-            data.get("ended_at"),
-            decision,
-            data.get("failure_reason"),
-            timestamp,
-            timestamp,
-        ),
+    loop_tags = {
+        "loop_id": loop_id,
+        "run_id": data["run_id"],
+        "item_id": external_item_id,
+        "family": data.get("experiment_family"),
+    }
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="loop_iteration",
+        source_runtime="openclaw",
+        source_uri=str(envelope["path"]),
+        content_hash=result_hash(envelope["path"]),
+        claim=loop_iteration_claim(data),
+        artifact_uri=str(envelope["path"]),
+        artifact_hash=result_hash(envelope["path"]),
+        verifier_status="passed" if verifier.get("passed") else "failed",
+        loop_tags=loop_tags,
+        project=data.get("project"),
+        privacy_scope=data.get("privacy_scope", "workspace"),
+        occurred_at=data.get("created_at") or timestamp,
     )
-    conn.execute(
-        """
-        INSERT INTO loop_iterations (
-          id, loop_item_id, loop_run_id, loop_id, hypothesis, mechanism,
-          experiment_family, change_summary, changed_files_json, eval_command,
-          guardrail_commands_json, verifier_command, verifier_passed, baseline_value,
-          result_value, delta_value, decision, lesson_summary, next_candidate,
-          started_at, ended_at, duration_seconds, tokens_used, cost_estimate,
-          tool_profile, privacy_scope, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            iteration_id,
-            item_id,
-            run_row_id,
-            loop_id,
-            data.get("hypothesis"),
-            data.get("mechanism"),
-            data.get("experiment_family"),
-            data.get("change_summary"),
-            json.dumps(data.get("changed_files") or [], sort_keys=True),
-            eval_payload.get("command"),
-            json.dumps(data.get("guardrails") or [], sort_keys=True),
-            verifier.get("command"),
-            1 if verifier.get("passed") else 0,
-            str(eval_payload.get("baseline_value")),
-            str(eval_payload.get("result_value")),
-            str(eval_payload.get("delta_value")),
-            decision,
-            "; ".join(
-                compact_whitespace(str(item.get("body", "")))
-                for item in data.get("lesson_candidates") or []
-                if item.get("body")
-            ),
-            "; ".join(data.get("next_candidates") or []),
-            data.get("started_at"),
-            data.get("ended_at"),
-            data.get("duration_seconds"),
-            data.get("tokens_used"),
-            data.get("cost_estimate"),
-            (data.get("safety") or {}).get("tool_profile"),
-            data.get("privacy_scope", "workspace"),
-            timestamp,
-            timestamp,
-        ),
+    metric_knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject=f"loop:{loop_id}:family:{data.get('experiment_family') or 'unknown'}",
+        predicate=eval_payload["metric_name"],
+        value_numeric=numeric_delta(eval_payload.get("result_value")),
+        unit=eval_payload.get("unit"),
+        target_value=numeric_delta(eval_payload.get("baseline_value")),
+        status="current" if eval_payload.get("passed") else "candidate",
+        confidence=0.82 if eval_payload.get("passed") else 0.62,
+        content_hash=result_hash(envelope["path"]),
+        loop_tags=loop_tags,
+        project=data.get("project"),
+        privacy_scope=data.get("privacy_scope", "workspace"),
     )
-    conn.execute(
-        """
-        INSERT INTO loop_metrics (
-          id, loop_iteration_id, loop_run_id, loop_id, metric_name, metric_kind,
-          direction, unit, baseline_value, result_value, delta_value, passed,
-          measured_at, evidence_uri, evidence_hash
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            stable_id(
-                "lmet",
-                loop_id,
-                data["run_id"],
-                external_item_id,
-                eval_payload["metric_name"],
-            ),
-            iteration_id,
-            run_row_id,
-            loop_id,
-            eval_payload["metric_name"],
-            "primary",
-            eval_payload["direction"],
-            eval_payload.get("unit"),
-            numeric_delta(eval_payload.get("baseline_value")),
-            numeric_delta(eval_payload.get("result_value")),
-            numeric_delta(eval_payload.get("delta_value")),
-            1 if eval_payload.get("passed") else 0,
-            data.get("ended_at") or data.get("created_at") or timestamp,
-            eval_payload.get("evidence_uri"),
-            None,
-        ),
-    )
+    link_knowledge_evidence(conn, metric_knowledge_id, evidence_id, relation="derived_from")
+    evidence_ids = [evidence_id]
     for uri in data.get("artifact_uris") or []:
         artifact_path = resolve_artifact_uri(uri, envelope["path"])
+        if artifact_path.exists():
+            evidence_ids.append(
+                upsert_evidence(
+                    conn,
+                    source_type="loop_artifact",
+                    source_runtime="openclaw",
+                    source_uri=str(artifact_path),
+                    content_hash=file_hash(artifact_path),
+                    claim=f"Loop artifact for {loop_id}/{data['run_id']}/{external_item_id}: {uri}",
+                    artifact_uri=str(artifact_path),
+                    artifact_hash=file_hash(artifact_path),
+                    verifier_status="passed" if verifier.get("passed") else "failed",
+                    loop_tags={**loop_tags, "artifact_kind": infer_artifact_kind(uri)},
+                    project=data.get("project"),
+                    privacy_scope=data.get("privacy_scope", "workspace"),
+                    occurred_at=data.get("created_at") or timestamp,
+                )
+            )
+    for lesson in data.get("lesson_candidates") or []:
+        knowledge_id = knowledge_from_lesson(conn, lesson, data, loop_tags, envelope["path"])
+        if knowledge_id:
+            link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
+    return evidence_ids
+
+
+def loop_iteration_claim(data: dict[str, Any]) -> str:
+    eval_payload = data["eval"]
+    return (
+        f"Loop {data['loop_id']} run {data['run_id']} item {data['item_id']} "
+        f"{data.get('decision', 'unknown')}; {eval_payload['metric_name']} "
+        f"{eval_payload.get('baseline_value')} -> {eval_payload.get('result_value')} "
+        f"({eval_payload.get('delta_value')})."
+    )
+
+
+def knowledge_from_lesson(
+    conn: sqlite3.Connection,
+    lesson: dict[str, Any],
+    data: dict[str, Any],
+    loop_tags: dict[str, Any],
+    result_path: Path,
+) -> str | None:
+    body = compact_whitespace(str(lesson.get("body", "")))
+    if not body:
+        return None
+    target = lesson.get("target")
+    if target == "ignore":
+        return None
+    if target == "memory":
+        return upsert_knowledge(
+            conn,
+            knowledge_type="value",
+            gate="auto",
+            subject=f"loop:{data['loop_id']}",
+            predicate=claim_key(body, limit=80),
+            value_text=body,
+            status="current" if data.get("decision") == "kept" else "candidate",
+            inject=True,
+            confidence=0.78,
+            content_hash=result_hash(result_path),
+            loop_tags=loop_tags,
+            project=data.get("project"),
+            privacy_scope=data.get("privacy_scope", "workspace"),
+        )
+    if target in {"wiki", "policy"}:
+        return upsert_knowledge(
+            conn,
+            knowledge_type="doc",
+            gate="human" if target == "policy" else "auto",
+            slug=stable_id("doc", data["loop_id"], body),
+            title=title_from_body(body),
+            body_uri=str(result_path),
+            doc_kind="procedure" if target == "policy" else "wiki",
+            status="candidate",
+            prescriptive=target == "policy",
+            risk="medium" if target == "policy" else "low",
+            confidence=0.76,
+            content_hash=result_hash(result_path),
+            loop_tags=loop_tags,
+            project=data.get("project"),
+            privacy_scope=data.get("privacy_scope", "workspace"),
+        )
+    if target == "skill":
+        return upsert_knowledge(
+            conn,
+            knowledge_type="capability",
+            gate="human",
+            slug=stable_id("cap", data["loop_id"], body),
+            title=title_from_body(body),
+            body_uri=str(result_path),
+            status="candidate",
+            risk="medium",
+            confidence=0.74,
+            content_hash=result_hash(result_path),
+            loop_tags=loop_tags,
+            project=data.get("project"),
+            privacy_scope=data.get("privacy_scope", "workspace"),
+        )
+    return None
+
+
+def knowledge_from_candidate_summary(
+    conn: sqlite3.Connection,
+    candidate_summary: dict[str, Any],
+    *,
+    loop_id: str,
+    run_id: str,
+    content_hash_value: str,
+) -> str | None:
+    target = candidate_summary["target"]
+    body = candidate_summary["body"]
+    loop_tags = {"loop_id": loop_id, "run_id": run_id}
+    if target == "memory":
+        return upsert_knowledge(
+            conn,
+            knowledge_type="value",
+            gate="auto",
+            subject=f"loop:{loop_id}",
+            predicate=claim_key(body, limit=80),
+            value_text=body,
+            status="candidate",
+            inject=True,
+            confidence=candidate_summary.get("confidence"),
+            content_hash=content_hash_value,
+            loop_tags=loop_tags,
+            privacy_scope=candidate_summary.get("privacy_scope", "workspace"),
+        )
+    if target in {"wiki", "policy"}:
+        return upsert_knowledge(
+            conn,
+            knowledge_type="doc",
+            gate="human" if target == "policy" else "auto",
+            slug=stable_id("doc", loop_id, body),
+            title=candidate_summary.get("title") or title_from_body(body),
+            body_uri=candidate_summary.get("evidence_uri"),
+            doc_kind="procedure" if target == "policy" else "wiki",
+            status="candidate",
+            prescriptive=target == "policy",
+            risk=candidate_summary.get("risk", "low"),
+            confidence=candidate_summary.get("confidence"),
+            content_hash=content_hash_value,
+            loop_tags=loop_tags,
+            privacy_scope=candidate_summary.get("privacy_scope", "workspace"),
+        )
+    if target == "skill":
+        return upsert_knowledge(
+            conn,
+            knowledge_type="capability",
+            gate="human",
+            slug=stable_id("cap", loop_id, body),
+            title=candidate_summary.get("title") or title_from_body(body),
+            body_uri=candidate_summary.get("evidence_uri"),
+            status="candidate",
+            risk=candidate_summary.get("risk", "medium"),
+            confidence=candidate_summary.get("confidence"),
+            content_hash=content_hash_value,
+            loop_tags=loop_tags,
+            privacy_scope=candidate_summary.get("privacy_scope", "workspace"),
+        )
+    return None
+
+
+def refresh_family_scores(
+    conn: sqlite3.Connection,
+    loop_id: str,
+    families: list[dict[str, Any]],
+    timestamp: str,
+) -> None:
+    conn.execute("DELETE FROM family_scores WHERE loop_id = ?", (loop_id,))
+    for family in families:
         conn.execute(
             """
-            INSERT INTO loop_artifacts (
-              id, loop_iteration_id, loop_run_id, loop_id, kind, uri, hash,
-              size_bytes, verifier_status, privacy_scope, produced_at, ingested_at
+            INSERT INTO family_scores (
+              loop_id, family, attempts, kept, reverted, approach_failures,
+              verifier_pass_rate, mean_primary_delta, recency, state, refreshed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                stable_id("lart", loop_id, data["run_id"], external_item_id, uri),
-                iteration_id,
-                run_row_id,
                 loop_id,
-                infer_artifact_kind(uri),
-                uri,
-                file_hash(artifact_path) if artifact_path.exists() else None,
-                artifact_path.stat().st_size if artifact_path.exists() else None,
-                "passed" if verifier.get("passed") else "failed",
-                data.get("privacy_scope", "workspace"),
-                data.get("ended_at"),
+                family["name"],
+                family["attempts"],
+                family["kept"],
+                family["reverted"],
+                family["failed"],
+                None,
+                family["mean_delta"],
+                timestamp,
+                family_state(family["status"]),
                 timestamp,
             ),
         )
+
+
+def family_state(status: str) -> str:
+    if status in {"promising", "risky", "stale"}:
+        return status
+    if status == "exhausted":
+        return "exhausted"
+    return "untried"
 
 
 def infer_artifact_kind(uri: str) -> str:

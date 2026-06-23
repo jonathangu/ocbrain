@@ -1,6 +1,13 @@
 import json
 
-from ocbrain.db import EventInput, connect, init_db, insert_candidate, upsert_event
+from ocbrain.db import (
+    EventInput,
+    connect,
+    init_db,
+    insert_candidate,
+    upsert_event,
+    upsert_knowledge,
+)
 from ocbrain.mcp import handle_request
 from ocbrain.schema import Candidate, Scope, Target
 
@@ -156,6 +163,66 @@ def test_mcp_get_approved_candidate_by_default(tmp_path):
     ).fetchone()
     assert row["runtime"] == "mcp"
     assert row["query"] == "brain.get"
+
+
+def test_mcp_get_current_knowledge_by_default(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="uses_shared_brain",
+        value_bool=True,
+        status="current",
+        inject=True,
+        confidence=0.9,
+    )
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.get", "arguments": {"id": knowledge_id}},
+        },
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["object_kind"] == "knowledge"
+    assert payload["id"] == knowledge_id
+    assert payload["retrieval_use_id"].startswith("ret_")
+
+
+def test_mcp_get_candidate_knowledge_requires_draft_flag(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="dangerous-capability",
+        title="Dangerous capability",
+        status="candidate",
+        risk="high",
+    )
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.get", "arguments": {"id": knowledge_id}},
+        },
+    )
+
+    assert response["error"]["code"] == -32001
+    assert "include_draft" in response["error"]["message"]
 
 
 def test_mcp_search_records_retrieval_use(tmp_path):

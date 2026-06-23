@@ -10,6 +10,7 @@ from ocbrain.db import (
     connect,
     counts,
     get_candidate,
+    get_knowledge,
     init_db,
     log_retrieval_use,
     search,
@@ -101,26 +102,35 @@ def handle_request(
                 conn.commit()
                 result = {"content": [{"type": "text", "text": json.dumps(counts(conn))}]}
             elif name == "brain.get":
-                row = get_candidate(conn, require_string(arguments, "id"))
+                requested_id = require_string(arguments, "id")
+                row = get_knowledge(conn, requested_id)
+                row_kind = "knowledge"
                 if row is None:
-                    raise ValueError(f"candidate not found: {arguments['id']}")
-                if row["scope"] == "private" and not arguments.get("include_private"):
-                    raise PermissionError("private candidate requires explicit include_private")
-                if (
-                    row["status"] not in REVIEWED_OUTPUT_STATUSES
-                    and not arguments.get("include_draft")
-                ):
-                    raise PermissionError("draft candidate requires explicit include_draft")
+                    row = get_candidate(conn, requested_id)
+                    row_kind = "candidate"
+                if row is None:
+                    raise ValueError(f"brain object not found: {arguments['id']}")
+                scope = row["privacy_scope"] if row_kind == "knowledge" else row["scope"]
+                if scope == "private" and not arguments.get("include_private"):
+                    raise PermissionError("private brain object requires explicit include_private")
+                status = row["status"]
+                if row_kind == "knowledge":
+                    reviewed = status == "current"
+                else:
+                    reviewed = status in REVIEWED_OUTPUT_STATUSES
+                if not reviewed and not arguments.get("include_draft"):
+                    raise PermissionError("candidate brain object requires explicit include_draft")
                 retrieval_use_id = log_retrieval_use(
                     conn,
                     row["id"],
                     runtime="mcp",
                     query="brain.get",
                     outcome="served",
-                    note=f"status={row['status']};scope={row['scope']}",
+                    note=f"kind={row_kind};status={status};scope={scope}",
                 )
                 conn.commit()
                 row_dict = dict(row)
+                row_dict["object_kind"] = row_kind
                 row_dict["retrieval_use_id"] = retrieval_use_id
                 result = {"content": [{"type": "text", "text": json.dumps(row_dict)}]}
             elif name == "brain.feedback":
