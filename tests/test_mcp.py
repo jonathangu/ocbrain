@@ -1,4 +1,4 @@
-from ocbrain.db import connect, init_db, insert_candidate
+from ocbrain.db import EventInput, connect, init_db, insert_candidate, upsert_event
 from ocbrain.mcp import handle_request
 from ocbrain.schema import Candidate, Scope, Target
 
@@ -146,3 +146,43 @@ def test_mcp_get_approved_candidate_by_default(tmp_path):
     )
 
     assert response["result"]["content"][0]["type"] == "text"
+    row = conn.execute(
+        "SELECT * FROM retrieval_uses WHERE artifact_or_candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row["runtime"] == "mcp"
+    assert row["query"] == "brain.get"
+
+
+def test_mcp_search_records_retrieval_use(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    event = EventInput(
+        id="evt_search",
+        source_type="doc",
+        source_uri="/tmp/search.md",
+        content_hash="hash-search",
+        title="MCP search",
+        summary="Architecture uses MCP search.",
+        body="Architecture uses MCP search.",
+    )
+    assert upsert_event(conn, event)
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.search", "arguments": {"query": "MCP search"}},
+        },
+    )
+
+    assert "result" in response
+    row = conn.execute(
+        "SELECT * FROM retrieval_uses WHERE artifact_or_candidate_id = ?",
+        (event.id,),
+    ).fetchone()
+    assert row["runtime"] == "mcp"
+    assert row["query"] == "brain.search:MCP search"

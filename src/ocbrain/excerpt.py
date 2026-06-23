@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from ocbrain.db import REVIEWED_OUTPUT_STATUSES, list_candidates
+from ocbrain.db import REVIEWED_OUTPUT_STATUSES, list_candidates, log_retrieval_use
 
 BEGIN = "<!-- BEGIN OCBRAIN MANAGED BLOCK -->"
 END = "<!-- END OCBRAIN MANAGED BLOCK -->"
@@ -62,6 +63,7 @@ def write_excerpt(
     include_draft: bool = False,
 ) -> Path:
     block = build_excerpt(conn, runtime, scope, limit, status, include_draft)
+    wrote_path = output_path
     if output_path.exists():
         existing = output_path.read_text(encoding="utf-8")
         start = existing.find(BEGIN)
@@ -70,8 +72,33 @@ def write_excerpt(
             end += len(END)
             new_text = existing[:start] + block.rstrip() + existing[end:]
             output_path.write_text(new_text.rstrip() + "\n", encoding="utf-8")
+            log_excerpt_retrievals(conn, block, runtime, scope, status, limit, wrote_path)
+            conn.commit()
             return output_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prefix = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
     output_path.write_text((prefix.rstrip() + "\n\n" + block).lstrip(), encoding="utf-8")
+    log_excerpt_retrievals(conn, block, runtime, scope, status, limit, wrote_path)
+    conn.commit()
     return output_path
+
+
+def log_excerpt_retrievals(
+    conn,
+    block: str,
+    runtime: str,
+    scope: str | None,
+    status: str | None,
+    limit: int,
+    output_path: Path,
+) -> None:
+    query = f"scope={scope or '*'};status={status or 'reviewed'};limit={limit}"
+    for candidate_id in re.findall(r"\[(cand_[a-z0-9]+)\]$", block, flags=re.MULTILINE):
+        log_retrieval_use(
+            conn,
+            candidate_id,
+            runtime=f"excerpt:{runtime}",
+            query=query,
+            outcome="included",
+            note=str(output_path),
+        )

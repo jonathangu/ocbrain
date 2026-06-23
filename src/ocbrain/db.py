@@ -219,6 +219,47 @@ def add_evidence(conn: sqlite3.Connection, event_id: str, evidence: Evidence, ki
     return evidence_id
 
 
+def log_retrieval_use(
+    conn: sqlite3.Connection,
+    artifact_or_candidate_id: str,
+    *,
+    runtime: str | None = None,
+    query: str | None = None,
+    outcome: str | None = None,
+    note: str | None = None,
+) -> str:
+    created_at = now_iso()
+    sequence = conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
+    retrieval_id = stable_id(
+        "ret",
+        artifact_or_candidate_id,
+        runtime or "",
+        query or "",
+        outcome or "",
+        note or "",
+        created_at,
+        str(sequence),
+    )
+    conn.execute(
+        """
+        INSERT INTO retrieval_uses (
+          id, artifact_or_candidate_id, runtime, query, outcome, note, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            retrieval_id,
+            artifact_or_candidate_id,
+            runtime,
+            query,
+            outcome,
+            note,
+            created_at,
+        ),
+    )
+    return retrieval_id
+
+
 def insert_candidate(
     conn: sqlite3.Connection, candidate: Candidate, event_id: str | None = None
 ) -> str | None:

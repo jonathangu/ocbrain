@@ -12,6 +12,7 @@ from ocbrain.db import (
     search,
     upsert_event,
 )
+from ocbrain.excerpt import write_excerpt
 from ocbrain.ingest import IngestOptions, event_from_file
 from ocbrain.schema import Candidate, Evidence, Target
 
@@ -339,6 +340,35 @@ def test_invalidate_temporal_records_supersession(tmp_path: Path, capsys) -> Non
     invalidation = conn.execute("SELECT * FROM invalidations").fetchone()
     assert invalidation["old_candidate_id"] == old_id
     assert invalidation["new_candidate_id"] == new_id
+
+
+def test_write_excerpt_records_retrieval_use(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    candidate_id = insert_candidate(
+        conn,
+        Candidate(
+            target=Target.WIKI,
+            title="Approved runtime context",
+            body="Draft wiki synthesis from source: Runtime context is reviewed.",
+            confidence=0.8,
+            evidence=[Evidence(uri="/tmp/source.md", excerpt="Runtime context is reviewed.")],
+        ),
+    )
+    conn.execute("UPDATE candidates SET status = 'approved' WHERE id = ?", (candidate_id,))
+    conn.commit()
+
+    output_path = tmp_path / "AGENTS.md"
+    write_excerpt(conn, output_path, "codex", None, 5)
+
+    row = conn.execute(
+        "SELECT * FROM retrieval_uses WHERE artifact_or_candidate_id = ?",
+        (candidate_id,),
+    ).fetchone()
+    assert row["runtime"] == "excerpt:codex"
+    assert row["outcome"] == "included"
+    assert row["note"] == str(output_path)
 
 
 def test_review_approve_gates_proposal_generation(tmp_path: Path) -> None:

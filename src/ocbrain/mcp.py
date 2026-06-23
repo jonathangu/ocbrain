@@ -5,7 +5,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ocbrain.db import REVIEWED_OUTPUT_STATUSES, connect, counts, get_candidate, init_db, search
+from ocbrain.db import (
+    REVIEWED_OUTPUT_STATUSES,
+    connect,
+    counts,
+    get_candidate,
+    init_db,
+    log_retrieval_use,
+    search,
+)
 from ocbrain.proposals import write_proposal
 
 INSTRUCTIONS = (
@@ -64,10 +72,28 @@ def handle_request(
                 query = require_string(arguments, "query")
                 limit = min(max(int(arguments.get("limit", 10)), 1), 50)
                 rows = search(conn, query, limit, scopes=("workspace", "project", "public"))
+                for row in rows:
+                    log_retrieval_use(
+                        conn,
+                        row["doc_id"],
+                        runtime="mcp",
+                        query=f"brain.search:{query}",
+                        outcome="served",
+                        note=f"limit={limit}",
+                    )
+                conn.commit()
                 result = {
                     "content": [{"type": "text", "text": json.dumps([dict(row) for row in rows])}]
                 }
             elif name == "brain.digest":
+                log_retrieval_use(
+                    conn,
+                    "brain://digest/current",
+                    runtime="mcp",
+                    query="brain.digest",
+                    outcome="served",
+                )
+                conn.commit()
                 result = {"content": [{"type": "text", "text": json.dumps(counts(conn))}]}
             elif name == "brain.get":
                 row = get_candidate(conn, require_string(arguments, "id"))
@@ -80,6 +106,15 @@ def handle_request(
                     and not arguments.get("include_draft")
                 ):
                     raise PermissionError("draft candidate requires explicit include_draft")
+                log_retrieval_use(
+                    conn,
+                    row["id"],
+                    runtime="mcp",
+                    query="brain.get",
+                    outcome="served",
+                    note=f"status={row['status']};scope={row['scope']}",
+                )
+                conn.commit()
                 result = {"content": [{"type": "text", "text": json.dumps(dict(row))}]}
             elif name == "brain.propose":
                 if not allow_writes:
@@ -108,6 +143,14 @@ def handle_request(
             uri = request.get("params", {}).get("uri")
             if uri != "brain://digest/current":
                 raise ValueError(f"unknown resource: {uri}")
+            log_retrieval_use(
+                conn,
+                uri,
+                runtime="mcp",
+                query="resources/read",
+                outcome="served",
+            )
+            conn.commit()
             result = {
                 "contents": [
                     {
