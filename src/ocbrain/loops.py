@@ -48,6 +48,7 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
         for envelope in valid_envelopes
         for tripwire in artifact_tripwires(envelope["data"], envelope["path"])
     ]
+    tripwires.extend(error_tripwires(envelopes, options))
     families = experiment_family_summaries(valid_envelopes)
     primary = primary_metric_summary(valid_envelopes)
     candidates = candidate_summaries(valid_envelopes, families, primary)
@@ -83,6 +84,24 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
 def write_loop_ingest(conn: sqlite3.Connection, options: LoopIngestOptions) -> dict[str, Any]:
     result = dry_run_loop_ingest(options)
     if result["envelopes"]["invalid"]:
+        for tripwire in result["tripwires"]:
+            if tripwire["kind"] in {"unverified_kept", "verifier_artifact_mismatch"}:
+                upsert_evidence(
+                    conn,
+                    source_type="loop_tripwire",
+                    source_uri=tripwire["evidence_uri"],
+                    content_hash=content_hash(json.dumps(tripwire, sort_keys=True)),
+                    claim=tripwire["message"],
+                    verifier_status="not_required",
+                    loop_tags={
+                        "loop_id": options.loop_id,
+                        "run_id": options.run_id,
+                        "tripwire": tripwire["kind"],
+                    },
+                    privacy_scope="workspace",
+                    occurred_at=now_iso(),
+                )
+        conn.commit()
         raise ValueError("cannot apply invalid loop envelopes")
 
     timestamp = now_iso()
@@ -462,12 +481,119 @@ def read_result_envelope(path: Path, options: LoopIngestOptions) -> dict[str, An
         target = candidate.get("target")
         if target not in TARGETS:
             errors.append(error(path, "invalid_lesson_target", f"{index}:{target}"))
+    if data.get("decision") == "kept":
+        validate_kept_result(path, data, errors)
 
     return {"path": path, "data": data, "errors": errors}
 
 
 def error(path: Path, kind: str, message: str) -> dict[str, str]:
     return {"path": str(path), "kind": kind, "message": message}
+
+
+def validate_kept_result(
+    result_path: Path,
+    data: dict[str, Any],
+    errors: list[dict[str, str]],
+) -> None:
+    eval_payload = data.get("eval") or {}
+    eval_uri = eval_payload.get("evidence_uri")
+    if not eval_uri:
+        errors.append(error(result_path, "unverified_kept", "missing eval.evidence_uri"))
+    else:
+        eval_path = resolve_artifact_uri(eval_uri, result_path)
+        if not eval_path.exists():
+            errors.append(
+                error(result_path, "unverified_kept", f"missing eval artifact {eval_uri}")
+            )
+        else:
+            try:
+                artifact_eval = json.loads(eval_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                errors.append(
+                    error(result_path, "unverified_kept", f"invalid eval artifact: {exc}")
+                )
+            else:
+                data["eval"] = {**eval_payload, **artifact_eval}
+
+    verifier = data.get("verifier") or {}
+    receipt_uri = verifier.get("evidence_uri")
+    if not receipt_uri:
+        errors.append(error(result_path, "unverified_kept", "missing verifier.evidence_uri"))
+        return
+    receipt_path = resolve_artifact_uri(receipt_uri, result_path)
+    if not receipt_path.exists():
+        errors.append(
+            error(result_path, "unverified_kept", f"missing verifier receipt {receipt_uri}")
+        )
+        return
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        errors.append(error(result_path, "unverified_kept", f"invalid verifier receipt: {exc}"))
+        return
+    target_hash = str(receipt.get("target_hash", ""))
+    patch_hashes = patch_artifact_hashes(data, result_path)
+    if not target_hash or not patch_hashes:
+        errors.append(
+            error(result_path, "unverified_kept", "missing verifier target_hash or patch artifact")
+        )
+        return
+    normalized_targets = {target_hash, target_hash.removeprefix("sha256:")}
+    if not (normalized_targets & patch_hashes):
+        errors.append(
+            error(
+                result_path,
+                "verifier_artifact_mismatch",
+                "verifier target_hash does not match patch/diff artifact",
+            )
+        )
+
+
+def patch_artifact_hashes(data: dict[str, Any], result_path: Path) -> set[str]:
+    hashes = set()
+    for uri in data.get("artifact_uris") or []:
+        if infer_artifact_kind(uri) not in {"patch", "diff"}:
+            continue
+        artifact_path = resolve_artifact_uri(uri, result_path)
+        if artifact_path.exists():
+            digest = file_hash(artifact_path)
+            hashes.add(digest)
+            hashes.add(f"sha256:{digest}")
+    return hashes
+
+
+def error_tripwires(
+    envelopes: list[dict[str, Any]],
+    options: LoopIngestOptions,
+) -> list[dict[str, Any]]:
+    tripwires = []
+    for envelope in envelopes:
+        data = envelope["data"]
+        for item in envelope["errors"]:
+            if item["kind"] not in {"unverified_kept", "verifier_artifact_mismatch"}:
+                continue
+            tripwires.append(
+                {
+                    "id": stable_id(
+                        "trip",
+                        options.loop_id,
+                        options.run_id,
+                        data.get("item_id", ""),
+                        item["kind"],
+                        item["message"],
+                    ),
+                    "kind": item["kind"],
+                    "severity": "high",
+                    "status": "open",
+                    "message": item["message"],
+                    "evidence_uri": item["path"],
+                    "loop_id": options.loop_id,
+                    "loop_run_id": options.run_id,
+                    "loop_item_id": data.get("item_id"),
+                }
+            )
+    return tripwires
 
 
 def artifact_tripwires(data: dict[str, Any], result_path: Path) -> list[dict[str, Any]]:

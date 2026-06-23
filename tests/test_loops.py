@@ -3,6 +3,7 @@ from pathlib import Path
 
 from ocbrain import cli
 from ocbrain.db import connect, init_db
+from ocbrain.ids import content_hash
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest
 
 
@@ -17,8 +18,26 @@ def write_result(
 ) -> Path:
     item_dir = root / item_id
     item_dir.mkdir(parents=True)
-    (item_dir / "diff.patch").write_text("diff --git a/x b/x\n", encoding="utf-8")
+    patch_text = "diff --git a/x b/x\n"
+    (item_dir / "diff.patch").write_text(patch_text, encoding="utf-8")
+    eval_payload = {
+        "command": "npm run typecheck",
+        "metric_name": "typecheck_errors",
+        "direction": "lower_is_better",
+        "baseline_value": 17,
+        "result_value": 9 if delta < 0 else 17,
+        "delta_value": delta,
+        "passed": True,
+    }
+    (item_dir / "eval.json").write_text(json.dumps(eval_payload), encoding="utf-8")
+    (item_dir / "verifier.json").write_text(
+        json.dumps({"passed": True, "target_hash": content_hash(patch_text)}),
+        encoding="utf-8",
+    )
     result_path = item_dir / "result.json"
+    artifact_uris = [artifact_uri]
+    if artifact_uri == "diff.patch":
+        artifact_uris.append("eval.json")
     result_path.write_text(
         json.dumps(
             {
@@ -33,7 +52,7 @@ def write_result(
                 "mechanism": "The branch narrows too late.",
                 "experiment_family": family,
                 "changed_files": ["src/parser.ts"],
-                "artifact_uris": [artifact_uri],
+                "artifact_uris": artifact_uris,
                 "eval": {
                     "command": "npm run typecheck",
                     "metric_name": "typecheck_errors",
@@ -42,6 +61,7 @@ def write_result(
                     "result_value": 9 if delta < 0 else 17,
                     "delta_value": delta,
                     "passed": True,
+                    "evidence_uri": "eval.json",
                 },
                 "guardrails": [{"name": "tests", "command": "npm test", "passed": True}],
                 "verifier": {
@@ -99,7 +119,12 @@ def test_loop_ingest_reconstructs_counts_and_candidates(tmp_path: Path) -> None:
 
 def test_loop_ingest_reports_missing_artifact_tripwire(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
-    write_result(artifacts, "exp_001", artifact_uri="missing-eval.json")
+    write_result(
+        artifacts,
+        "exp_001",
+        decision="reverted",
+        artifact_uri="missing-eval.json",
+    )
 
     result = dry_run_loop_ingest(
         LoopIngestOptions(
@@ -158,6 +183,34 @@ def test_loop_ingest_rejects_invalid_envelope(tmp_path: Path) -> None:
     assert result["envelopes"]["invalid"] >= 1
 
 
+def test_loop_kept_requires_verifier_target_hash_match(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    result_path = write_result(artifacts, "exp_001", decision="kept")
+    verifier_path = result_path.parent / "verifier.json"
+    verifier_path.write_text(
+        json.dumps({"passed": True, "target_hash": "sha256:not-the-diff"}),
+        encoding="utf-8",
+    )
+
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id="repo-quality-loop",
+            run_id="2026-06-23-nightly",
+            artifacts_root=artifacts,
+        )
+    )
+
+    assert result["run_status"] == "needs_review"
+    assert result["envelopes"]["valid"] == 0
+    assert any(
+        error["kind"] == "verifier_artifact_mismatch"
+        for error in result["envelopes"]["errors"]
+    )
+    assert any(
+        tripwire["kind"] == "verifier_artifact_mismatch" for tripwire in result["tripwires"]
+    )
+
+
 def test_loop_ingest_cli_is_dry_run_and_does_not_create_db(tmp_path: Path, capsys) -> None:
     artifacts = tmp_path / "artifacts"
     write_result(artifacts, "exp_001")
@@ -191,7 +244,7 @@ def test_loop_ingest_cli_is_dry_run_and_does_not_create_db(tmp_path: Path, capsy
 def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
     artifacts = tmp_path / "artifacts"
     write_result(artifacts, "exp_001")
-    write_result(artifacts, "exp_002", artifact_uri="missing-eval.json")
+    write_result(artifacts, "exp_002", decision="reverted", artifact_uri="missing-eval.json")
     db_path = tmp_path / "ocbrain.sqlite"
     command = [
         "--db",
@@ -213,9 +266,9 @@ def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
     second_payload = json.loads(capsys.readouterr().out)
 
     conn = connect(db_path)
-    assert first_payload["applied"]["evidence"] == 4
-    assert second_payload["applied"]["evidence"] == 4
-    assert conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 4
+    assert first_payload["applied"]["evidence"] == 5
+    assert second_payload["applied"]["evidence"] == 5
+    assert conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 5
     assert conn.execute("SELECT COUNT(*) FROM knowledge WHERE type = 'value'").fetchone()[0] == 4
     assert conn.execute("SELECT COUNT(*) FROM family_scores").fetchone()[0] == 1
     assert conn.execute(
