@@ -349,6 +349,54 @@ def test_mcp_mark_stale_is_write_gated_and_updates_knowledge(tmp_path):
     assert row["invalidation_reason"] == "user_request"
 
 
+def test_mcp_propose_can_write_human_gated_knowledge_proposal(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="loop_iteration",
+        source_uri="/tmp/result.json",
+        content_hash="hash-capability-result",
+        claim="Repeated verified success suggests a reusable test workflow.",
+        verifier_status="passed",
+    )
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="verified-test-workflow",
+        title="Verified test workflow",
+        body_uri="/tmp/result.json",
+        status="candidate",
+        risk="high",
+        confidence=0.82,
+    )
+    link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.propose",
+                "arguments": {"id": knowledge_id, "output_dir": str(tmp_path / "proposals")},
+            },
+        },
+        allow_writes=True,
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+    proposal = tmp_path / "proposals" / f"knowledge-capability-{knowledge_id}.md"
+    assert payload["proposal"] == str(proposal)
+    content = proposal.read_text(encoding="utf-8")
+    assert "object_kind: knowledge" in content
+    assert "Human-gated. Do not auto-apply." in content
+    assert "Repeated verified success" in content
+
+
 def test_mcp_search_records_retrieval_use(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
