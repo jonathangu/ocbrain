@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from ocbrain.db import EventInput
@@ -40,6 +41,17 @@ def classify_text(
     title = title_from_text(text, title_hint)
     candidates: list[Candidate] = []
     claim = claim_from_evidence(evidence, text)
+    if not claim or is_low_value_claim(claim):
+        return [
+            Candidate(
+                target=Target.IGNORE,
+                title=f"No durable candidate: {title}",
+                body="No strong memory/wiki/skill/policy candidate was detected.",
+                confidence=0.5,
+                evidence=evidence,
+                claim_key=claim_key(f"ignore {claim}"),
+            )
+        ]
 
     lower = text.lower()
     if any(
@@ -150,14 +162,67 @@ def _first_meaningful_evidence(path: Path, lines: list[str]) -> list[Evidence]:
 
 def is_low_value_evidence_line(stripped: str) -> bool:
     lowered = stripped.lower()
-    if stripped in {"---", "```"}:
+    if stripped in {"---", "```", "{", "}", "[", "]"}:
+        return True
+    if stripped.startswith(("{", "[", "}", "]")) and (
+        '"type"' in stripped or '"version"' in stripped or '"timestamp"' in stripped
+    ):
+        return True
+    if len(stripped) <= 2:
+        return True
+    if re.fullmatch(r"[-*]?\s*date:\s*\d{4}-\d{2}-\d{2}.*", lowered):
         return True
     if lowered.startswith(("- **session key**", "- session key", "session key")):
         return True
     if lowered.startswith(("- status:", "status:", "- source:", "source:")):
+        return True
+    if lowered.startswith('"status":') and "ok" in lowered:
+        return True
+    if lowered in {"status ok", "openclawbrain"}:
+        return True
+    if lowered.startswith(
+        (
+            "id:",
+            "learned memory and context from openclawbrain",
+            "format:",
+            "origin:",
+            "shape:",
+            "capability mode:",
+            "legacy before_agent_start:",
+            "typed hooks:",
+            "services:",
+            "install:",
+            "owner:",
+            "- owner:",
+        )
+    ):
+        return True
+    if lowered.startswith(("- bundle verdict:", "bundle verdict:", "- severity:", "severity:")):
+        return True
+    if re.fullmatch(
+        r'"(command|openclawhome|activationroot|plugin|attach|restart)"\s*:.*',
+        lowered,
+    ):
+        return True
+    if re.fullmatch(r'"(action|changed|changereasons|required|capture)"\s*:.*', lowered):
         return True
     if lowered.startswith(("pagetype:", "- openclaw home:")):
         return True
     if "brain loaded: runtime hook registered" in lowered:
         return True
     return lowered in {"- status: `ok`", "status: ok"}
+
+
+def is_low_value_claim(claim: str) -> bool:
+    lowered = compact_whitespace(claim).lower()
+    if not lowered:
+        return True
+    if is_low_value_evidence_line(lowered):
+        return True
+    if lowered in {"{", "}", "[", "]", "```", "---"}:
+        return True
+    if lowered.startswith(("{", "[")) and (
+        '"type"' in lowered or '"version"' in lowered or '"timestamp"' in lowered
+    ):
+        return True
+    return False
