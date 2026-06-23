@@ -107,6 +107,204 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS loop_programs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  project TEXT,
+  owner TEXT,
+  objective TEXT NOT NULL,
+  primary_metric_name TEXT,
+  primary_metric_direction TEXT CHECK (
+    primary_metric_direction IN ('higher_is_better','lower_is_better','target','boolean')
+  ),
+  baseline_value TEXT,
+  baseline_measured_at TEXT,
+  guardrails_json TEXT,
+  allowed_scope_json TEXT,
+  blocked_actions_json TEXT,
+  budget_json TEXT,
+  schedule_json TEXT,
+  verifier_ref TEXT,
+  status TEXT CHECK (
+    status IN ('draft','enabled','paused','disabled','archived')
+  ) DEFAULT 'draft',
+  risk TEXT CHECK (risk IN ('low','medium','high','critical')) DEFAULT 'medium',
+  privacy_scope TEXT CHECK (
+    privacy_scope IN ('private','workspace','project','public')
+  ) DEFAULT 'workspace',
+  definition_uri TEXT,
+  content_hash TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_runs (
+  id TEXT PRIMARY KEY,
+  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
+  trigger_type TEXT CHECK (
+    trigger_type IN ('heartbeat','cron','manual','taskflow','api','unknown')
+  ),
+  trigger_ref TEXT,
+  orchestrator_session_uri TEXT,
+  backlog_snapshot_uri TEXT,
+  backlog_snapshot_hash TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  status TEXT CHECK (
+    status IN (
+      'planned','running','completed','failed','paused','cancelled','wedged','needs_review'
+    )
+  ),
+  budget_used_json TEXT,
+  summary TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_items (
+  id TEXT PRIMARY KEY,
+  loop_run_id TEXT NOT NULL REFERENCES loop_runs(id),
+  external_backlog_id TEXT,
+  spec_uri TEXT,
+  spec_hash TEXT,
+  experiment_family TEXT,
+  status TEXT CHECK (
+    status IN (
+      'pending','claimed','running','done','failed','skipped','reverted','needs_review','stale'
+    )
+  ),
+  claimed_by TEXT,
+  worker_session_uri TEXT,
+  timeout_seconds INTEGER,
+  claimed_at TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  final_decision TEXT CHECK (
+    final_decision IN ('kept','reverted','failed','skipped','needs_review','unknown')
+  ),
+  failure_reason TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_iterations (
+  id TEXT PRIMARY KEY,
+  loop_item_id TEXT NOT NULL REFERENCES loop_items(id),
+  loop_run_id TEXT NOT NULL REFERENCES loop_runs(id),
+  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
+  hypothesis TEXT,
+  mechanism TEXT,
+  experiment_family TEXT,
+  change_summary TEXT,
+  changed_files_json TEXT,
+  eval_command TEXT,
+  guardrail_commands_json TEXT,
+  verifier_command TEXT,
+  verifier_passed INTEGER CHECK (verifier_passed IN (0,1)),
+  baseline_value TEXT,
+  result_value TEXT,
+  delta_value TEXT,
+  decision TEXT CHECK (decision IN ('kept','reverted','failed','needs_review','skipped')),
+  lesson_summary TEXT,
+  next_candidate TEXT,
+  started_at TEXT,
+  ended_at TEXT,
+  duration_seconds INTEGER,
+  tokens_used INTEGER,
+  cost_estimate REAL,
+  tool_profile TEXT,
+  privacy_scope TEXT CHECK (
+    privacy_scope IN ('private','workspace','project','public')
+  ) DEFAULT 'workspace',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_metrics (
+  id TEXT PRIMARY KEY,
+  loop_iteration_id TEXT REFERENCES loop_iterations(id),
+  loop_run_id TEXT REFERENCES loop_runs(id),
+  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
+  metric_name TEXT NOT NULL,
+  metric_kind TEXT CHECK (
+    metric_kind IN ('primary','guardrail','cost','latency','quality','safety','operational')
+  ),
+  direction TEXT CHECK (direction IN ('higher_is_better','lower_is_better','target','boolean')),
+  unit TEXT,
+  baseline_value REAL,
+  result_value REAL,
+  delta_value REAL,
+  passed INTEGER CHECK (passed IN (0,1)),
+  measured_at TEXT NOT NULL,
+  evidence_uri TEXT,
+  evidence_hash TEXT
+);
+
+CREATE TABLE IF NOT EXISTS loop_artifacts (
+  id TEXT PRIMARY KEY,
+  loop_iteration_id TEXT REFERENCES loop_iterations(id),
+  loop_run_id TEXT REFERENCES loop_runs(id),
+  loop_id TEXT NOT NULL REFERENCES loop_programs(id),
+  kind TEXT CHECK (
+    kind IN (
+      'diff','patch','benchmark','eval','log','report','screenshot','verifier','model','config',
+      'other'
+    )
+  ),
+  uri TEXT NOT NULL,
+  hash TEXT,
+  size_bytes INTEGER,
+  verifier_status TEXT CHECK (
+    verifier_status IN ('unknown','passed','failed','not_required')
+  ) DEFAULT 'unknown',
+  privacy_scope TEXT CHECK (
+    privacy_scope IN ('private','workspace','project','public')
+  ) DEFAULT 'workspace',
+  produced_at TEXT,
+  ingested_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS loop_tripwires (
+  id TEXT PRIMARY KEY,
+  loop_id TEXT REFERENCES loop_programs(id),
+  loop_run_id TEXT REFERENCES loop_runs(id),
+  loop_item_id TEXT REFERENCES loop_items(id),
+  kind TEXT CHECK (
+    kind IN (
+      'stale_running_item',
+      'heartbeat_starved',
+      'no_ledger_writes',
+      'verifier_failure_streak',
+      'approval_gate_reached',
+      'cost_spike',
+      'regression_streak',
+      'dangerous_action_attempt',
+      'artifact_missing',
+      'config_or_secret_risk',
+      'other'
+    )
+  ),
+  severity TEXT CHECK (severity IN ('info','warning','high','critical')),
+  status TEXT CHECK (status IN ('open','acknowledged','resolved','ignored')) DEFAULT 'open',
+  message TEXT,
+  evidence_uri TEXT,
+  opened_at TEXT NOT NULL,
+  resolved_at TEXT,
+  resolved_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS loop_candidate_links (
+  id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL REFERENCES candidates(id),
+  loop_id TEXT REFERENCES loop_programs(id),
+  loop_run_id TEXT REFERENCES loop_runs(id),
+  loop_iteration_id TEXT REFERENCES loop_iterations(id),
+  relation TEXT CHECK (
+    relation IN ('derived_from','supports','contradicts','supersedes','invalidates')
+  ),
+  created_at TEXT NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   doc_id UNINDEXED,
   kind,

@@ -93,7 +93,19 @@ Exit evidence:
 - redaction leakage audit
 - narrowed ingestion profiles by source type
 
-### Loop 5: Scheduler Readiness
+### Loop 5: Loop-Aware Brain Ingest
+
+Goal: make ocbrain understand autonomous loop result envelopes without becoming
+the loop runner.
+
+Exit evidence:
+
+- `ocbrain.loop_result.v1` envelope validation
+- dry-run `brain-loop-ingest` command
+- deterministic run summary, metric, experiment-family, candidate, and tripwire output
+- tests proving dry-run ingest writes nothing
+
+### Loop 6: Scheduler Readiness
 
 Goal: prepare a scheduled consolidation loop without enabling it yet.
 
@@ -106,9 +118,8 @@ Exit evidence:
 
 ## Current Next Action
 
-Continue Loop 4 historical backfill iterations:
+Continue Loop 5 loop-aware brain ingest:
 
-- use `backfill-preview` for copied-DB rebuilds and before/after eval gates
-- improve evidence/title alignment after boilerplate skipping
-- add temporal invalidation heuristics for current/latest/installed/version facts
-- keep scheduled dry-run readiness queued until historical quality is stable
+- turn dry-run loop summaries into idempotent ledger writes only after another gated preview
+- add loop digest/wiki draft writers before any live memory/wiki/skill/policy mutation
+- keep scheduled dry-run readiness queued until loop evidence ingestion is stable

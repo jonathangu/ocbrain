@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from ocbrain.classifier import classify_event, classify_text, is_low_value_evidence_line
@@ -35,6 +36,7 @@ from ocbrain.ingest import (
     event_from_file,
     iter_candidate_files,
 )
+from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
 from ocbrain.schema import Evidence
@@ -109,6 +111,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     digest_parser = subparsers.add_parser("digest", help="Show ledger counts")
     digest_parser.set_defaults(func=cmd_digest)
+
+    loop_ingest_parser = subparsers.add_parser(
+        "loop-ingest", help="Dry-run ingest loop result envelopes"
+    )
+    loop_ingest_parser.add_argument("--loop-id", required=True)
+    loop_ingest_parser.add_argument("--run-id", required=True)
+    loop_ingest_parser.add_argument("--artifacts", required=True, type=Path)
+    loop_ingest_parser.add_argument("--ledger", type=Path)
+    loop_ingest_parser.add_argument("--backlog", type=Path)
+    loop_ingest_parser.add_argument("--dry-run", action="store_true")
+    loop_ingest_parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    loop_ingest_parser.set_defaults(func=cmd_loop_ingest)
 
     candidates_parser = subparsers.add_parser("candidates", help="List candidates")
     candidates_parser.add_argument("--target")
@@ -217,6 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None and Path(sys.argv[0]).name == "brain-loop-ingest":
+        argv = ["loop-ingest", *sys.argv[1:]]
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.input and args.command is None:
@@ -297,6 +313,23 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     conn.commit()
     output(args, {"seen": seen, "inserted": inserted, "skipped": skipped, "counts": counts(conn)})
     return 0
+
+
+def cmd_loop_ingest(args: argparse.Namespace) -> int:
+    if not args.dry_run:
+        raise SystemExit("loop-ingest currently requires --dry-run")
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id=args.loop_id,
+            run_id=args.run_id,
+            artifacts_root=args.artifacts,
+            ledger=args.ledger,
+            backlog=args.backlog,
+            dry_run=True,
+        )
+    )
+    output(args, result)
+    return 0 if result["envelopes"]["invalid"] == 0 else 1
 
 
 def cmd_triage(args: argparse.Namespace) -> int:

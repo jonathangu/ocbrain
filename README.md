@@ -35,6 +35,7 @@ Lightweight runtime V0 is installed and working locally.
 - managed native excerpt output
 - stdio MCP server, read-only by default
 - local retrieval-use feedback logging
+- dry-run loop result envelope ingest
 
 Installed local hosts:
 
@@ -124,6 +125,26 @@ server is launched with `--allow-writes`.
 `brain.search` and `brain.get` return `retrieval_use_id` values. Call
 `brain.feedback` with one of `helpful`, `used`, `irrelevant`, `ignored`, or
 `harmful` to record whether the retrieved knowledge helped the current runtime.
+
+## Loop-Aware Ingest
+
+`ocbrain` can read autonomous loop result envelopes without running the loop:
+
+```bash
+brain-loop-ingest \
+  --loop-id repo-quality-loop \
+  --run-id 2026-06-23-nightly \
+  --artifacts loops/artifacts/repo-quality-loop/2026-06-23-nightly \
+  --dry-run \
+  --json
+```
+
+The envelope schema is `ocbrain.loop_result.v1` in each item `result.json`.
+Dry-run ingest validates envelopes, reconstructs done/failed/kept/reverted
+counts, summarizes the primary metric and experiment families, opens missing
+artifact tripwires in the output, and stages proposal-only skill/policy
+candidates. It does not enqueue work, run loops, write skills, apply policy, or
+mutate the ledger yet.
 
 ## Principles
 

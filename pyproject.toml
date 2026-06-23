@@ -21,6 +21,7 @@ dev = [
 [project.scripts]
 ocbrain = "ocbrain.cli:main"
 ocbrain-closeout = "ocbrain.cli:main"
+brain-loop-ingest = "ocbrain.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
