@@ -298,6 +298,35 @@ def test_prune_marks_unrefreshed_unreferenced_knowledge_stale(tmp_path: Path) ->
     assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 1
 
 
+def test_prune_archives_stale_rows_without_deleting_them(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    old = (now - timedelta(days=120)).isoformat()
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="archive_fact",
+        value_text="old",
+        status="current",
+    )
+    conn.execute(
+        "UPDATE knowledge SET status = 'stale', updated_at = ? WHERE id = ?",
+        (old, knowledge_id),
+    )
+    conn.commit()
+
+    result = prune_knowledge(conn, archive_stale_days=90, now=now)
+    conn.commit()
+    row = conn.execute("SELECT status FROM knowledge WHERE id = ?", (knowledge_id,)).fetchone()
+
+    assert result.changed == 1
+    assert row["status"] == "archived"
+    assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 1
+
+
 def test_prune_decays_served_but_never_useful_knowledge_faster(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
@@ -423,6 +452,54 @@ def test_heal_supersedes_conflicting_current_values_with_evidence(tmp_path: Path
         "SELECT COUNT(*) FROM evidence WHERE source_type = 'correction'"
     ).fetchone()[0]
     assert correction_count == 1
+
+
+def test_heal_leaves_numeric_values_within_threshold_current(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    timestamp = "2026-06-23T12:00:00+00:00"
+    upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="loop:repo-quality-loop",
+        predicate="typecheck_errors",
+        value_numeric=9,
+        status="current",
+        confidence=0.9,
+    )
+    conn.execute(
+        """
+        INSERT INTO knowledge (
+          id, type, subject, predicate, value_numeric, status, gate,
+          confidence, privacy_scope, created_at, updated_at
+        )
+        VALUES (
+          'know_near_value', 'value', 'loop:repo-quality-loop',
+          'typecheck_errors', 9.2, 'current', 'auto', 0.4, 'workspace', ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    conn.commit()
+
+    result = heal_conflicts(
+        conn,
+        numeric_threshold=1.0,
+        now=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+    )
+    conn.commit()
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM knowledge ORDER BY id")
+    }
+
+    assert result.changed == 0
+    assert set(statuses.values()) == {"current"}
+    correction_count = conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE source_type = 'correction'"
+    ).fetchone()[0]
+    assert correction_count == 0
 
 
 def test_liveness_check_reads_runner_ledger_and_writes_tripwire_evidence(tmp_path: Path) -> None:
