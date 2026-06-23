@@ -21,6 +21,7 @@ from ocbrain.db import (
 )
 from ocbrain.ids import content_hash
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
+from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
 from ocbrain.text import compact_whitespace
@@ -115,6 +116,25 @@ def build_parser() -> argparse.ArgumentParser:
     stale_parser.add_argument("knowledge_id")
     stale_parser.add_argument("--reason", default="user_request")
     stale_parser.set_defaults(func=cmd_mark_stale)
+
+    prune_parser = subparsers.add_parser(
+        "prune", help="Mark unreferenced expired knowledge stale or archived"
+    )
+    prune_parser.add_argument("--ttl-days", type=int, default=30)
+    prune_parser.add_argument("--archive-stale-days", type=int)
+    prune_parser.set_defaults(func=cmd_prune)
+
+    heal_parser = subparsers.add_parser(
+        "heal", help="Supersede conflicting current value knowledge"
+    )
+    heal_parser.add_argument("--numeric-threshold", type=float, default=0.0)
+    heal_parser.set_defaults(func=cmd_heal)
+
+    liveness_parser = subparsers.add_parser(
+        "liveness-check", help="Open loop liveness tripwires from runner deadman rows"
+    )
+    liveness_parser.add_argument("--runner-ledger", type=Path)
+    liveness_parser.set_defaults(func=cmd_liveness_check)
 
     mcp_parser = subparsers.add_parser("mcp", help="Run stdio MCP server")
     mcp_parser.add_argument(
@@ -315,6 +335,34 @@ def cmd_mark_stale(args: argparse.Namespace) -> int:
     conn.commit()
     row = get_knowledge(conn, args.knowledge_id)
     output(args, {"knowledge": dict(row)})
+    return 0
+
+
+def cmd_prune(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = prune_knowledge(
+        conn,
+        ttl_days=args.ttl_days,
+        archive_stale_days=args.archive_stale_days,
+    )
+    conn.commit()
+    output(args, result.as_dict() | {"counts": counts(conn)})
+    return 0
+
+
+def cmd_heal(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = heal_conflicts(conn, numeric_threshold=args.numeric_threshold)
+    conn.commit()
+    output(args, result.as_dict() | {"counts": counts(conn)})
+    return 0
+
+
+def cmd_liveness_check(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = check_loop_liveness(conn, runner_ledger=args.runner_ledger)
+    conn.commit()
+    output(args, result.as_dict() | {"counts": counts(conn)})
     return 0
 
 

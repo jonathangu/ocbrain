@@ -35,7 +35,7 @@ Current surfaces:
 - SQLite ledger: `evidence`, `knowledge`, `knowledge_evidence`, `retrieval_uses`,
   `loop_liveness`, `family_scores`, and `memory`.
 - CLI: `evidence`, `value`, `knowledge`, `search`, `digest`, `loop-ingest`,
-  `propose`, `mark-stale`, `mcp`.
+  `propose`, `mark-stale`, `prune`, `heal`, `liveness-check`, `mcp`.
 - MCP: `brain.search`, `brain.get`, `brain.digest`, `brain.feedback`,
   write-gated `brain.propose`, write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
@@ -118,6 +118,23 @@ brain-loop-ingest \
 
 Kept loop results require verifier evidence whose target hash matches the
 changed artifact hash. Mismatches fail ingest and write tripwire evidence.
+
+## Maintenance
+
+Maintenance commands are designed for OpenClaw cron/heartbeat lanes, but no cron
+is installed by this repo.
+
+```bash
+uv run --with-editable . ocbrain prune --ttl-days 30 --archive-stale-days 90
+uv run --with-editable . ocbrain heal --numeric-threshold 0.01
+uv run --with-editable . ocbrain liveness-check --runner-ledger loops/runner.sqlite
+```
+
+`prune` marks unreferenced expired knowledge `stale` and can later archive stale
+rows without deleting the audit trail. `heal` supersedes conflicting current
+values and writes correction evidence. `liveness-check` reads runner deadman rows
+and writes loop tripwire evidence such as `heartbeat_starved` or
+`no_ledger_writes`; it does not claim lanes or enqueue loop work.
 
 ## Verification
 

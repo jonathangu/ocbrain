@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ocbrain import cli
@@ -14,6 +15,7 @@ from ocbrain.db import (
     upsert_knowledge,
 )
 from ocbrain.excerpt import write_excerpt
+from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.proposals import write_proposal
 
 
@@ -264,3 +266,123 @@ def test_excerpt_reads_injected_current_knowledge(tmp_path: Path) -> None:
     assert "BEGIN OCBRAIN MANAGED BLOCK" in text
     assert knowledge_id in text
     assert "edit source knowledge" in text
+
+
+def test_prune_marks_unrefreshed_unreferenced_knowledge_stale(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    old = (now - timedelta(days=45)).isoformat()
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="stale_fact",
+        value_text="old",
+        status="current",
+    )
+    conn.execute("UPDATE knowledge SET updated_at = ? WHERE id = ?", (old, knowledge_id))
+    conn.commit()
+
+    result = prune_knowledge(conn, ttl_days=30, now=now)
+    conn.commit()
+    row = conn.execute("SELECT status, invalidation_reason FROM knowledge").fetchone()
+
+    assert result.changed == 1
+    assert row["status"] == "stale"
+    assert row["invalidation_reason"] == "stale"
+    assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 1
+
+
+def test_heal_supersedes_conflicting_current_values_with_evidence(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    timestamp = "2026-06-23T12:00:00+00:00"
+    winner_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="loop:repo-quality-loop",
+        predicate="typecheck_errors",
+        value_numeric=9,
+        status="current",
+        confidence=0.9,
+    )
+    conn.execute(
+        """
+        INSERT INTO knowledge (
+          id, type, subject, predicate, value_numeric, status, gate,
+          confidence, privacy_scope, created_at, updated_at
+        )
+        VALUES (
+          'know_conflict_loser', 'value', 'loop:repo-quality-loop',
+          'typecheck_errors', 17, 'current', 'auto', 0.4, 'workspace', ?, ?
+        )
+        """,
+        (timestamp, timestamp),
+    )
+    conn.commit()
+
+    result = heal_conflicts(
+        conn,
+        numeric_threshold=1.0,
+        now=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+    )
+    conn.commit()
+    loser = conn.execute(
+        "SELECT status, superseded_by, invalidation_reason FROM knowledge WHERE id = ?",
+        ("know_conflict_loser",),
+    ).fetchone()
+
+    assert result.changed == 1
+    assert loser["status"] == "superseded"
+    assert loser["superseded_by"] == winner_id
+    assert loser["invalidation_reason"] == "contradicted"
+    correction_count = conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE source_type = 'correction'"
+    ).fetchone()[0]
+    assert correction_count == 1
+
+
+def test_liveness_check_reads_runner_ledger_and_writes_tripwire_evidence(tmp_path: Path) -> None:
+    runner_path = tmp_path / "runner.sqlite"
+    runner = connect(runner_path)
+    init_db(runner)
+    runner.execute(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "repo-quality-loop",
+            "2026-06-23-nightly",
+            None,
+            None,
+            300,
+            "2026-06-23T11:55:00+00:00",
+        ),
+    )
+    runner.commit()
+    runner.close()
+
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    result = check_loop_liveness(
+        conn,
+        runner_ledger=runner_path,
+        now=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+    )
+    conn.commit()
+    tripwires = {
+        json.loads(row["loop_tags"])["tripwire"]
+        for row in conn.execute(
+            "SELECT loop_tags FROM evidence WHERE source_type = 'loop_tripwire'"
+        )
+    }
+
+    assert result.changed == 2
+    assert {"heartbeat_starved", "no_ledger_writes"} <= tripwires

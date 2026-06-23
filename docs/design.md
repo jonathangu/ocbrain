@@ -29,3 +29,14 @@ Memory is a view over current injectable knowledge. Wiki/procedure pages are
 - `family_scores`
 - `memory` view
 - `search_index`
+
+## Maintenance Surface
+
+- `ocbrain prune`: marks unreferenced expired knowledge `stale`, and can archive
+  stale rows later without deleting them.
+- `ocbrain heal`: detects conflicting current values for the same
+  `(subject, predicate, project)` and supersedes lower-confidence rows with
+  correction evidence.
+- `ocbrain liveness-check`: reads runner-owned `loop_liveness` rows, opens
+  loop tripwire evidence after missed deadman timestamps, and never executes or
+  enqueues loop work.
