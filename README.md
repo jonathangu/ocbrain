@@ -113,11 +113,17 @@ The MCP server currently exposes:
 - `brain.digest`
 - `brain.get`
 - `brain.feedback`
+- `brain.propose` with `--allow-writes`
+- `brain.mark_stale` with `--allow-writes`
 - `brain://digest/current`
+- `brain://wiki/{slug}`
+- `brain://loop/families`
 
 `brain.get` serves current knowledge and reviewed legacy candidates by default;
-candidate/private objects require explicit inspection flags. `brain.propose` is
-write-capable and hidden unless the server is launched with `--allow-writes`.
+candidate/private objects require explicit inspection flags. `brain.digest`
+returns current injectable memory, values, documents, capabilities, and loop
+family scores from `knowledge`. Write-capable tools stay hidden unless the
+server is launched with `--allow-writes`.
 
 `brain.search` and `brain.get` return `retrieval_use_id` values. Call
 `brain.feedback` with one of `helpful`, `used`, `irrelevant`, `ignored`, or

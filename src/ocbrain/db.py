@@ -808,6 +808,261 @@ def get_knowledge(conn: sqlite3.Connection, knowledge_id: str) -> sqlite3.Row | 
     return conn.execute("SELECT * FROM knowledge WHERE id = ?", (knowledge_id,)).fetchone()
 
 
+def knowledge_evidence(conn: sqlite3.Connection, knowledge_id: str) -> list[dict[str, Any]]:
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+              knowledge_evidence.relation,
+              evidence.id,
+              evidence.source_type,
+              evidence.source_runtime,
+              evidence.source_uri,
+              evidence.content_hash,
+              evidence.claim,
+              evidence.artifact_uri,
+              evidence.artifact_hash,
+              evidence.verifier_status,
+              evidence.privacy_scope,
+              evidence.occurred_at
+            FROM knowledge_evidence
+            JOIN evidence ON evidence.id = knowledge_evidence.evidence_id
+            WHERE knowledge_evidence.knowledge_id = ?
+            ORDER BY knowledge_evidence.created_at ASC, evidence.id ASC
+            """,
+            (knowledge_id,),
+        )
+    ]
+
+
+def list_current_knowledge(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    limit: int = 20,
+    knowledge_type: str | None = None,
+    doc_kind: str | None = None,
+    inject_only: bool = False,
+) -> list[sqlite3.Row]:
+    clauses = ["status = 'current'"]
+    params: list[Any] = []
+    if scopes:
+        placeholders = ",".join("?" for _ in scopes)
+        clauses.append(f"privacy_scope IN ({placeholders})")
+        params.extend(scopes)
+    if project:
+        clauses.append("(project = ? OR project IS NULL)")
+        params.append(project)
+    if knowledge_type:
+        clauses.append("type = ?")
+        params.append(knowledge_type)
+    if doc_kind:
+        clauses.append("doc_kind = ?")
+        params.append(doc_kind)
+    if inject_only:
+        clauses.append("inject = 1")
+    params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM knowledge
+            WHERE {' AND '.join(clauses)}
+            ORDER BY
+              inject DESC,
+              COALESCE(confidence, 0) DESC,
+              updated_at DESC,
+              id ASC
+            LIMIT ?
+            """,
+            params,
+        )
+    )
+
+
+def get_current_doc(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    doc_kind: str | None = None,
+) -> sqlite3.Row | None:
+    clauses = ["status = 'current'", "type = 'doc'", "slug = ?"]
+    params: list[Any] = [slug]
+    if scopes:
+        placeholders = ",".join("?" for _ in scopes)
+        clauses.append(f"privacy_scope IN ({placeholders})")
+        params.extend(scopes)
+    if doc_kind:
+        clauses.append("doc_kind = ?")
+        params.append(doc_kind)
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM knowledge
+        WHERE {' AND '.join(clauses)}
+        ORDER BY updated_at DESC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+
+
+def knowledge_value(row: sqlite3.Row) -> Any:
+    if row["value_bool"] is not None:
+        return bool(row["value_bool"])
+    if row["value_numeric"] is not None:
+        if row["unit"]:
+            return {"value": row["value_numeric"], "unit": row["unit"]}
+        return row["value_numeric"]
+    return row["value_text"]
+
+
+def knowledge_summary(
+    row: sqlite3.Row, evidence: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": row["id"],
+        "type": row["type"],
+        "status": row["status"],
+        "gate": row["gate"],
+        "risk": row["risk"],
+        "confidence": row["confidence"],
+        "inject": bool(row["inject"]),
+        "project": row["project"],
+        "privacy_scope": row["privacy_scope"],
+        "updated_at": row["updated_at"],
+    }
+    if row["type"] == "value":
+        payload.update(
+            {
+                "subject": row["subject"],
+                "predicate": row["predicate"],
+                "value": knowledge_value(row),
+                "target_value": row["target_value"],
+            }
+        )
+    else:
+        payload.update(
+            {
+                "slug": row["slug"],
+                "title": row["title"],
+                "body_uri": row["body_uri"],
+                "doc_kind": row["doc_kind"],
+            }
+        )
+    if evidence is not None:
+        payload["evidence"] = evidence
+    return payload
+
+
+def knowledge_digest(
+    conn: sqlite3.Connection,
+    *,
+    project: str | None = None,
+    scopes: tuple[str, ...] = ("workspace", "project", "public"),
+    limit: int = 12,
+) -> dict[str, Any]:
+    values = list_current_knowledge(
+        conn,
+        project=project,
+        scopes=scopes,
+        limit=limit,
+        knowledge_type="value",
+    )
+    docs = list_current_knowledge(
+        conn,
+        project=project,
+        scopes=scopes,
+        limit=limit,
+        knowledge_type="doc",
+    )
+    capabilities = list_current_knowledge(
+        conn,
+        project=project,
+        scopes=scopes,
+        limit=limit,
+        knowledge_type="capability",
+    )
+    injected = list_current_knowledge(
+        conn,
+        project=project,
+        scopes=scopes,
+        limit=limit,
+        inject_only=True,
+    )
+    family_rows = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM family_scores
+            ORDER BY refreshed_at DESC, loop_id ASC, family ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    ]
+    return {
+        "counts": counts(conn),
+        "project": project,
+        "scopes": list(scopes),
+        "memory": [knowledge_summary(row) for row in injected],
+        "values": [knowledge_summary(row) for row in values],
+        "documents": [knowledge_summary(row) for row in docs],
+        "capabilities": [knowledge_summary(row) for row in capabilities],
+        "loop_families": family_rows,
+    }
+
+
+def render_doc_markdown(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    evidence = knowledge_evidence(conn, row["id"])
+    title = row["title"] or row["slug"] or row["id"]
+    lines = [
+        f"# {title}",
+        "",
+        f"- Brain ID: `{row['id']}`",
+        f"- Type: `{row['type']}` / `{row['doc_kind'] or 'doc'}`",
+        f"- Status: `{row['status']}`",
+        f"- Gate: `{row['gate']}`",
+        f"- Scope: `{row['privacy_scope']}`",
+    ]
+    if row["body_uri"]:
+        lines.append(f"- Body URI: `{row['body_uri']}`")
+    if row["confidence"] is not None:
+        lines.append(f"- Confidence: `{row['confidence']}`")
+    lines += ["", "## Evidence", ""]
+    if not evidence:
+        lines.append("- No linked evidence.")
+    else:
+        for item in evidence:
+            source = item["source_uri"] or item["artifact_uri"] or item["id"]
+            relation = item["relation"] or "supports"
+            lines.append(f"- `{relation}` [{item['id']}] {item['claim']} (`{source}`)")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def mark_knowledge_stale(
+    conn: sqlite3.Connection,
+    knowledge_id: str,
+    *,
+    reason: str = "user_request",
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE knowledge
+        SET status = 'stale',
+            invalidation_reason = ?,
+            updated_at = ?
+        WHERE id = ? AND status != 'archived'
+        """,
+        (reason, now_iso(), knowledge_id),
+    )
+    return cursor.rowcount > 0
+
+
 def transition_candidate(
     conn: sqlite3.Connection,
     candidate_id: str,

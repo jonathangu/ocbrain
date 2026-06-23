@@ -5,7 +5,9 @@ from ocbrain.db import (
     connect,
     init_db,
     insert_candidate,
+    link_knowledge_evidence,
     upsert_event,
+    upsert_evidence,
     upsert_knowledge,
 )
 from ocbrain.mcp import handle_request
@@ -45,6 +47,7 @@ def test_mcp_tools_list_can_opt_into_write_tools(tmp_path):
     names = {tool["name"] for tool in response["result"]["tools"]}
 
     assert "brain.propose" in names
+    assert "brain.mark_stale" in names
 
 
 def test_mcp_initialized_notification_has_no_response(tmp_path):
@@ -223,6 +226,127 @@ def test_mcp_get_candidate_knowledge_requires_draft_flag(tmp_path):
 
     assert response["error"]["code"] == -32001
     assert "include_draft" in response["error"]["message"]
+
+
+def test_mcp_digest_returns_current_knowledge_not_just_counts(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="uses_shared_brain",
+        value_bool=True,
+        status="current",
+        inject=True,
+        confidence=0.9,
+    )
+    upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="needs-approval",
+        title="Needs approval",
+        status="candidate",
+        risk="high",
+    )
+    conn.commit()
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.digest", "arguments": {}},
+        },
+    )
+
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["counts"]["knowledge"] == 2
+    assert payload["memory"][0]["subject"] == "runtime:codex"
+    assert payload["values"][0]["value"] is True
+    assert payload["capabilities"] == []
+
+
+def test_mcp_lists_and_renders_current_wiki_resources(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="closeout",
+        source_runtime="codex",
+        source_uri="/tmp/wiki-proof.md",
+        content_hash="hash-wiki-proof",
+        claim="Runtime integration docs were verified.",
+        verifier_status="passed",
+    )
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="runtime-integration",
+        title="Runtime integration",
+        body_uri="/tmp/wiki-proof.md",
+        doc_kind="wiki",
+        status="current",
+        confidence=0.87,
+    )
+    link_knowledge_evidence(conn, knowledge_id, evidence_id)
+    conn.commit()
+
+    listed = handle_request(conn, {"jsonrpc": "2.0", "id": 1, "method": "resources/list"})
+    uris = {resource["uri"] for resource in listed["result"]["resources"]}
+    assert "brain://wiki/runtime-integration" in uris
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "resources/read",
+            "params": {"uri": "brain://wiki/runtime-integration"},
+        },
+    )
+
+    content = response["result"]["contents"][0]
+    assert content["mimeType"] == "text/markdown"
+    assert "# Runtime integration" in content["text"]
+    assert "Runtime integration docs were verified." in content["text"]
+
+
+def test_mcp_mark_stale_is_write_gated_and_updates_knowledge(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="old_fact",
+        value_text="old",
+        status="current",
+    )
+    conn.commit()
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "brain.mark_stale", "arguments": {"id": knowledge_id}},
+    }
+
+    denied = handle_request(conn, request)
+    assert denied["error"]["code"] == -32001
+
+    response = handle_request(conn, request, allow_writes=True)
+    assert "result" in response
+    row = conn.execute(
+        "SELECT status, invalidation_reason FROM knowledge WHERE id = ?",
+        (knowledge_id,),
+    ).fetchone()
+    assert row["status"] == "stale"
+    assert row["invalidation_reason"] == "user_request"
 
 
 def test_mcp_search_records_retrieval_use(tmp_path):

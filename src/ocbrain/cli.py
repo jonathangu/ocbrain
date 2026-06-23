@@ -16,6 +16,7 @@ from ocbrain.db import (
     init_db,
     insert_candidate,
     iter_untriaged_events,
+    knowledge_digest,
     list_candidate_decisions,
     list_candidates,
     mark_event_triaged,
@@ -109,7 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--include-private", action="store_true")
     search_parser.set_defaults(func=cmd_search)
 
-    digest_parser = subparsers.add_parser("digest", help="Show ledger counts")
+    digest_parser = subparsers.add_parser("digest", help="Show current knowledge digest")
+    digest_parser.add_argument("--project")
+    digest_parser.add_argument("--limit", type=int, default=12)
+    digest_parser.add_argument("--include-private", action="store_true")
     digest_parser.set_defaults(func=cmd_digest)
 
     loop_ingest_parser = subparsers.add_parser(
@@ -700,7 +704,12 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_digest(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    output(args, counts(conn))
+    scopes = (
+        ("private", "workspace", "project", "public")
+        if args.include_private
+        else ("workspace", "project", "public")
+    )
+    output(args, knowledge_digest(conn, project=args.project, scopes=scopes, limit=args.limit))
     return 0
 
 
