@@ -12,6 +12,7 @@ from ocbrain.ids import stable_id
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
 PUBLIC_SCOPES = ("workspace", "project", "public")
+SCOPE_RANK = {"private": 0, "workspace": 1, "project": 2, "public": 3}
 
 
 SCHEMA = """
@@ -385,6 +386,43 @@ def link_knowledge_evidence(
         """,
         (knowledge_id, evidence_id, relation, now_iso()),
     )
+    apply_composed_privacy_scope(conn, knowledge_id, evidence_id)
+
+
+def apply_composed_privacy_scope(
+    conn: sqlite3.Connection, knowledge_id: str, evidence_id: str
+) -> None:
+    row = conn.execute(
+        """
+        SELECT
+          knowledge.privacy_scope AS knowledge_scope,
+          evidence.privacy_scope AS evidence_scope
+        FROM knowledge
+        JOIN evidence ON evidence.id = ?
+        WHERE knowledge.id = ?
+        """,
+        (evidence_id, knowledge_id),
+    ).fetchone()
+    if row is None:
+        return
+    composed_scope = most_restrictive_scope(row["knowledge_scope"], row["evidence_scope"])
+    if composed_scope == row["knowledge_scope"]:
+        return
+    conn.execute(
+        """
+        UPDATE knowledge
+        SET privacy_scope = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (composed_scope, now_iso(), knowledge_id),
+    )
+
+
+def most_restrictive_scope(*scopes: str | None) -> str:
+    valid_scopes = [scope for scope in scopes if scope in SCOPE_RANK]
+    if not valid_scopes:
+        return "workspace"
+    return min(valid_scopes, key=lambda scope: SCOPE_RANK[scope])
 
 
 def upsert_search_index(

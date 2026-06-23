@@ -121,6 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         "prune", help="Mark unreferenced expired knowledge stale or archived"
     )
     prune_parser.add_argument("--ttl-days", type=int, default=30)
+    prune_parser.add_argument("--unhelpful-ttl-days", type=int, default=14)
     prune_parser.add_argument("--archive-stale-days", type=int)
     prune_parser.set_defaults(func=cmd_prune)
 
@@ -343,6 +344,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     result = prune_knowledge(
         conn,
         ttl_days=args.ttl_days,
+        unhelpful_ttl_days=args.unhelpful_ttl_days,
         archive_stale_days=args.archive_stale_days,
     )
     conn.commit()

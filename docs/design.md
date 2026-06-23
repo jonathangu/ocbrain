@@ -33,7 +33,9 @@ Memory is a view over current injectable knowledge. Wiki/procedure pages are
 ## Maintenance Surface
 
 - `ocbrain prune`: marks unreferenced expired knowledge `stale`, and can archive
-  stale rows later without deleting them.
+  stale rows later without deleting them. Served-but-never-useful knowledge uses
+  a shorter decay window; useful retrieval feedback protects knowledge from that
+  accelerated stale transition.
 - `ocbrain heal`: detects conflicting current values for the same
   `(subject, predicate, project)` and supersedes lower-confidence rows with
   correction evidence.
@@ -49,3 +51,10 @@ family. `precondition` and `infra` failures put the family in `blocked` and
 stage repair context; `safety` failures make the family `risky`. Forced
 exploration is recorded from `forced_exploration=true` or
 `exploration.forced=true` and summarized as attempts plus improvements found.
+
+## Privacy Composition
+
+Evidence links tighten knowledge scope using the privacy lattice:
+`private < workspace < project < public`. A doc initially staged as `public`
+becomes `private` if any linked source evidence is private, so digest and
+resource rendering cannot accidentally publish private-source material.

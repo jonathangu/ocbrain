@@ -7,8 +7,11 @@ from ocbrain import cli
 from ocbrain.db import (
     connect,
     counts,
+    get_current_doc,
     init_db,
+    knowledge_digest,
     link_knowledge_evidence,
+    log_retrieval_use,
     mark_knowledge_stale,
     search,
     upsert_evidence,
@@ -293,6 +296,83 @@ def test_prune_marks_unrefreshed_unreferenced_knowledge_stale(tmp_path: Path) ->
     assert row["status"] == "stale"
     assert row["invalidation_reason"] == "stale"
     assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 1
+
+
+def test_prune_decays_served_but_never_useful_knowledge_faster(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    old = (now - timedelta(days=15)).isoformat()
+    useless_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="ignored_fact",
+        value_text="ignored",
+        status="current",
+    )
+    useful_id = upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        subject="runtime:codex",
+        predicate="useful_fact",
+        value_text="useful",
+        status="current",
+    )
+    log_retrieval_use(conn, useless_id, outcome="ignored")
+    log_retrieval_use(conn, useful_id, outcome="helpful")
+    conn.execute("UPDATE knowledge SET updated_at = ?", (old,))
+    conn.commit()
+
+    result = prune_knowledge(conn, ttl_days=30, unhelpful_ttl_days=7, now=now)
+    conn.commit()
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute("SELECT id, status FROM knowledge ORDER BY id")
+    }
+
+    assert result.changed == 1
+    assert statuses[useless_id] == "stale"
+    assert statuses[useful_id] == "current"
+    assert result.details[0]["reason"] == "ttl_served_without_usefulness"
+
+
+def test_private_evidence_tightens_public_doc_scope(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="closeout",
+        source_uri="/private/source.md",
+        content_hash="private-hash",
+        claim="Private source backs a derived doc.",
+        privacy_scope="private",
+    )
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="public-derived-doc",
+        title="Public Derived Doc",
+        body_uri="/tmp/public.md",
+        doc_kind="wiki",
+        status="current",
+        privacy_scope="public",
+    )
+    link_knowledge_evidence(conn, knowledge_id, evidence_id)
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT privacy_scope FROM knowledge WHERE id = ?",
+        (knowledge_id,),
+    ).fetchone()
+    digest = knowledge_digest(conn)
+
+    assert row["privacy_scope"] == "private"
+    assert not any(item["id"] == knowledge_id for item in digest["documents"])
+    assert get_current_doc(conn, slug="public-derived-doc") is None
 
 
 def test_heal_supersedes_conflicting_current_values_with_evidence(tmp_path: Path) -> None:

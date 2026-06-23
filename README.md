@@ -131,15 +131,19 @@ Maintenance commands are designed for OpenClaw cron/heartbeat lanes, but no cron
 is installed by this repo.
 
 ```bash
-uv run --with-editable . ocbrain prune --ttl-days 30 --archive-stale-days 90
+uv run --with-editable . ocbrain prune \
+  --ttl-days 30 \
+  --unhelpful-ttl-days 14 \
+  --archive-stale-days 90
 uv run --with-editable . ocbrain heal --numeric-threshold 0.01
 uv run --with-editable . ocbrain liveness-check --runner-ledger loops/runner.sqlite
 ```
 
-`prune` marks unreferenced expired knowledge `stale` and can later archive stale
-rows without deleting the audit trail. `heal` supersedes conflicting current
-values and writes correction evidence. `liveness-check` reads runner deadman rows
-and writes loop tripwire evidence such as `heartbeat_starved` or
+`prune` marks unreferenced expired knowledge `stale`, decays served-but-never
+useful knowledge on a shorter TTL, and can later archive stale rows without
+deleting the audit trail. `heal` supersedes conflicting current values and
+writes correction evidence. `liveness-check` reads runner deadman rows and
+writes loop tripwire evidence such as `heartbeat_starved` or
 `no_ledger_writes`; it does not claim lanes or enqueue loop work.
 
 ## Verification
@@ -156,6 +160,7 @@ uv run --with-editable . python -m compileall src tests
 - Verified is not claimed.
 - Memory is a view, not a store.
 - Supersede/archive; do not overwrite in place.
+- A derived object's privacy scope is the most restrictive linked source scope.
 - Human gate before executable or prescriptive knowledge.
 - Emit evidence; do not write durable knowledge directly from runtimes.
 - Watch loops closely enough to tell done from wedged, without running them.

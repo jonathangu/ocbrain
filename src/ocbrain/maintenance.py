@@ -25,26 +25,52 @@ def prune_knowledge(
     conn: sqlite3.Connection,
     *,
     ttl_days: int = 30,
+    unhelpful_ttl_days: int | None = 14,
     archive_stale_days: int | None = None,
     now: datetime | None = None,
 ) -> MaintenanceResult:
     timestamp = now or datetime.now(UTC)
     stale_before = (timestamp - timedelta(days=ttl_days)).isoformat()
+    unhelpful_before = (
+        (timestamp - timedelta(days=unhelpful_ttl_days)).isoformat()
+        if unhelpful_ttl_days is not None
+        else None
+    )
     details: list[dict[str, Any]] = []
 
     stale_rows = list(
         conn.execute(
             """
-            SELECT knowledge.id, knowledge.type, knowledge.status, knowledge.updated_at
+            SELECT
+              knowledge.id,
+              knowledge.type,
+              knowledge.status,
+              knowledge.updated_at,
+              COUNT(retrieval_uses.id) AS retrieval_count,
+              SUM(
+                CASE
+                  WHEN retrieval_uses.outcome IN ('improved','helpful','used')
+                  THEN 1 ELSE 0
+                END
+              ) AS useful_count
             FROM knowledge
             LEFT JOIN retrieval_uses ON retrieval_uses.knowledge_id = knowledge.id
             WHERE knowledge.status IN ('candidate','current')
-              AND knowledge.updated_at < ?
             GROUP BY knowledge.id
-            HAVING COUNT(retrieval_uses.id) = 0
+            HAVING
+              (
+                knowledge.updated_at < ?
+                AND retrieval_count = 0
+              )
+              OR (
+                ? IS NOT NULL
+                AND knowledge.updated_at < ?
+                AND retrieval_count > 0
+                AND useful_count = 0
+              )
             ORDER BY knowledge.updated_at ASC, knowledge.id ASC
             """,
-            (stale_before,),
+            (stale_before, unhelpful_before, unhelpful_before),
         )
     )
     for row in stale_rows:
@@ -63,7 +89,11 @@ def prune_knowledge(
                 "id": row["id"],
                 "from_status": row["status"],
                 "to_status": "stale",
-                "reason": "ttl_unreferenced",
+                "reason": (
+                    "ttl_unreferenced"
+                    if row["retrieval_count"] == 0
+                    else "ttl_served_without_usefulness"
+                ),
             }
         )
 
