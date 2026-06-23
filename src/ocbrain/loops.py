@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ocbrain.db import now_iso
 from ocbrain.ids import content_hash, stable_id
 from ocbrain.text import claim_key, compact_whitespace
 
@@ -27,10 +29,11 @@ class LoopIngestOptions:
     dry_run: bool = True
 
 
-def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
-    if not options.dry_run:
-        raise ValueError("loop ingest writes are not implemented yet; use --dry-run")
+def loop_run_row_id(loop_id: str, run_id: str) -> str:
+    return stable_id("lrun", loop_id, run_id)
 
+
+def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
     result_paths = sorted(options.artifacts_root.rglob("result.json"))
     envelopes = [read_result_envelope(path, options) for path in result_paths]
     errors = [error for envelope in envelopes for error in envelope["errors"]]
@@ -47,9 +50,10 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
 
     return {
         "schema_version": "ocbrain.loop_ingest.dry_run.v1",
-        "dry_run": True,
+        "dry_run": options.dry_run,
         "loop_id": options.loop_id,
         "run_id": options.run_id,
+        "loop_run_row_id": loop_run_row_id(options.loop_id, options.run_id),
         "run_status": status,
         "inputs": {
             "artifacts": str(options.artifacts_root),
@@ -69,6 +73,319 @@ def dry_run_loop_ingest(options: LoopIngestOptions) -> dict[str, Any]:
             "errors": errors,
         },
     }
+
+
+def write_loop_ingest(conn: sqlite3.Connection, options: LoopIngestOptions) -> dict[str, Any]:
+    result = dry_run_loop_ingest(options)
+    if result["envelopes"]["invalid"]:
+        raise ValueError("cannot apply invalid loop envelopes")
+
+    timestamp = now_iso()
+    envelopes = [
+        read_result_envelope(path, options)
+        for path in sorted(options.artifacts_root.rglob("result.json"))
+    ]
+    valid_envelopes = [envelope for envelope in envelopes if not envelope["errors"]]
+    loop_id = options.loop_id
+    run_row_id = result["loop_run_row_id"]
+    run_summary = json.dumps(result["summary"], sort_keys=True)
+    first = valid_envelopes[0]["data"] if valid_envelopes else {}
+
+    conn.execute(
+        """
+        INSERT INTO loop_programs (
+          id, name, project, owner, objective, primary_metric_name,
+          primary_metric_direction, baseline_value, verifier_ref, status,
+          risk, privacy_scope, definition_uri, content_hash, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          name = excluded.name,
+          project = excluded.project,
+          objective = excluded.objective,
+          primary_metric_name = excluded.primary_metric_name,
+          primary_metric_direction = excluded.primary_metric_direction,
+          baseline_value = excluded.baseline_value,
+          verifier_ref = excluded.verifier_ref,
+          privacy_scope = excluded.privacy_scope,
+          definition_uri = excluded.definition_uri,
+          content_hash = excluded.content_hash,
+          updated_at = excluded.updated_at
+        """,
+        (
+            loop_id,
+            loop_id,
+            first.get("project"),
+            None,
+            first.get("objective") or f"Loop program {loop_id}",
+            first.get("eval", {}).get("metric_name"),
+            first.get("eval", {}).get("direction"),
+            str(first.get("eval", {}).get("baseline_value")),
+            first.get("verifier", {}).get("command"),
+            "draft",
+            "medium",
+            first.get("privacy_scope", "workspace"),
+            str(options.artifacts_root),
+            content_hash(json.dumps(result, sort_keys=True)),
+            timestamp,
+            timestamp,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO loop_runs (
+          id, loop_id, trigger_type, trigger_ref, backlog_snapshot_uri,
+          started_at, ended_at, status, budget_used_json, summary, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          trigger_ref = excluded.trigger_ref,
+          backlog_snapshot_uri = excluded.backlog_snapshot_uri,
+          status = excluded.status,
+          budget_used_json = excluded.budget_used_json,
+          summary = excluded.summary,
+          updated_at = excluded.updated_at
+        """,
+        (
+            run_row_id,
+            loop_id,
+            "unknown",
+            options.run_id,
+            str(options.backlog) if options.backlog else None,
+            first.get("started_at"),
+            first.get("ended_at"),
+            result["run_status"],
+            None,
+            run_summary,
+            timestamp,
+            timestamp,
+        ),
+    )
+    delete_run_children(conn, run_row_id)
+    for envelope in valid_envelopes:
+        write_envelope_rows(conn, envelope, loop_id, run_row_id, timestamp)
+    for tripwire in result["tripwires"]:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO loop_tripwires (
+              id, loop_id, loop_run_id, loop_item_id, kind, severity, status,
+              message, evidence_uri, opened_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tripwire["id"],
+                loop_id,
+                run_row_id,
+                stable_id("litem", loop_id, options.run_id, tripwire["loop_item_id"]),
+                tripwire["kind"],
+                tripwire["severity"],
+                tripwire["status"],
+                tripwire["message"],
+                tripwire["evidence_uri"],
+                timestamp,
+            ),
+        )
+    conn.commit()
+    result["dry_run"] = False
+    result["applied"] = {
+        "loop_program_id": loop_id,
+        "loop_run_id": run_row_id,
+        "items": len(valid_envelopes),
+        "tripwires": len(result["tripwires"]),
+    }
+    return result
+
+
+def delete_run_children(conn: sqlite3.Connection, run_row_id: str) -> None:
+    for table in (
+        "loop_candidate_links",
+        "loop_tripwires",
+        "loop_artifacts",
+        "loop_metrics",
+        "loop_iterations",
+        "loop_items",
+    ):
+        conn.execute(f"DELETE FROM {table} WHERE loop_run_id = ?", (run_row_id,))
+
+
+def write_envelope_rows(
+    conn: sqlite3.Connection,
+    envelope: dict[str, Any],
+    loop_id: str,
+    run_row_id: str,
+    timestamp: str,
+) -> None:
+    data = envelope["data"]
+    external_item_id = data["item_id"]
+    item_id = stable_id("litem", loop_id, data["run_id"], external_item_id)
+    iteration_id = stable_id("liter", loop_id, data["run_id"], external_item_id)
+    decision = data.get("decision") or "unknown"
+    status = {
+        "kept": "done",
+        "reverted": "reverted",
+        "failed": "failed",
+        "skipped": "skipped",
+        "needs_review": "needs_review",
+    }.get(decision, "needs_review")
+    eval_payload = data["eval"]
+    verifier = data["verifier"]
+
+    conn.execute(
+        """
+        INSERT INTO loop_items (
+          id, loop_run_id, external_backlog_id, spec_uri, spec_hash, experiment_family,
+          status, claimed_by, worker_session_uri, timeout_seconds, claimed_at, started_at,
+          ended_at, final_decision, failure_reason, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item_id,
+            run_row_id,
+            external_item_id,
+            str(envelope["path"]),
+            result_hash(envelope["path"]),
+            data.get("experiment_family"),
+            status,
+            None,
+            data.get("worker_session_uri"),
+            None,
+            None,
+            data.get("started_at"),
+            data.get("ended_at"),
+            decision,
+            data.get("failure_reason"),
+            timestamp,
+            timestamp,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO loop_iterations (
+          id, loop_item_id, loop_run_id, loop_id, hypothesis, mechanism,
+          experiment_family, change_summary, changed_files_json, eval_command,
+          guardrail_commands_json, verifier_command, verifier_passed, baseline_value,
+          result_value, delta_value, decision, lesson_summary, next_candidate,
+          started_at, ended_at, duration_seconds, tokens_used, cost_estimate,
+          tool_profile, privacy_scope, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            iteration_id,
+            item_id,
+            run_row_id,
+            loop_id,
+            data.get("hypothesis"),
+            data.get("mechanism"),
+            data.get("experiment_family"),
+            data.get("change_summary"),
+            json.dumps(data.get("changed_files") or [], sort_keys=True),
+            eval_payload.get("command"),
+            json.dumps(data.get("guardrails") or [], sort_keys=True),
+            verifier.get("command"),
+            1 if verifier.get("passed") else 0,
+            str(eval_payload.get("baseline_value")),
+            str(eval_payload.get("result_value")),
+            str(eval_payload.get("delta_value")),
+            decision,
+            "; ".join(
+                compact_whitespace(str(item.get("body", "")))
+                for item in data.get("lesson_candidates") or []
+                if item.get("body")
+            ),
+            "; ".join(data.get("next_candidates") or []),
+            data.get("started_at"),
+            data.get("ended_at"),
+            data.get("duration_seconds"),
+            data.get("tokens_used"),
+            data.get("cost_estimate"),
+            (data.get("safety") or {}).get("tool_profile"),
+            data.get("privacy_scope", "workspace"),
+            timestamp,
+            timestamp,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO loop_metrics (
+          id, loop_iteration_id, loop_run_id, loop_id, metric_name, metric_kind,
+          direction, unit, baseline_value, result_value, delta_value, passed,
+          measured_at, evidence_uri, evidence_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            stable_id(
+                "lmet",
+                loop_id,
+                data["run_id"],
+                external_item_id,
+                eval_payload["metric_name"],
+            ),
+            iteration_id,
+            run_row_id,
+            loop_id,
+            eval_payload["metric_name"],
+            "primary",
+            eval_payload["direction"],
+            eval_payload.get("unit"),
+            numeric_delta(eval_payload.get("baseline_value")),
+            numeric_delta(eval_payload.get("result_value")),
+            numeric_delta(eval_payload.get("delta_value")),
+            1 if eval_payload.get("passed") else 0,
+            data.get("ended_at") or data.get("created_at") or timestamp,
+            eval_payload.get("evidence_uri"),
+            None,
+        ),
+    )
+    for uri in data.get("artifact_uris") or []:
+        artifact_path = resolve_artifact_uri(uri, envelope["path"])
+        conn.execute(
+            """
+            INSERT INTO loop_artifacts (
+              id, loop_iteration_id, loop_run_id, loop_id, kind, uri, hash,
+              size_bytes, verifier_status, privacy_scope, produced_at, ingested_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stable_id("lart", loop_id, data["run_id"], external_item_id, uri),
+                iteration_id,
+                run_row_id,
+                loop_id,
+                infer_artifact_kind(uri),
+                uri,
+                file_hash(artifact_path) if artifact_path.exists() else None,
+                artifact_path.stat().st_size if artifact_path.exists() else None,
+                "passed" if verifier.get("passed") else "failed",
+                data.get("privacy_scope", "workspace"),
+                data.get("ended_at"),
+                timestamp,
+            ),
+        )
+
+
+def infer_artifact_kind(uri: str) -> str:
+    suffix = Path(uri).suffix.lower()
+    if suffix == ".patch":
+        return "patch"
+    if suffix in {".diff"}:
+        return "diff"
+    if suffix in {".json", ".jsonl"}:
+        return "eval"
+    if suffix in {".log", ".txt"}:
+        return "log"
+    if suffix in {".md"}:
+        return "report"
+    if suffix in {".png", ".jpg", ".jpeg"}:
+        return "screenshot"
+    return "other"
+
+
+def file_hash(path: Path) -> str:
+    return content_hash(path.read_text(encoding="utf-8", errors="replace"))
 
 
 def read_result_envelope(path: Path, options: LoopIngestOptions) -> dict[str, Any]:

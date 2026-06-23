@@ -36,7 +36,7 @@ from ocbrain.ingest import (
     event_from_file,
     iter_candidate_files,
 )
-from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest
+from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
 from ocbrain.schema import Evidence
@@ -120,7 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
     loop_ingest_parser.add_argument("--artifacts", required=True, type=Path)
     loop_ingest_parser.add_argument("--ledger", type=Path)
     loop_ingest_parser.add_argument("--backlog", type=Path)
-    loop_ingest_parser.add_argument("--dry-run", action="store_true")
+    loop_mode = loop_ingest_parser.add_mutually_exclusive_group()
+    loop_mode.add_argument("--dry-run", action="store_true")
+    loop_mode.add_argument("--apply", action="store_true")
     loop_ingest_parser.add_argument("--json", action="store_true", help="Emit JSON output")
     loop_ingest_parser.set_defaults(func=cmd_loop_ingest)
 
@@ -316,18 +318,19 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 
 def cmd_loop_ingest(args: argparse.Namespace) -> int:
-    if not args.dry_run:
-        raise SystemExit("loop-ingest currently requires --dry-run")
-    result = dry_run_loop_ingest(
-        LoopIngestOptions(
-            loop_id=args.loop_id,
-            run_id=args.run_id,
-            artifacts_root=args.artifacts,
-            ledger=args.ledger,
-            backlog=args.backlog,
-            dry_run=True,
-        )
+    options = LoopIngestOptions(
+        loop_id=args.loop_id,
+        run_id=args.run_id,
+        artifacts_root=args.artifacts,
+        ledger=args.ledger,
+        backlog=args.backlog,
+        dry_run=not args.apply,
     )
+    if args.apply:
+        conn = open_db(args)
+        result = write_loop_ingest(conn, options)
+    else:
+        result = dry_run_loop_ingest(options)
     output(args, result)
     return 0 if result["envelopes"]["invalid"] == 0 else 1
 

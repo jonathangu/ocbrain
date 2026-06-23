@@ -104,6 +104,7 @@ Exit evidence:
 - dry-run `brain-loop-ingest` command
 - deterministic run summary, metric, experiment-family, candidate, and tripwire output
 - tests proving dry-run ingest writes nothing
+- explicit `--apply` mode writes only loop audit/index tables and is idempotent
 
 ### Loop 6: Scheduler Readiness
 
@@ -120,6 +121,5 @@ Exit evidence:
 
 Continue Loop 5 loop-aware brain ingest:
 
-- turn dry-run loop summaries into idempotent ledger writes only after another gated preview
 - add loop digest/wiki draft writers before any live memory/wiki/skill/policy mutation
 - keep scheduled dry-run readiness queued until loop evidence ingestion is stable

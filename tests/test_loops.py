@@ -188,6 +188,41 @@ def test_loop_ingest_cli_is_dry_run_and_does_not_create_db(tmp_path: Path, capsy
     assert not db_path.exists()
 
 
+def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(artifacts, "exp_001")
+    write_result(artifacts, "exp_002", artifact_uri="missing-eval.json")
+    db_path = tmp_path / "ocbrain.sqlite"
+    command = [
+        "--db",
+        str(db_path),
+        "loop-ingest",
+        "--loop-id",
+        "repo-quality-loop",
+        "--run-id",
+        "2026-06-23-nightly",
+        "--artifacts",
+        str(artifacts),
+        "--apply",
+        "--json",
+    ]
+
+    assert cli.main(command) == 0
+    first_payload = json.loads(capsys.readouterr().out)
+    assert cli.main(command) == 0
+    second_payload = json.loads(capsys.readouterr().out)
+
+    conn = connect(db_path)
+    assert first_payload["applied"]["items"] == 2
+    assert second_payload["applied"]["items"] == 2
+    assert conn.execute("SELECT COUNT(*) FROM loop_runs").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM loop_items").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM loop_iterations").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM loop_metrics").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM loop_artifacts").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM loop_tripwires").fetchone()[0] == 1
+
+
 def test_loop_tables_exist_after_init(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

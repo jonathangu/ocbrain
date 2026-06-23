@@ -143,8 +143,22 @@ The envelope schema is `ocbrain.loop_result.v1` in each item `result.json`.
 Dry-run ingest validates envelopes, reconstructs done/failed/kept/reverted
 counts, summarizes the primary metric and experiment families, opens missing
 artifact tripwires in the output, and stages proposal-only skill/policy
-candidates. It does not enqueue work, run loops, write skills, apply policy, or
-mutate the ledger yet.
+candidates.
+
+An explicit `--apply` mode writes only the loop audit/index tables with stable
+IDs, so re-ingesting the same run is idempotent:
+
+```bash
+brain-loop-ingest \
+  --loop-id repo-quality-loop \
+  --run-id 2026-06-23-nightly \
+  --artifacts loops/artifacts/repo-quality-loop/2026-06-23-nightly \
+  --apply \
+  --json
+```
+
+It does not enqueue work, run loops, write skills, apply policy, or mutate
+memory/wiki/skill/policy surfaces.
 
 ## Principles
 
