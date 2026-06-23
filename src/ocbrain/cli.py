@@ -376,6 +376,18 @@ def is_generic_candidate_body(body: str) -> bool:
             "from source: pagetype:",
             "from source: - openclaw home:",
             "brain loaded: runtime hook registered",
+            "from source: status ok",
+            "from source: openclawbrain",
+            "from source: {",
+            "from source: date:",
+            "from source: - bundle verdict:",
+            "from source: bundle verdict:",
+            "from source: format:",
+            "from source: - severity:",
+            "from source: severity:",
+            'from source: "command":',
+            "from source: owner:",
+            "from source: - owner:",
         )
     )
 
