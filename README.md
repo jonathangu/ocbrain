@@ -118,6 +118,12 @@ brain-loop-ingest \
 
 Kept loop results require verifier evidence whose target hash matches the
 changed artifact hash. Mismatches fail ingest and write tripwire evidence.
+Failed loop results must include `failure_class` as `approach`, `precondition`,
+`infra`, `safety`, or `unknown`. Only `approach` failures count toward an
+`exhausted` family; `precondition` and `infra` failures mark the family
+`blocked` and stage repair context instead of suppressing the family.
+Forced-exploration envelopes can set `forced_exploration=true`; ingest records
+whether those attempts found improvement.
 
 ## Maintenance
 

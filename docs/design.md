@@ -40,3 +40,12 @@ Memory is a view over current injectable knowledge. Wiki/procedure pages are
 - `ocbrain liveness-check`: reads runner-owned `loop_liveness` rows, opens
   loop tripwire evidence after missed deadman timestamps, and never executes or
   enqueues loop work.
+
+## Loop Family Classification
+
+Loop failures are classified on ingest as `approach`, `precondition`, `infra`,
+`safety`, or `unknown`. Only `approach` failures count toward an `exhausted`
+family. `precondition` and `infra` failures put the family in `blocked` and
+stage repair context; `safety` failures make the family `risky`. Forced
+exploration is recorded from `forced_exploration=true` or
+`exploration.forced=true` and summarized as attempts plus improvements found.

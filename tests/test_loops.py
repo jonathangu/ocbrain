@@ -15,6 +15,8 @@ def write_result(
     family: str = "typecheck_narrowing",
     delta: int = -8,
     artifact_uri: str = "diff.patch",
+    failure_class: str | None = None,
+    forced_exploration: bool = False,
 ) -> Path:
     item_dir = root / item_id
     item_dir.mkdir(parents=True)
@@ -38,57 +40,57 @@ def write_result(
     artifact_uris = [artifact_uri]
     if artifact_uri == "diff.patch":
         artifact_uris.append("eval.json")
-    result_path.write_text(
-        json.dumps(
+    payload = {
+        "schema_version": "ocbrain.loop_result.v1",
+        "loop_id": "repo-quality-loop",
+        "run_id": "2026-06-23-nightly",
+        "item_id": item_id,
+        "worker_session_uri": "~/.openclaw/agents/session.jsonl",
+        "project": "ocbrain",
+        "objective": "Improve repo quality with verifier evidence.",
+        "hypothesis": "Narrowing fixes avoidable type errors.",
+        "mechanism": "The branch narrows too late.",
+        "experiment_family": family,
+        "changed_files": ["src/parser.ts"],
+        "artifact_uris": artifact_uris,
+        "eval": {
+            "command": "npm run typecheck",
+            "metric_name": "typecheck_errors",
+            "direction": "lower_is_better",
+            "baseline_value": 17,
+            "result_value": 9 if delta < 0 else 17,
+            "delta_value": delta,
+            "passed": True,
+            "evidence_uri": "eval.json",
+        },
+        "guardrails": [{"name": "tests", "command": "npm test", "passed": True}],
+        "verifier": {
+            "command": "python loops/scripts/verify_result.py --item exp_001",
+            "passed": True,
+            "evidence_uri": "verifier.json",
+        },
+        "decision": decision,
+        "failure_reason": None,
+        "lesson_candidates": [
             {
-                "schema_version": "ocbrain.loop_result.v1",
-                "loop_id": "repo-quality-loop",
-                "run_id": "2026-06-23-nightly",
-                "item_id": item_id,
-                "worker_session_uri": "~/.openclaw/agents/session.jsonl",
-                "project": "ocbrain",
-                "objective": "Improve repo quality with verifier evidence.",
-                "hypothesis": "Narrowing fixes avoidable type errors.",
-                "mechanism": "The branch narrows too late.",
-                "experiment_family": family,
-                "changed_files": ["src/parser.ts"],
-                "artifact_uris": artifact_uris,
-                "eval": {
-                    "command": "npm run typecheck",
-                    "metric_name": "typecheck_errors",
-                    "direction": "lower_is_better",
-                    "baseline_value": 17,
-                    "result_value": 9 if delta < 0 else 17,
-                    "delta_value": delta,
-                    "passed": True,
-                    "evidence_uri": "eval.json",
-                },
-                "guardrails": [{"name": "tests", "command": "npm test", "passed": True}],
-                "verifier": {
-                    "command": "python loops/scripts/verify_result.py --item exp_001",
-                    "passed": True,
-                    "evidence_uri": "verifier.json",
-                },
-                "decision": decision,
-                "failure_reason": None,
-                "lesson_candidates": [
-                    {
-                        "target": "memory",
-                        "body": "typecheck_narrowing reduced typecheck errors while tests passed.",
-                    }
-                ],
-                "next_candidates": ["Apply narrowing inspection to adjacent modules."],
-                "safety": {
-                    "tool_profile": "coding",
-                    "approval_gates_crossed": [],
-                    "blocked_actions_attempted": [],
-                },
-                "hashes": {"result_hash": "sha256:placeholder"},
-                "created_at": "2026-06-23T06:30:00-07:00",
+                "target": "memory",
+                "body": "typecheck_narrowing reduced typecheck errors while tests passed.",
             }
-        ),
-        encoding="utf-8",
-    )
+        ],
+        "next_candidates": ["Apply narrowing inspection to adjacent modules."],
+        "safety": {
+            "tool_profile": "coding",
+            "approval_gates_crossed": [],
+            "blocked_actions_attempted": [],
+        },
+        "hashes": {"result_hash": "sha256:placeholder"},
+        "created_at": "2026-06-23T06:30:00-07:00",
+    }
+    if failure_class is not None:
+        payload["failure_class"] = failure_class
+    if forced_exploration:
+        payload["forced_exploration"] = True
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
     return result_path
 
 
@@ -160,6 +162,142 @@ def test_loop_ingest_proposes_skill_after_repeated_success(tmp_path: Path) -> No
     assert skill_knowledge_candidates
     assert skill_knowledge_candidates[0]["status"] == "proposal_only"
     assert "typecheck_narrowing" in skill_knowledge_candidates[0]["body"]
+
+
+def test_loop_failed_item_requires_failure_class(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(artifacts, "exp_001", decision="failed", delta=0)
+
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id="repo-quality-loop",
+            run_id="2026-06-23-nightly",
+            artifacts_root=artifacts,
+        )
+    )
+
+    assert result["run_status"] == "needs_review"
+    assert result["envelopes"]["valid"] == 0
+    assert any(error["kind"] == "missing_failure_class" for error in result["envelopes"]["errors"])
+
+
+def test_precondition_failures_block_family_without_exhausting_it(tmp_path: Path, capsys) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(
+        artifacts,
+        "exp_001",
+        decision="failed",
+        delta=0,
+        failure_class="precondition",
+    )
+    write_result(
+        artifacts,
+        "exp_002",
+        decision="failed",
+        delta=0,
+        failure_class="infra",
+    )
+    write_result(
+        artifacts,
+        "exp_003",
+        decision="failed",
+        delta=0,
+        failure_class="precondition",
+    )
+
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id="repo-quality-loop",
+            run_id="2026-06-23-nightly",
+            artifacts_root=artifacts,
+        )
+    )
+    family = result["experiment_families"][0]
+    repair_candidates = [
+        candidate
+        for candidate in result["knowledge_candidates"]
+        if "repair the blocking condition" in candidate["body"]
+    ]
+
+    assert family["status"] == "blocked"
+    assert family["approach_failures"] == 0
+    assert family["blocking_failures"] == 3
+    assert repair_candidates
+
+    db_path = tmp_path / "ocbrain.sqlite"
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "loop-ingest",
+                "--loop-id",
+                "repo-quality-loop",
+                "--run-id",
+                "2026-06-23-nightly",
+                "--artifacts",
+                str(artifacts),
+                "--apply",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    conn = connect(db_path)
+    score = conn.execute("SELECT state, approach_failures FROM family_scores").fetchone()
+
+    assert score["state"] == "blocked"
+    assert score["approach_failures"] == 0
+
+
+def test_only_approach_failures_can_exhaust_family(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(artifacts, "exp_001", decision="failed", delta=0, failure_class="approach")
+    write_result(artifacts, "exp_002", decision="failed", delta=0, failure_class="approach")
+    write_result(artifacts, "exp_003", decision="failed", delta=0, failure_class="approach")
+
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id="repo-quality-loop",
+            run_id="2026-06-23-nightly",
+            artifacts_root=artifacts,
+        )
+    )
+    family = result["experiment_families"][0]
+
+    assert family["status"] == "exhausted"
+    assert family["approach_failures"] == 3
+
+
+def test_forced_exploration_logs_whether_it_found_improvement(tmp_path: Path) -> None:
+    artifacts = tmp_path / "artifacts"
+    write_result(
+        artifacts,
+        "exp_001",
+        decision="reverted",
+        delta=0,
+        forced_exploration=True,
+    )
+
+    result = dry_run_loop_ingest(
+        LoopIngestOptions(
+            loop_id="repo-quality-loop",
+            run_id="2026-06-23-nightly",
+            artifacts_root=artifacts,
+        )
+    )
+    family = result["experiment_families"][0]
+    exploration_candidates = [
+        candidate
+        for candidate in result["knowledge_candidates"]
+        if candidate["title"] == "Forced exploration: typecheck_narrowing"
+    ]
+
+    assert family["forced_exploration_attempts"] == 1
+    assert family["forced_exploration_improvements"] == 0
+    assert exploration_candidates
+    assert "found 0 improving attempts" in exploration_candidates[0]["body"]
 
 
 def test_loop_ingest_rejects_invalid_envelope(tmp_path: Path) -> None:

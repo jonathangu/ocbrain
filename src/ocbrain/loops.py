@@ -22,6 +22,7 @@ DECISIONS = {"kept", "reverted", "failed", "needs_review", "skipped"}
 DIRECTIONS = {"higher_is_better", "lower_is_better", "target", "boolean"}
 TARGETS = {"memory", "wiki", "skill", "policy", "ignore"}
 SCOPES = {"private", "workspace", "project", "public"}
+FAILURE_CLASSES = {"approach", "precondition", "infra", "safety", "unknown"}
 
 
 @dataclass(frozen=True)
@@ -394,7 +395,7 @@ def refresh_family_scores(
                 family["attempts"],
                 family["kept"],
                 family["reverted"],
-                family["failed"],
+                family["approach_failures"],
                 None,
                 family["mean_delta"],
                 timestamp,
@@ -405,7 +406,7 @@ def refresh_family_scores(
 
 
 def family_state(status: str) -> str:
-    if status in {"promising", "risky", "stale"}:
+    if status in {"promising", "blocked", "risky", "stale"}:
         return status
     if status == "exhausted":
         return "exhausted"
@@ -456,6 +457,18 @@ def read_result_envelope(path: Path, options: LoopIngestOptions) -> dict[str, An
     decision = data.get("decision")
     if decision is not None and decision not in DECISIONS:
         errors.append(error(path, "invalid_decision", str(decision)))
+    if decision == "failed":
+        failure_class = normalized_failure_class(data)
+        if failure_class is None:
+            errors.append(
+                error(
+                    path,
+                    "missing_failure_class",
+                    "failed loop items must set failure_class",
+                )
+            )
+        else:
+            data["failure_class"] = failure_class
 
     eval_payload = data.get("eval") or {}
     for field in (
@@ -489,6 +502,18 @@ def read_result_envelope(path: Path, options: LoopIngestOptions) -> dict[str, An
 
 def error(path: Path, kind: str, message: str) -> dict[str, str]:
     return {"path": str(path), "kind": kind, "message": message}
+
+
+def normalized_failure_class(data: dict[str, Any]) -> str | None:
+    raw = data.get("failure_class")
+    if raw is None and isinstance(data.get("failure_reason"), dict):
+        raw = data["failure_reason"].get("class")
+    if raw is None:
+        return None
+    failure_class = str(raw).strip().lower()
+    if failure_class in FAILURE_CLASSES:
+        return failure_class
+    return None
 
 
 def validate_kept_result(
@@ -688,6 +713,16 @@ def experiment_family_summaries(envelopes: list[dict[str, Any]]) -> list[dict[st
         kept = sum(1 for row in rows if row.get("decision") == "kept")
         failed = sum(1 for row in rows if row.get("decision") == "failed")
         reverted = sum(1 for row in rows if row.get("decision") == "reverted")
+        failure_classes = Counter(
+            normalized_failure_class(row) or "none"
+            for row in rows
+            if row.get("decision") == "failed"
+        )
+        approach_failures = failure_classes["approach"]
+        blocking_failures = failure_classes["precondition"] + failure_classes["infra"]
+        safety_failures = failure_classes["safety"]
+        forced_explorations = [row for row in rows if is_forced_exploration(row)]
+        forced_improvements = sum(1 for row in forced_explorations if found_improvement(row))
         guardrail_failures = sum(
             1
             for row in rows
@@ -703,9 +738,22 @@ def experiment_family_summaries(envelopes: list[dict[str, Any]]) -> list[dict[st
                 "kept": kept,
                 "failed": failed,
                 "reverted": reverted,
+                "failure_classes": dict(sorted(failure_classes.items())),
+                "approach_failures": approach_failures,
+                "blocking_failures": blocking_failures,
+                "safety_failures": safety_failures,
+                "forced_exploration_attempts": len(forced_explorations),
+                "forced_exploration_improvements": forced_improvements,
                 "guardrail_failures": guardrail_failures,
                 "mean_delta": mean_delta,
-                "status": classify_family(attempts, kept, failed, guardrail_failures),
+                "status": classify_family(
+                    attempts,
+                    kept,
+                    approach_failures,
+                    blocking_failures,
+                    safety_failures,
+                    guardrail_failures,
+                ),
             }
         )
     return summaries
@@ -718,10 +766,40 @@ def numeric_delta(value: Any) -> float:
         return 0.0
 
 
-def classify_family(attempts: int, kept: int, failed: int, guardrail_failures: int) -> str:
-    if guardrail_failures:
+def is_forced_exploration(data: dict[str, Any]) -> bool:
+    exploration = data.get("exploration")
+    return bool(
+        data.get("forced_exploration")
+        or (isinstance(exploration, dict) and exploration.get("forced"))
+    )
+
+
+def found_improvement(data: dict[str, Any]) -> bool:
+    if data.get("decision") == "kept":
+        return True
+    eval_payload = data.get("eval") or {}
+    delta = numeric_delta(eval_payload.get("delta_value"))
+    direction = eval_payload.get("direction")
+    if direction == "lower_is_better":
+        return delta < 0
+    if direction == "higher_is_better":
+        return delta > 0
+    return bool(eval_payload.get("passed"))
+
+
+def classify_family(
+    attempts: int,
+    kept: int,
+    approach_failures: int,
+    blocking_failures: int,
+    safety_failures: int,
+    guardrail_failures: int,
+) -> str:
+    if guardrail_failures or safety_failures:
         return "risky"
-    if attempts >= 3 and kept == 0 and failed >= 2:
+    if blocking_failures:
+        return "blocked"
+    if attempts >= 3 and kept == 0 and approach_failures >= 2:
         return "exhausted"
     if kept >= 2:
         return "promising"
@@ -751,17 +829,41 @@ def knowledge_candidate_summaries(
         seen.add(("memory", claim_key(body)))
 
     for family in families:
-        if family["status"] in {"promising", "exhausted", "risky"}:
+        if family["status"] in {"promising", "exhausted", "risky", "blocked"}:
             target = "wiki" if family["status"] == "promising" else "memory"
-            body = (
-                f"Experiment family {family['name']} is {family['status']} after "
-                f"{family['attempts']} attempts, {family['kept']} kept, "
-                f"{family['failed']} failed, and {family['reverted']} reverted."
-            )
+            if family["status"] == "blocked":
+                body = (
+                    f"Experiment family {family['name']} is blocked after "
+                    f"{family['blocking_failures']} precondition/infra failures; repair "
+                    "the blocking condition before counting it as exhausted."
+                )
+            else:
+                body = (
+                    f"Experiment family {family['name']} is {family['status']} after "
+                    f"{family['attempts']} attempts, {family['kept']} kept, "
+                    f"{family['failed']} failed, and {family['reverted']} reverted."
+                )
             key = (target, claim_key(body))
             if key not in seen:
                 knowledge_candidates.append(
                     knowledge_candidate(target, f"Loop family: {family['name']}", body, 0.8)
+                )
+                seen.add(key)
+        if family["forced_exploration_attempts"]:
+            body = (
+                f"Forced exploration checked experiment family {family['name']} and found "
+                f"{family['forced_exploration_improvements']} improving attempts across "
+                f"{family['forced_exploration_attempts']} forced attempts."
+            )
+            key = ("memory", claim_key(body))
+            if key not in seen:
+                knowledge_candidates.append(
+                    knowledge_candidate(
+                        "memory",
+                        f"Forced exploration: {family['name']}",
+                        body,
+                        0.79,
+                    )
                 )
                 seen.add(key)
         if family["kept"] >= 3 and family["guardrail_failures"] == 0:
