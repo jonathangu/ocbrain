@@ -13,6 +13,7 @@ from ocbrain.db import (
     init_db,
     log_retrieval_use,
     search,
+    update_retrieval_use_feedback,
 )
 from ocbrain.proposals import write_proposal
 
@@ -72,8 +73,10 @@ def handle_request(
                 query = require_string(arguments, "query")
                 limit = min(max(int(arguments.get("limit", 10)), 1), 50)
                 rows = search(conn, query, limit, scopes=("workspace", "project", "public"))
+                result_rows = []
                 for row in rows:
-                    log_retrieval_use(
+                    row_dict = dict(row)
+                    retrieval_use_id = log_retrieval_use(
                         conn,
                         row["doc_id"],
                         runtime="mcp",
@@ -81,9 +84,11 @@ def handle_request(
                         outcome="served",
                         note=f"limit={limit}",
                     )
+                    row_dict["retrieval_use_id"] = retrieval_use_id
+                    result_rows.append(row_dict)
                 conn.commit()
                 result = {
-                    "content": [{"type": "text", "text": json.dumps([dict(row) for row in rows])}]
+                    "content": [{"type": "text", "text": json.dumps(result_rows)}]
                 }
             elif name == "brain.digest":
                 log_retrieval_use(
@@ -106,7 +111,7 @@ def handle_request(
                     and not arguments.get("include_draft")
                 ):
                     raise PermissionError("draft candidate requires explicit include_draft")
-                log_retrieval_use(
+                retrieval_use_id = log_retrieval_use(
                     conn,
                     row["id"],
                     runtime="mcp",
@@ -115,7 +120,38 @@ def handle_request(
                     note=f"status={row['status']};scope={row['scope']}",
                 )
                 conn.commit()
-                result = {"content": [{"type": "text", "text": json.dumps(dict(row))}]}
+                row_dict = dict(row)
+                row_dict["retrieval_use_id"] = retrieval_use_id
+                result = {"content": [{"type": "text", "text": json.dumps(row_dict)}]}
+            elif name == "brain.feedback":
+                retrieval_use_id = require_string(arguments, "retrieval_use_id")
+                outcome = require_string(arguments, "outcome")
+                if outcome not in {"helpful", "used", "irrelevant", "ignored", "harmful"}:
+                    raise ValueError(
+                        "outcome must be helpful, used, irrelevant, ignored, or harmful"
+                    )
+                note = arguments.get("note")
+                if note is not None and not isinstance(note, str):
+                    raise ValueError("note must be a string when provided")
+                updated = update_retrieval_use_feedback(
+                    conn,
+                    retrieval_use_id,
+                    outcome=outcome,
+                    note=note,
+                )
+                if not updated:
+                    raise ValueError(f"retrieval use not found: {retrieval_use_id}")
+                conn.commit()
+                result = {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"retrieval_use_id": retrieval_use_id, "outcome": outcome}
+                            ),
+                        }
+                    ]
+                }
             elif name == "brain.propose":
                 if not allow_writes:
                     raise PermissionError("brain.propose requires --allow-writes")
@@ -203,6 +239,22 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
                     "include_private": {"type": "boolean"},
                 },
                 "required": ["id"],
+            },
+        },
+        {
+            "name": "brain.feedback",
+            "description": "Record whether served ocbrain context was useful.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "retrieval_use_id": {"type": "string"},
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["helpful", "used", "irrelevant", "ignored", "harmful"],
+                    },
+                    "note": {"type": "string"},
+                },
+                "required": ["retrieval_use_id", "outcome"],
             },
         },
     ]

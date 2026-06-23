@@ -1,8 +1,15 @@
 # ocbrain
 
-OpenClawBrain Lite: an OpenClaw-owned consolidation governor for shared agent knowledge.
+Lightweight shared memory for Codex, Claude, and OpenClaw.
 
-`ocbrain` starts with one narrow job: take a completed work artifact and produce structured dry-run candidates for the right durable surface:
+`ocbrain` is the small, auditable OpenClawBrain runtime that turns historical
+agent work into source-backed knowledge, serves it through MCP, and records
+which retrieved memories actually helped. It is installed locally on this Mac
+mini for Codex, Claude Code, and OpenClaw so each runtime can search the same
+historical ledger instead of living in separate memory silos.
+
+The consolidation pipeline starts with one narrow job: take a completed work
+artifact and produce structured dry-run candidates for the right durable surface:
 
 - `memory`: evidence, facts, preferences, decisions
 - `wiki`: compiled belief and stable synthesis
@@ -10,12 +17,13 @@ OpenClawBrain Lite: an OpenClaw-owned consolidation governor for shared agent kn
 - `policy`: constraints, patch-suggestion only
 - `ignore`: noise, duplicates, unsafe, or not future-useful
 
-The intended shape is not a new agent runtime. It is a small, auditable pipeline that preserves evidence, writes proposals, serves compact context through MCP, and compiles native excerpts for runtimes like Codex and Claude.
+The intended shape is not a new chat agent. It is the shared knowledge layer
+behind the agents: evidence in, compact retrieval out, feedback back into the
+ledger, and proposal-first writes for durable memory/wiki/skill/policy changes.
 
 ## Status
 
-Baseline V0 is implemented. It is useful as a working seed, but it is not the finished
-OpenClawBrain system.
+Lightweight runtime V0 is installed and working locally.
 
 - SQLite ledger
 - safe historical ingest
@@ -25,11 +33,21 @@ OpenClawBrain system.
 - read-only evaluation harness
 - proposal markdown output
 - managed native excerpt output
-- stdio MCP server skeleton, read-only by default
+- stdio MCP server, read-only by default
+- local retrieval-use feedback logging
 
-Current active work is the long-running build loop in [docs/BUILD_LOOP.md](docs/BUILD_LOOP.md).
-That loop must prove quality, runtime fit, reviewer ergonomics, and repeatable
-consolidation before `ocbrain` is considered done.
+Installed local hosts:
+
+- Codex: `~/.codex/config.toml`
+- OpenClaw Codex ACP home: `~/.openclaw/acpx/codex-home/config.toml`
+- Claude Code: user-scoped `claude mcp`
+- OpenClaw: provider-safe MCP tools in `openclaw.json`
+
+Current active work is still tracked by the long-running build loop in
+[docs/BUILD_LOOP.md](docs/BUILD_LOOP.md). The repo is intentionally conservative:
+live memory/wiki/skill/policy mutation remains proposal-first, and the MCP server
+does not expose write-capable proposal tools unless it is explicitly launched
+with `--allow-writes`.
 
 Runtime integration proof notes live in
 [docs/RUNTIME_INTEGRATION.md](docs/RUNTIME_INTEGRATION.md).
@@ -85,16 +103,27 @@ ocbrain --db data/ocbrain.sqlite excerpt --runtime codex --output /tmp/AGENTS.md
 ocbrain --db data/ocbrain.sqlite mcp
 ```
 
+For the local installed instance, use the stable launcher:
+
+```bash
+scripts/ocbrain-mcp
+```
+
 The MCP server currently exposes:
 
 - `brain.search`
 - `brain.digest`
 - `brain.get`
+- `brain.feedback`
 - `brain://digest/current`
 
 `brain.get` serves reviewed candidates by default; draft/private candidates require
 explicit inspection flags. `brain.propose` is write-capable and hidden unless the
 server is launched with `--allow-writes`.
+
+`brain.search` and `brain.get` return `retrieval_use_id` values. Call
+`brain.feedback` with one of `helpful`, `used`, `irrelevant`, `ignored`, or
+`harmful` to record whether the retrieved knowledge helped the current runtime.
 
 ## Principles
 

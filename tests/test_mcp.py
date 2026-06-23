@@ -1,3 +1,5 @@
+import json
+
 from ocbrain.db import EventInput, connect, init_db, insert_candidate, upsert_event
 from ocbrain.mcp import handle_request
 from ocbrain.schema import Candidate, Scope, Target
@@ -20,7 +22,7 @@ def test_mcp_tools_list_is_read_only_by_default(tmp_path):
     response = handle_request(conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     names = {tool["name"] for tool in response["result"]["tools"]}
 
-    assert {"brain.search", "brain.get", "brain.digest"} <= names
+    assert {"brain.search", "brain.get", "brain.digest", "brain.feedback"} <= names
     assert "brain.propose" not in names
 
 
@@ -146,6 +148,8 @@ def test_mcp_get_approved_candidate_by_default(tmp_path):
     )
 
     assert response["result"]["content"][0]["type"] == "text"
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["retrieval_use_id"].startswith("ret_")
     row = conn.execute(
         "SELECT * FROM retrieval_uses WHERE artifact_or_candidate_id = ?",
         (candidate_id,),
@@ -180,9 +184,60 @@ def test_mcp_search_records_retrieval_use(tmp_path):
     )
 
     assert "result" in response
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload[0]["retrieval_use_id"].startswith("ret_")
     row = conn.execute(
         "SELECT * FROM retrieval_uses WHERE artifact_or_candidate_id = ?",
         (event.id,),
     ).fetchone()
     assert row["runtime"] == "mcp"
     assert row["query"] == "brain.search:MCP search"
+
+
+def test_mcp_feedback_updates_retrieval_use(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    event = EventInput(
+        id="evt_feedback",
+        source_type="doc",
+        source_uri="/tmp/feedback.md",
+        content_hash="hash-feedback",
+        title="Feedback search",
+        summary="Claude and Codex share ocbrain context.",
+        body="Claude and Codex share ocbrain context.",
+    )
+    assert upsert_event(conn, event)
+    conn.commit()
+    search_response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.search", "arguments": {"query": "Codex Claude"}},
+        },
+    )
+    payload = json.loads(search_response["result"]["content"][0]["text"])
+    retrieval_use_id = payload[0]["retrieval_use_id"]
+
+    response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {
+                    "retrieval_use_id": retrieval_use_id,
+                    "outcome": "helpful",
+                    "note": "used in answer",
+                },
+            },
+        },
+    )
+
+    assert "result" in response
+    row = conn.execute("SELECT * FROM retrieval_uses WHERE id = ?", (retrieval_use_id,)).fetchone()
+    assert row["outcome"] == "helpful"
+    assert row["note"] == "used in answer"

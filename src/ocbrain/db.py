@@ -260,6 +260,24 @@ def log_retrieval_use(
     return retrieval_id
 
 
+def update_retrieval_use_feedback(
+    conn: sqlite3.Connection,
+    retrieval_use_id: str,
+    *,
+    outcome: str,
+    note: str | None = None,
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE retrieval_uses
+        SET outcome = ?, note = ?
+        WHERE id = ?
+        """,
+        (outcome, note, retrieval_use_id),
+    )
+    return cursor.rowcount > 0
+
+
 def insert_candidate(
     conn: sqlite3.Connection, candidate: Candidate, event_id: str | None = None
 ) -> str | None:
