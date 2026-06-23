@@ -7,6 +7,7 @@ from typing import Any
 
 from ocbrain.db import (
     PUBLIC_SCOPES,
+    approve_knowledge,
     connect,
     get_current_doc,
     get_knowledge,
@@ -14,6 +15,7 @@ from ocbrain.db import (
     knowledge_digest,
     log_retrieval_use,
     mark_knowledge_stale,
+    reject_knowledge,
     render_doc_markdown,
     search,
     update_retrieval_use_feedback,
@@ -145,16 +147,37 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         row_dict["retrieval_use_id"] = retrieval_use_id
         return text_result(row_dict)
     if name == "brain.feedback":
-        retrieval_use_id = require_string(arguments, "retrieval_use_id")
-        outcome = require_string(arguments, "outcome")
-        if outcome not in {"helpful", "used", "irrelevant", "ignored", "harmful"}:
-            raise ValueError("outcome must be helpful, used, irrelevant, ignored, or harmful")
-        note = optional_string(arguments, "note")
-        updated = update_retrieval_use_feedback(conn, retrieval_use_id, outcome=outcome, note=note)
+        if "retrieval_use_id" in arguments:
+            retrieval_use_id = require_string(arguments, "retrieval_use_id")
+            outcome = require_string(arguments, "outcome")
+            if outcome not in {"helpful", "used", "irrelevant", "ignored", "harmful"}:
+                raise ValueError("outcome must be helpful, used, irrelevant, ignored, or harmful")
+            note = optional_string(arguments, "note")
+            updated = update_retrieval_use_feedback(
+                conn, retrieval_use_id, outcome=outcome, note=note
+            )
+            if not updated:
+                raise ValueError(f"retrieval use not found: {retrieval_use_id}")
+            conn.commit()
+            return text_result({"retrieval_use_id": retrieval_use_id, "outcome": outcome})
+        if not allow_writes:
+            raise PermissionError("knowledge approval feedback requires --allow-writes")
+        knowledge_id = require_string(arguments, "id")
+        decision = require_string(arguments, "decision")
+        actor = optional_string(arguments, "actor") or "human"
+        if decision == "approve":
+            updated = approve_knowledge(conn, knowledge_id, actor=actor)
+            status = "current"
+        elif decision == "reject":
+            reason = optional_string(arguments, "reason") or "rejected"
+            updated = reject_knowledge(conn, knowledge_id, reason=reason)
+            status = "archived"
+        else:
+            raise ValueError("decision must be approve or reject")
         if not updated:
-            raise ValueError(f"retrieval use not found: {retrieval_use_id}")
+            raise ValueError(f"candidate human-gated knowledge not found: {knowledge_id}")
         conn.commit()
-        return text_result({"retrieval_use_id": retrieval_use_id, "outcome": outcome})
+        return text_result({"id": knowledge_id, "decision": decision, "status": status})
     if name == "brain.propose":
         if not allow_writes:
             raise PermissionError("brain.propose requires --allow-writes")
@@ -292,9 +315,12 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["helpful", "used", "irrelevant", "ignored", "harmful"],
                     },
+                    "id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["approve", "reject"]},
+                    "actor": {"type": "string"},
+                    "reason": {"type": "string"},
                     "note": {"type": "string"},
                 },
-                "required": ["retrieval_use_id", "outcome"],
             },
         },
     ]

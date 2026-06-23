@@ -58,3 +58,10 @@ Evidence links tighten knowledge scope using the privacy lattice:
 `private < workspace < project < public`. A doc initially staged as `public`
 becomes `private` if any linked source evidence is private, so digest and
 resource rendering cannot accidentally publish private-source material.
+
+## Human Feedback Gate
+
+`brain.feedback` records retrieval usefulness by default. When the MCP server is
+started with `--allow-writes`, the same tool can approve or reject human-gated
+candidate knowledge. Approval moves a candidate to `current` and records
+`approved_by`; rejection archives the candidate with an invalidation reason.

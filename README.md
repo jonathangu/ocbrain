@@ -89,7 +89,12 @@ uv run --with-editable . ocbrain --db data/ocbrain.sqlite mcp --allow-writes
 
 `brain.search` and `brain.get` return `retrieval_use_id` values. Call
 `brain.feedback` with `helpful`, `used`, `irrelevant`, `ignored`, or `harmful`
-to record usefulness.
+to record usefulness. With `--allow-writes`, `brain.feedback` can also approve
+or reject human-gated candidate knowledge:
+
+```json
+{ "id": "know_...", "decision": "approve", "actor": "jon" }
+```
 
 ## Loop Ingest
 

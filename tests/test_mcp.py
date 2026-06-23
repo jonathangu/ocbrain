@@ -273,3 +273,91 @@ def test_mcp_propose_and_mark_stale_are_write_gated(tmp_path):
         allow_writes=True,
     )
     assert "result" in stale
+
+
+def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    approve_id = upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="approved-workflow",
+        title="Approved workflow",
+        status="candidate",
+        risk="high",
+    )
+    reject_id = upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="rejected-workflow",
+        title="Rejected workflow",
+        status="candidate",
+        risk="high",
+    )
+    conn.commit()
+
+    denied = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {"id": approve_id, "decision": "approve", "actor": "jon"},
+            },
+        },
+    )
+    assert denied["error"]["code"] == -32001
+
+    approved = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {"id": approve_id, "decision": "approve", "actor": "jon"},
+            },
+        },
+        allow_writes=True,
+    )
+    approved_payload = json.loads(approved["result"]["content"][0]["text"])
+    approved_row = conn.execute(
+        "SELECT status, approved_by FROM knowledge WHERE id = ?",
+        (approve_id,),
+    ).fetchone()
+
+    assert approved_payload["status"] == "current"
+    assert approved_row["status"] == "current"
+    assert approved_row["approved_by"] == "jon"
+
+    rejected = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {
+                    "id": reject_id,
+                    "decision": "reject",
+                    "reason": "not ready",
+                },
+            },
+        },
+        allow_writes=True,
+    )
+    rejected_payload = json.loads(rejected["result"]["content"][0]["text"])
+    rejected_row = conn.execute(
+        "SELECT status, invalidation_reason FROM knowledge WHERE id = ?",
+        (reject_id,),
+    ).fetchone()
+
+    assert rejected_payload["status"] == "archived"
+    assert rejected_row["status"] == "archived"
+    assert rejected_row["invalidation_reason"] == "not ready"

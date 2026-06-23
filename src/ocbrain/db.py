@@ -872,6 +872,25 @@ def approve_knowledge(
     return cursor.rowcount > 0
 
 
+def reject_knowledge(
+    conn: sqlite3.Connection,
+    knowledge_id: str,
+    *,
+    reason: str = "rejected",
+) -> bool:
+    cursor = conn.execute(
+        """
+        UPDATE knowledge
+        SET status = 'archived',
+            invalidation_reason = ?,
+            updated_at = ?
+        WHERE id = ? AND gate = 'human' AND status = 'candidate'
+        """,
+        (reason, now_iso(), knowledge_id),
+    )
+    return cursor.rowcount > 0
+
+
 def counts(conn: sqlite3.Connection) -> dict[str, Any]:
     evidence_count = conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0]
     knowledge_count = conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0]
