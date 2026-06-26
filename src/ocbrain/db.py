@@ -196,81 +196,182 @@ def _canonical_retrieval_uses_ddl() -> str:
     return match.group(0)
 
 
+# Outcome values the canonical retrieval_uses.outcome CHECK constraint allows.
+# Kept in sync with the CHECK in SCHEMA above. Any other value (including NULL or
+# legacy 'included') must be sanitized to 'unknown' before copying forward, or the
+# INSERT trips ``CHECK constraint failed: outcome IN (...)``.
+_RETRIEVAL_OUTCOMES = (
+    "improved",
+    "failed",
+    "neutral",
+    "unknown",
+    "served",
+    "helpful",
+    "used",
+    "irrelevant",
+    "ignored",
+    "harmful",
+)
+
+
+def _retrieval_uses_source_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list[str]]:
+    """Build (canonical_columns, source_exprs) for copying a legacy table forward.
+
+    Defensive on which legacy columns exist: each source expression is assembled
+    with explicit ``if 'col' in source_cols`` checks rather than by string-munging a
+    template, so the CASE expression that sanitizes ``outcome`` is never mangled.
+    Canonical column <- legacy source.
+    """
+    # outcome: keep only values the canonical CHECK constraint allows; everything
+    # else (NULL, legacy 'included', ...) maps to 'unknown'. A CASE expression is
+    # used rather than COALESCE because COALESCE preserves invalid non-NULL values.
+    if "outcome" in source_cols:
+        allowed = ", ".join(f"'{value}'" for value in _RETRIEVAL_OUTCOMES)
+        outcome_expr = f"CASE WHEN outcome IN ({allowed}) THEN outcome ELSE 'unknown' END"
+    else:
+        outcome_expr = "'unknown'"
+
+    # knowledge_id: prefer an existing knowledge_id, else the legacy
+    # artifact_or_candidate_id, else NULL.
+    knowledge_sources = [
+        col for col in ("knowledge_id", "artifact_or_candidate_id") if col in source_cols
+    ]
+    if not knowledge_sources:
+        knowledge_expr = "NULL"
+    elif len(knowledge_sources) == 1:
+        knowledge_expr = knowledge_sources[0]
+    else:
+        knowledge_expr = f"COALESCE({', '.join(knowledge_sources)})"
+
+    # served_to_runtime: prefer canonical served_to_runtime, else legacy runtime.
+    runtime_sources = [
+        col for col in ("served_to_runtime", "runtime") if col in source_cols
+    ]
+    if not runtime_sources:
+        runtime_expr = "NULL"
+    elif len(runtime_sources) == 1:
+        runtime_expr = runtime_sources[0]
+    else:
+        runtime_expr = f"COALESCE({', '.join(runtime_sources)})"
+
+    # served_at is NOT NULL in canonical; backfill from legacy created_at (NOT NULL
+    # in legacy) whenever served_at is missing or null.
+    served_at_sources = [
+        col for col in ("served_at", "created_at") if col in source_cols
+    ]
+    if not served_at_sources:
+        served_at_expr = "NULL"
+    elif len(served_at_sources) == 1:
+        served_at_expr = served_at_sources[0]
+    else:
+        served_at_expr = f"COALESCE({', '.join(served_at_sources)})"
+
+    def passthrough(col: str) -> str:
+        return col if col in source_cols else "NULL"
+
+    target_columns = [
+        "id",
+        "knowledge_id",
+        "served_to_runtime",
+        "task_ref",
+        "affected_decision",
+        "corrected",
+        "outcome",
+        "note",
+        "served_at",
+    ]
+    source_exprs = [
+        "id",
+        knowledge_expr,
+        runtime_expr,
+        passthrough("task_ref"),
+        passthrough("affected_decision"),
+        passthrough("corrected"),
+        outcome_expr,
+        passthrough("note"),
+        served_at_expr,
+    ]
+    return target_columns, source_exprs
+
+
 def _migrate_retrieval_uses(conn: sqlite3.Connection) -> None:
-    """Rebuild a legacy-shaped ``retrieval_uses`` table into the canonical shape.
+    """Bring a legacy-shaped ``retrieval_uses`` table into the canonical shape.
 
     Old databases were created by an earlier schema and then column-added via
     ALTER, leaving ``artifact_or_candidate_id``/``created_at``/``runtime``/``query``
     columns behind. ``log_retrieval_use`` only INSERTs the canonical columns, so on
     those DBs the INSERT trips ``NOT NULL constraint failed:
-    retrieval_uses.artifact_or_candidate_id``. This migration rebuilds the table to
-    match SCHEMA while preserving every historical row.
+    retrieval_uses.artifact_or_candidate_id``. This rebuilds the table to match
+    SCHEMA while preserving every historical row.
 
-    Idempotent and guarded: it only acts when the legacy
-    ``artifact_or_candidate_id`` column is present. A missing or already-canonical
-    table is left untouched.
+    SQLite DDL auto-commits in Python's default isolation mode, so a destroy-before-
+    copy rebuild can leave the DB half-migrated if the copy fails (canonical table
+    empty + a stray ``retrieval_uses_legacy`` holding the real rows). To stay safe
+    and idempotent, this handles three states:
+
+    * **State A (normal legacy)** — ``retrieval_uses`` still has
+      ``artifact_or_candidate_id``. Copy rows into a fresh scratch table
+      ``retrieval_uses_new`` first; only once that succeeds drop the original and
+      rename the scratch into place. The source is never destroyed before the copy.
+    * **State B (interrupted)** — ``retrieval_uses`` is already canonical but a stray
+      ``retrieval_uses_legacy`` survives from an earlier crashed migration. Recover
+      by copying its rows in with ``INSERT OR IGNORE`` (idempotent on the ``id`` PK),
+      then drop it.
+    * **State C (clean)** — canonical with no stray tables -> no-op.
     """
-    legacy_columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
-    # Guard: table absent, or already canonical (no legacy marker column) -> nothing to do.
-    if "artifact_or_candidate_id" not in legacy_columns:
+    # Clear any scratch table left by a prior crashed run before inspecting state.
+    conn.execute("DROP TABLE IF EXISTS retrieval_uses_new")
+
+    columns = _retrieval_uses_source_columns(conn, "retrieval_uses")
+    has_legacy_stash = bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='retrieval_uses_legacy'"
+        ).fetchone()
+    )
+
+    is_legacy_shape = "artifact_or_candidate_id" in columns
+    if not is_legacy_shape and not has_legacy_stash:
+        # State C: already canonical, nothing stashed -> done.
         return
 
     # The canonical table has knowledge_id REFERENCES knowledge(id). Legacy
     # artifact_or_candidate_id values are NOT canonical knowledge ids, so copying
     # history forward could trip FK enforcement. Disable FK checks for the rebuild
-    # (the standard SQLite table-rebuild pattern) so every historical row is
-    # preserved verbatim, then restore the original setting.
+    # (the standard SQLite table-rebuild pattern), then restore the original setting.
     fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
     conn.execute("PRAGMA foreign_keys=OFF")
-
-    # Move the legacy table aside, then recreate retrieval_uses from the single
-    # source of truth (the CREATE block in SCHEMA). We run just that block rather
-    # than the whole SCHEMA so we don't flip foreign_keys back on mid-rebuild.
-    conn.execute("ALTER TABLE retrieval_uses RENAME TO retrieval_uses_legacy")
-    conn.execute(_canonical_retrieval_uses_ddl())
-
-    # Copy rows forward, mapping defensively based on which legacy columns exist so
-    # this also works on partial-legacy variants. Canonical column <- legacy source.
-    column_mapping: list[tuple[str, str]] = [
-        ("id", "id"),
-        ("knowledge_id", "COALESCE(knowledge_id, artifact_or_candidate_id)"),
-        ("served_to_runtime", "COALESCE(served_to_runtime, runtime)"),
-        ("task_ref", "task_ref"),
-        ("affected_decision", "affected_decision"),
-        ("corrected", "corrected"),
-        ("outcome", "COALESCE(outcome, 'unknown')"),
-        ("note", "note"),
-        ("served_at", "COALESCE(served_at, created_at)"),
-    ]
-    # Only reference legacy columns that actually exist; otherwise fall back to NULL
-    # (or 'unknown' for the NOT-NULL-defaulted outcome column). Identifiers are kept
-    # in their original COALESCE order so precedence is preserved on partial-legacy
-    # variants; the 'unknown' literal is recognized as a non-column fallback.
-    target_columns: list[str] = []
-    source_exprs: list[str] = []
-    for target, source_expr in column_mapping:
-        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source_expr)
-        operands = [t for t in tokens if t != "COALESCE"]
-        kept = [t for t in operands if t == "unknown" or t in legacy_columns]
-        if kept != operands:
-            # Some referenced legacy column is absent on this variant; rebuild the
-            # expression over only the surviving operands (preserving their order).
-            if not kept:
-                source_expr = "'unknown'" if target == "outcome" else "NULL"
-            else:
-                parts = ["'unknown'" if t == "unknown" else t for t in kept]
-                source_expr = parts[0] if len(parts) == 1 else f"COALESCE({', '.join(parts)})"
-        target_columns.append(target)
-        source_exprs.append(source_expr)
-
-    conn.execute(
-        f"INSERT INTO retrieval_uses ({', '.join(target_columns)}) "
-        f"SELECT {', '.join(source_exprs)} FROM retrieval_uses_legacy"
-    )
-    conn.execute("DROP TABLE retrieval_uses_legacy")
-
-    # Restore the caller's foreign_keys setting (SCHEMA leaves it ON by default).
-    conn.execute(f"PRAGMA foreign_keys={'ON' if fk_was_on else 'OFF'}")
+    try:
+        if is_legacy_shape:
+            # State A: build a scratch canonical table, copy into it, and only then
+            # destroy the source. Derive the scratch DDL from the canonical CREATE so
+            # it can never drift from SCHEMA.
+            scratch_ddl = _canonical_retrieval_uses_ddl().replace(
+                "retrieval_uses", "retrieval_uses_new", 1
+            )
+            conn.execute(scratch_ddl)
+            target_columns, source_exprs = _retrieval_uses_copy_columns(columns)
+            conn.execute(
+                f"INSERT INTO retrieval_uses_new ({', '.join(target_columns)}) "
+                f"SELECT {', '.join(source_exprs)} FROM retrieval_uses"
+            )
+            conn.execute("DROP TABLE retrieval_uses")
+            conn.execute("ALTER TABLE retrieval_uses_new RENAME TO retrieval_uses")
+        elif has_legacy_stash:
+            # State B: canonical table already exists; recover the stashed rows.
+            legacy_cols = _retrieval_uses_source_columns(conn, "retrieval_uses_legacy")
+            target_columns, source_exprs = _retrieval_uses_copy_columns(legacy_cols)
+            conn.execute(
+                f"INSERT OR IGNORE INTO retrieval_uses ({', '.join(target_columns)}) "
+                f"SELECT {', '.join(source_exprs)} FROM retrieval_uses_legacy"
+            )
+            conn.execute("DROP TABLE retrieval_uses_legacy")
+    finally:
+        # Restore the caller's foreign_keys setting (SCHEMA leaves it ON by default).
+        conn.execute(f"PRAGMA foreign_keys={'ON' if fk_was_on else 'OFF'}")
 
 
 def upsert_evidence(

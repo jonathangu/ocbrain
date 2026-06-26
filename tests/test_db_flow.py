@@ -44,33 +44,71 @@ def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
     assert "candidate_decisions" not in names
 
 
+_CANONICAL_RETRIEVAL_COLUMNS = {
+    "id",
+    "knowledge_id",
+    "served_to_runtime",
+    "task_ref",
+    "affected_decision",
+    "corrected",
+    "outcome",
+    "note",
+    "served_at",
+}
+
+# The exact live legacy retrieval_uses shape: the original 7 columns plus the
+# 6 ALTER-added columns. init_db's CREATE TABLE IF NOT EXISTS won't reshape it.
+_LEGACY_RETRIEVAL_DDL = """
+CREATE TABLE {name} (
+  id TEXT PRIMARY KEY,
+  artifact_or_candidate_id TEXT NOT NULL,
+  runtime TEXT,
+  query TEXT,
+  outcome TEXT,
+  note TEXT,
+  created_at TEXT NOT NULL
+, knowledge_id TEXT, served_to_runtime TEXT, task_ref TEXT,
+  affected_decision INTEGER, corrected INTEGER, served_at TEXT)
+"""
+
+# Canonical shape, matching SCHEMA, used to stand up the half-migrated State B case.
+_CANONICAL_RETRIEVAL_DDL = """
+CREATE TABLE retrieval_uses (
+  id TEXT PRIMARY KEY,
+  knowledge_id TEXT REFERENCES knowledge(id),
+  served_to_runtime TEXT,
+  task_ref TEXT,
+  affected_decision INTEGER,
+  corrected INTEGER,
+  outcome TEXT CHECK (
+    outcome IN (
+      'improved','failed','neutral','unknown',
+      'served','helpful','used','irrelevant','ignored','harmful'
+    )
+  ) DEFAULT 'unknown',
+  note TEXT,
+  served_at TEXT NOT NULL
+)
+"""
+
+
 def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
-    # Build the exact legacy retrieval_uses shape: the original 7 columns plus the
-    # 6 ALTER-added columns. init_db's CREATE TABLE IF NOT EXISTS won't reshape it.
+    # State A: a live legacy table holding rows including one with an outcome
+    # ('included') that is NOT in the canonical CHECK set, plus NULL knowledge_id and
+    # NULL served_at. A naive COALESCE(outcome,'unknown') copy would trip the CHECK.
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
-        CREATE TABLE retrieval_uses (
-          id TEXT PRIMARY KEY,
-          artifact_or_candidate_id TEXT NOT NULL,
-          runtime TEXT,
-          query TEXT,
-          outcome TEXT,
-          note TEXT,
-          created_at TEXT NOT NULL
-        , knowledge_id TEXT, served_to_runtime TEXT, task_ref TEXT,
-          affected_decision INTEGER, corrected INTEGER, served_at TEXT)
-        """
-    )
+    conn.execute(_LEGACY_RETRIEVAL_DDL.format(name="retrieval_uses"))
     conn.executemany(
         """
         INSERT INTO retrieval_uses (id, artifact_or_candidate_id, runtime, outcome, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
         [
-            ("ret_legacy_1", "art_1", "codex", "served", "2026-06-01T00:00:00+00:00"),
-            ("ret_legacy_2", "art_2", "claude_code", "helpful", "2026-06-02T00:00:00+00:00"),
+            ("ret_legacy_1", "cand_1", "codex", "served", "2026-06-01T00:00:00+00:00"),
+            ("ret_legacy_2", "evt_2", "claude_code", "helpful", "2026-06-02T00:00:00+00:00"),
+            # outcome='included' is invalid; knowledge_id/served_at NULL.
+            ("ret_legacy_3", "cand_3", "mcp", "included", "2026-06-03T00:00:00+00:00"),
         ],
     )
     conn.commit()
@@ -80,37 +118,95 @@ def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
 
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
     assert "artifact_or_candidate_id" not in columns
-    assert columns == {
-        "id",
-        "knowledge_id",
-        "served_to_runtime",
-        "task_ref",
-        "affected_decision",
-        "corrected",
-        "outcome",
-        "note",
-        "served_at",
-    }
+    assert columns == _CANONICAL_RETRIEVAL_COLUMNS
 
     rows = {
         row["id"]: row
-        for row in conn.execute("SELECT id, served_to_runtime, served_at FROM retrieval_uses")
+        for row in conn.execute(
+            "SELECT id, knowledge_id, served_to_runtime, outcome, served_at FROM retrieval_uses"
+        )
     }
-    assert set(rows) == {"ret_legacy_1", "ret_legacy_2"}
+    # All rows preserved.
+    assert set(rows) == {"ret_legacy_1", "ret_legacy_2", "ret_legacy_3"}
     # served_at backfilled from created_at; served_to_runtime backfilled from runtime.
     assert rows["ret_legacy_1"]["served_at"] == "2026-06-01T00:00:00+00:00"
     assert rows["ret_legacy_1"]["served_to_runtime"] == "codex"
+    # knowledge_id backfilled from artifact_or_candidate_id.
+    assert rows["ret_legacy_1"]["knowledge_id"] == "cand_1"
+    assert rows["ret_legacy_3"]["knowledge_id"] == "cand_3"
+    # served_at backfilled even when the legacy served_at column was NULL.
+    assert rows["ret_legacy_3"]["served_at"] == "2026-06-03T00:00:00+00:00"
+    # Valid outcomes are preserved verbatim.
+    assert rows["ret_legacy_1"]["outcome"] == "served"
+    assert rows["ret_legacy_2"]["outcome"] == "helpful"
+    # The invalid 'included' outcome is sanitized to 'unknown' (not dropped).
+    assert rows["ret_legacy_3"]["outcome"] == "unknown"
 
     # The exact path that was failing on legacy DBs now succeeds.
     log_retrieval_use(conn, None, runtime="mcp", task_ref="brain.digest", outcome="served")
     conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 4
 
     # Idempotent: a second init_db is a no-op and does not error.
     init_db(conn)
     columns_again = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
     assert "artifact_or_candidate_id" not in columns_again
-    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 4
+
+
+def test_init_db_recovers_half_migrated_retrieval_uses(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    # State B: an earlier rebuild crashed mid-copy, leaving a canonical (empty)
+    # retrieval_uses alongside a stray retrieval_uses_legacy that still holds the
+    # real rows, including one with the invalid 'included' outcome.
+    conn = sqlite3.connect(db_path)
+    conn.execute(_CANONICAL_RETRIEVAL_DDL)
+    conn.execute(_LEGACY_RETRIEVAL_DDL.format(name="retrieval_uses_legacy"))
+    conn.executemany(
+        """
+        INSERT INTO retrieval_uses_legacy
+          (id, artifact_or_candidate_id, runtime, outcome, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            ("ret_stray_1", "cand_1", "codex", "served", "2026-06-01T00:00:00+00:00"),
+            ("ret_stray_2", "evt_2", "claude_code", "included", "2026-06-02T00:00:00+00:00"),
+        ],
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    init_db(conn)
+
+    names = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    # The stray table is dropped after recovery.
+    assert "retrieval_uses_legacy" not in names
+    assert "retrieval_uses_new" not in names
+
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            "SELECT id, knowledge_id, served_to_runtime, outcome, served_at FROM retrieval_uses"
+        )
+    }
+    # Rows recovered into the canonical table, with sanitization applied.
+    assert set(rows) == {"ret_stray_1", "ret_stray_2"}
+    assert rows["ret_stray_1"]["outcome"] == "served"
+    assert rows["ret_stray_2"]["outcome"] == "unknown"
+    assert rows["ret_stray_1"]["knowledge_id"] == "cand_1"
+    assert rows["ret_stray_1"]["served_at"] == "2026-06-01T00:00:00+00:00"
+
+    # Idempotent: a second init_db neither re-creates the stray table nor dupes rows.
+    init_db(conn)
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 2
+    names_again = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "retrieval_uses_legacy" not in names_again
 
 
 def test_value_knowledge_requires_exactly_one_typed_value(tmp_path: Path) -> None:
