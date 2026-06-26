@@ -166,7 +166,111 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate_schema(conn)
     conn.commit()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Reshape legacy tables that CREATE TABLE IF NOT EXISTS cannot touch.
+
+    SCHEMA uses ``CREATE TABLE IF NOT EXISTS`` everywhere, so an existing table
+    created by an older schema keeps its old columns forever. These migrations
+    bring such tables into line with the canonical SCHEMA definition.
+    """
+    _migrate_retrieval_uses(conn)
+
+
+def _canonical_retrieval_uses_ddl() -> str:
+    """Extract the canonical ``retrieval_uses`` CREATE statement from SCHEMA.
+
+    Keeping this derived from SCHEMA (rather than duplicated) means the migration
+    can never drift from the source-of-truth table definition.
+    """
+    match = re.search(
+        r"CREATE TABLE IF NOT EXISTS retrieval_uses\b.*?\);",
+        SCHEMA,
+        re.DOTALL,
+    )
+    if not match:  # pragma: no cover - SCHEMA always defines this table
+        raise RuntimeError("retrieval_uses CREATE statement not found in SCHEMA")
+    return match.group(0)
+
+
+def _migrate_retrieval_uses(conn: sqlite3.Connection) -> None:
+    """Rebuild a legacy-shaped ``retrieval_uses`` table into the canonical shape.
+
+    Old databases were created by an earlier schema and then column-added via
+    ALTER, leaving ``artifact_or_candidate_id``/``created_at``/``runtime``/``query``
+    columns behind. ``log_retrieval_use`` only INSERTs the canonical columns, so on
+    those DBs the INSERT trips ``NOT NULL constraint failed:
+    retrieval_uses.artifact_or_candidate_id``. This migration rebuilds the table to
+    match SCHEMA while preserving every historical row.
+
+    Idempotent and guarded: it only acts when the legacy
+    ``artifact_or_candidate_id`` column is present. A missing or already-canonical
+    table is left untouched.
+    """
+    legacy_columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
+    # Guard: table absent, or already canonical (no legacy marker column) -> nothing to do.
+    if "artifact_or_candidate_id" not in legacy_columns:
+        return
+
+    # The canonical table has knowledge_id REFERENCES knowledge(id). Legacy
+    # artifact_or_candidate_id values are NOT canonical knowledge ids, so copying
+    # history forward could trip FK enforcement. Disable FK checks for the rebuild
+    # (the standard SQLite table-rebuild pattern) so every historical row is
+    # preserved verbatim, then restore the original setting.
+    fk_was_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+
+    # Move the legacy table aside, then recreate retrieval_uses from the single
+    # source of truth (the CREATE block in SCHEMA). We run just that block rather
+    # than the whole SCHEMA so we don't flip foreign_keys back on mid-rebuild.
+    conn.execute("ALTER TABLE retrieval_uses RENAME TO retrieval_uses_legacy")
+    conn.execute(_canonical_retrieval_uses_ddl())
+
+    # Copy rows forward, mapping defensively based on which legacy columns exist so
+    # this also works on partial-legacy variants. Canonical column <- legacy source.
+    column_mapping: list[tuple[str, str]] = [
+        ("id", "id"),
+        ("knowledge_id", "COALESCE(knowledge_id, artifact_or_candidate_id)"),
+        ("served_to_runtime", "COALESCE(served_to_runtime, runtime)"),
+        ("task_ref", "task_ref"),
+        ("affected_decision", "affected_decision"),
+        ("corrected", "corrected"),
+        ("outcome", "COALESCE(outcome, 'unknown')"),
+        ("note", "note"),
+        ("served_at", "COALESCE(served_at, created_at)"),
+    ]
+    # Only reference legacy columns that actually exist; otherwise fall back to NULL
+    # (or 'unknown' for the NOT-NULL-defaulted outcome column). Identifiers are kept
+    # in their original COALESCE order so precedence is preserved on partial-legacy
+    # variants; the 'unknown' literal is recognized as a non-column fallback.
+    target_columns: list[str] = []
+    source_exprs: list[str] = []
+    for target, source_expr in column_mapping:
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", source_expr)
+        operands = [t for t in tokens if t != "COALESCE"]
+        kept = [t for t in operands if t == "unknown" or t in legacy_columns]
+        if kept != operands:
+            # Some referenced legacy column is absent on this variant; rebuild the
+            # expression over only the surviving operands (preserving their order).
+            if not kept:
+                source_expr = "'unknown'" if target == "outcome" else "NULL"
+            else:
+                parts = ["'unknown'" if t == "unknown" else t for t in kept]
+                source_expr = parts[0] if len(parts) == 1 else f"COALESCE({', '.join(parts)})"
+        target_columns.append(target)
+        source_exprs.append(source_expr)
+
+    conn.execute(
+        f"INSERT INTO retrieval_uses ({', '.join(target_columns)}) "
+        f"SELECT {', '.join(source_exprs)} FROM retrieval_uses_legacy"
+    )
+    conn.execute("DROP TABLE retrieval_uses_legacy")
+
+    # Restore the caller's foreign_keys setting (SCHEMA leaves it ON by default).
+    conn.execute(f"PRAGMA foreign_keys={'ON' if fk_was_on else 'OFF'}")
 
 
 def upsert_evidence(

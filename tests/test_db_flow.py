@@ -44,6 +44,75 @@ def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
     assert "candidate_decisions" not in names
 
 
+def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    # Build the exact legacy retrieval_uses shape: the original 7 columns plus the
+    # 6 ALTER-added columns. init_db's CREATE TABLE IF NOT EXISTS won't reshape it.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE retrieval_uses (
+          id TEXT PRIMARY KEY,
+          artifact_or_candidate_id TEXT NOT NULL,
+          runtime TEXT,
+          query TEXT,
+          outcome TEXT,
+          note TEXT,
+          created_at TEXT NOT NULL
+        , knowledge_id TEXT, served_to_runtime TEXT, task_ref TEXT,
+          affected_decision INTEGER, corrected INTEGER, served_at TEXT)
+        """
+    )
+    conn.executemany(
+        """
+        INSERT INTO retrieval_uses (id, artifact_or_candidate_id, runtime, outcome, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            ("ret_legacy_1", "art_1", "codex", "served", "2026-06-01T00:00:00+00:00"),
+            ("ret_legacy_2", "art_2", "claude_code", "helpful", "2026-06-02T00:00:00+00:00"),
+        ],
+    )
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+
+    init_db(conn)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
+    assert "artifact_or_candidate_id" not in columns
+    assert columns == {
+        "id",
+        "knowledge_id",
+        "served_to_runtime",
+        "task_ref",
+        "affected_decision",
+        "corrected",
+        "outcome",
+        "note",
+        "served_at",
+    }
+
+    rows = {
+        row["id"]: row
+        for row in conn.execute("SELECT id, served_to_runtime, served_at FROM retrieval_uses")
+    }
+    assert set(rows) == {"ret_legacy_1", "ret_legacy_2"}
+    # served_at backfilled from created_at; served_to_runtime backfilled from runtime.
+    assert rows["ret_legacy_1"]["served_at"] == "2026-06-01T00:00:00+00:00"
+    assert rows["ret_legacy_1"]["served_to_runtime"] == "codex"
+
+    # The exact path that was failing on legacy DBs now succeeds.
+    log_retrieval_use(conn, None, runtime="mcp", task_ref="brain.digest", outcome="served")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 3
+
+    # Idempotent: a second init_db is a no-op and does not error.
+    init_db(conn)
+    columns_again = {row["name"] for row in conn.execute("PRAGMA table_info(retrieval_uses)")}
+    assert "artifact_or_candidate_id" not in columns_again
+    assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 3
+
+
 def test_value_knowledge_requires_exactly_one_typed_value(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
