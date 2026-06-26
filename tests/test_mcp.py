@@ -10,6 +10,22 @@ from ocbrain.db import (
 from ocbrain.mcp import handle_request
 
 
+def test_mcp_initialize_includes_agent_conduct_guardrails(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    response = handle_request(
+        conn,
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+    )
+
+    instructions = response["result"]["instructions"]
+    assert "Surface assumptions or ambiguity before acting" in instructions
+    assert "smallest change that satisfies the verified goal" in instructions
+    assert "do not refactor unrelated code" in instructions
+    assert "record the evidence" in instructions
+
+
 def test_mcp_tools_are_knowledge_first(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

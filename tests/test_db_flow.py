@@ -269,6 +269,10 @@ def test_excerpt_reads_injected_current_knowledge(tmp_path: Path) -> None:
     assert "BEGIN OCBRAIN MANAGED BLOCK" in text
     assert knowledge_id in text
     assert "edit source knowledge" in text
+    assert "Surface assumptions or ambiguity before acting." in text
+    assert "Prefer the smallest change that satisfies the verified goal." in text
+    assert "Keep edits surgical; do not refactor unrelated code." in text
+    assert "Verify the result and record the evidence." in text
 
 
 def test_prune_marks_unrefreshed_unreferenced_knowledge_stale(tmp_path: Path) -> None:
