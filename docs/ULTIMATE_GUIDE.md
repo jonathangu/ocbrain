@@ -223,8 +223,13 @@ is not a valid product shape.
 `retrieval_uses` records what context was served, to whom, for what task, and
 whether it helped.
 
-Outcomes include:
+The `outcome` CHECK constraint in `db.py` allows ten values, and the column
+defaults to `unknown`:
 
+- `improved`
+- `failed`
+- `neutral`
+- `unknown` (default)
 - `served`
 - `helpful`
 - `used`
@@ -232,9 +237,16 @@ Outcomes include:
 - `ignored`
 - `harmful`
 
+`served` is written when context is served (search, get, digest, and resource
+reads). `brain.feedback` records the agent's verdict and accepts `helpful`,
+`used`, `irrelevant`, `ignored`, or `harmful`. The `improved`/`failed`/`neutral`
+values are reserved for loop-ingest-style outcome reporting.
+
 This table closes the loop between "memory was available" and "memory was
 actually useful." Maintenance uses this signal to protect useful knowledge and
-decay stale or ignored knowledge.
+decay stale or ignored knowledge: `prune` treats `improved`, `helpful`, and
+`used` as the protective "useful" set, so a row served without any of those
+outcomes can decay on the shorter unhelpful TTL.
 
 ### Loop Liveness
 
@@ -349,6 +361,13 @@ JSON-RPC in, JSON-RPC out, explicit errors, no background behavior.
 ## CLI Surface
 
 The CLI is implemented in `src/ocbrain/cli.py`.
+
+`pyproject.toml` defines three console scripts — `ocbrain`, `ocbrain-closeout`,
+and `brain-loop-ingest` — that all dispatch to `ocbrain.cli:main`. Behavior is
+selected by argv: invoking `brain-loop-ingest` rewrites the call to the
+`loop-ingest` subcommand, while `ocbrain` and `ocbrain-closeout` run the parser
+as given. A hidden global `--input` flag (suppressed from help) routes a bare
+invocation to the `evidence` command.
 
 Core commands:
 
@@ -504,7 +523,8 @@ When in doubt, stage a candidate or proposal and require a human decision.
 ### Repo Layout
 
 ```text
-src/ocbrain/db.py            SQLite schema and core persistence functions
+src/ocbrain/db.py            SQLite schema (DDL) and core persistence functions
+src/ocbrain/schema.py        Candidate/Evidence dataclasses and Target/Scope/Risk enums
 src/ocbrain/cli.py           CLI parser and command handlers
 src/ocbrain/mcp.py           stdio MCP server, tools, resources, instructions
 src/ocbrain/loops.py         loop result ingest and family scoring
@@ -514,9 +534,13 @@ src/ocbrain/excerpt.py       managed runtime instruction block generation
 src/ocbrain/ids.py           stable id/content hash helpers
 src/ocbrain/text.py          text normalization helpers
 tests/                       focused behavior tests
+tools/                       development helpers for proof artifacts
 docs/                        product, runtime, design, and guide docs
 scripts/ocbrain-mcp          installed launcher
 ```
+
+`schema.py` holds in-memory dataclasses and enums only; all DDL/`CREATE TABLE`
+statements live in the `SCHEMA` string in `db.py`.
 
 ### Design Style
 

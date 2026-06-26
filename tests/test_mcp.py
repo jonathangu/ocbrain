@@ -291,6 +291,33 @@ def test_mcp_propose_and_mark_stale_are_write_gated(tmp_path):
     assert "result" in stale
 
 
+def test_mcp_mark_stale_denied_without_allow_writes(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="capability",
+        gate="human",
+        slug="stale-candidate-workflow",
+        title="Stale candidate workflow",
+        status="candidate",
+        risk="high",
+    )
+    conn.commit()
+
+    denied = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "brain.mark_stale", "arguments": {"id": knowledge_id}},
+        },
+    )
+    assert denied["error"]["code"] == -32001
+    assert "--allow-writes" in denied["error"]["message"]
+
+
 def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
