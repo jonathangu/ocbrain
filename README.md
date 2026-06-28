@@ -34,8 +34,9 @@ Current surfaces:
 
 - SQLite ledger: `evidence`, `knowledge`, `knowledge_evidence`, `retrieval_uses`,
   `loop_liveness`, `family_scores`, and `memory`.
-- CLI: `evidence`, `value`, `knowledge`, `search`, `digest`, `loop-ingest`,
-  `propose`, `mark-stale`, `prune`, `heal`, `liveness-check`, `mcp`.
+- CLI: `evidence`, `value`, `knowledge`, `import-memory`, `search`, `digest`,
+  `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`, `liveness-check`,
+  `mcp`.
 - MCP: `brain.search`, `brain.get`, `brain.digest`, `brain.feedback`,
   write-gated `brain.propose`, write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
@@ -56,8 +57,13 @@ uv run --with-editable . ocbrain value \
   --bool true \
   --status current \
   --inject
+uv run --with-editable . ocbrain import-memory MEMORY.md memory/
 uv run --with-editable . ocbrain --pretty digest
 ```
+
+`import-memory` converts markdown memory files into final-spec immutable
+evidence plus current `doc` knowledge, then indexes redacted document text so
+`search`, `digest`, and MCP tools can return source-backed context.
 
 ## MCP
 

@@ -280,6 +280,71 @@ def test_identity_spine_dedupes_value_across_runtime_evidence(tmp_path: Path) ->
     assert conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0] == 1
 
 
+def test_import_memory_makes_markdown_searchable_and_digestible(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    memory_path = tmp_path / "memory" / "2026-06-28.md"
+    memory_path.parent.mkdir()
+    memory_path.write_text(
+        "# OCBrain product check\n\n"
+        "The actual ocbrain product must return source-backed memory, not empty arrays.\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-memory",
+                str(memory_path),
+                "--project",
+                "ocbrain",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["imported"] == 1
+    assert payload["counts"]["evidence"] == 1
+    assert payload["counts"]["knowledge"] == 1
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "search",
+                "source-backed memory",
+                "--project",
+                "ocbrain",
+                "--type",
+                "doc",
+            ]
+        )
+        == 0
+    )
+    search_payload = json.loads(capsys.readouterr().out)
+    assert search_payload["results"][0]["kind"] == "knowledge:doc"
+    assert "source-backed" in search_payload["results"][0]["snippet"]
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "digest",
+                "--project",
+                "ocbrain",
+            ]
+        )
+        == 0
+    )
+    digest_payload = json.loads(capsys.readouterr().out)
+    assert digest_payload["documents"][0]["title"] == "OCBrain product check"
+
+
 def test_capability_is_human_gated_candidate(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

@@ -13,18 +13,20 @@ from ocbrain.db import (
     get_knowledge,
     init_db,
     knowledge_digest,
+    link_knowledge_evidence,
     list_knowledge,
     mark_knowledge_stale,
     search,
     upsert_evidence,
     upsert_knowledge,
+    upsert_search_index,
 )
 from ocbrain.ids import content_hash
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
-from ocbrain.text import compact_whitespace
+from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,6 +84,22 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--loop-id")
     search_parser.add_argument("--family")
     search_parser.set_defaults(func=cmd_search)
+
+    import_memory_parser = subparsers.add_parser(
+        "import-memory",
+        help="Import markdown memory files as source-backed doc knowledge",
+    )
+    import_memory_parser.add_argument("paths", nargs="+", type=Path)
+    import_memory_parser.add_argument("--project", default="workspace")
+    import_memory_parser.add_argument("--privacy-scope", default="workspace")
+    import_memory_parser.add_argument("--limit", type=int)
+    import_memory_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=50_000,
+        help="Maximum UTF-8 bytes to index per file",
+    )
+    import_memory_parser.set_defaults(func=cmd_import_memory)
 
     digest_parser = subparsers.add_parser("digest", help="Show current knowledge digest")
     digest_parser.add_argument("--project")
@@ -286,6 +304,116 @@ def cmd_search(args: argparse.Namespace) -> int:
     ]
     output(args, {"query": args.query, "filters": filters, "results": rows})
     return 0
+
+
+def cmd_import_memory(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    files = memory_files(args.paths)
+    if args.limit is not None:
+        files = files[: args.limit]
+    imported: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for path in files:
+        try:
+            result = import_memory_file(
+                conn,
+                path,
+                project=args.project,
+                privacy_scope=args.privacy_scope,
+                max_bytes=args.max_bytes,
+            )
+        except OSError as exc:
+            skipped.append({"path": str(path), "reason": str(exc)})
+            continue
+        if result is None:
+            skipped.append({"path": str(path), "reason": "empty"})
+        else:
+            imported.append(result)
+    conn.commit()
+    output(
+        args,
+        {
+            "imported": len(imported),
+            "skipped": skipped,
+            "files": imported,
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def memory_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for path in paths:
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.md")))
+        elif path.suffix.lower() == ".md":
+            files.append(path)
+    return sorted(dict.fromkeys(path.resolve() for path in files))
+
+
+def import_memory_file(
+    conn,
+    path: Path,
+    *,
+    project: str | None,
+    privacy_scope: str,
+    max_bytes: int,
+) -> dict[str, str] | None:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if not raw.strip():
+        return None
+    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode(
+        "utf-8", errors="replace"
+    )
+    text = redact_secrets(truncated)
+    title = title_from_text(text, path.stem)
+    source_uri = str(path)
+    digest = content_hash(raw)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="memory_file",
+        source_runtime="openclaw",
+        source_uri=source_uri,
+        content_hash=digest,
+        claim=f"Memory file {path.name}: {compact_whitespace(text[:900])}",
+        artifact_uri=source_uri,
+        artifact_hash=digest,
+        verifier_status="not_required",
+        project=project,
+        privacy_scope=privacy_scope,
+    )
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug=memory_slug(path),
+        title=title,
+        body_uri=source_uri,
+        doc_kind="memory",
+        status="current",
+        confidence=0.7,
+        content_hash=digest,
+        project=project,
+        privacy_scope=privacy_scope,
+    )
+    link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
+    upsert_search_index(
+        conn,
+        knowledge_id,
+        "knowledge:doc",
+        title,
+        text,
+        source_uri,
+    )
+    return {"path": source_uri, "evidence_id": evidence_id, "knowledge_id": knowledge_id}
+
+
+def memory_slug(path: Path) -> str:
+    parts = [part for part in path.with_suffix("").parts if part not in {"/", ""}]
+    tail = parts[-3:] if len(parts) > 3 else parts
+    slug = "-".join(tail).lower()
+    return "".join(char if char.isalnum() else "-" for char in slug).strip("-")
 
 
 def cmd_digest(args: argparse.Namespace) -> int:
