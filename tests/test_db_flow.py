@@ -345,6 +345,68 @@ def test_import_memory_makes_markdown_searchable_and_digestible(
     assert digest_payload["documents"][0]["title"] == "OCBrain product check"
 
 
+def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    codex_path = tmp_path / ".codex" / "sessions" / "2026" / "06" / "rollout.jsonl"
+    openclaw_path = tmp_path / ".openclaw" / "agents" / "main" / "sessions" / "turn.jsonl"
+    claude_path = tmp_path / ".claude" / "projects" / "workspace" / "session.jsonl"
+    for path, runtime in [
+        (codex_path, "codex"),
+        (openclaw_path, "openclaw"),
+        (claude_path, "claude"),
+    ]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "message",
+                    "runtime": runtime,
+                    "content": f"{runtime} transcript contains harvest sentinel",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(tmp_path / ".codex" / "sessions"),
+                str(tmp_path / ".openclaw" / "agents"),
+                str(tmp_path / ".claude" / "projects"),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["imported"] == 3
+    assert payload["existing"] == 0
+    assert payload["by_runtime"] == {"claude": 1, "codex": 1, "openclaw": 1}
+    assert payload["counts"]["evidence"] == 3
+    assert payload["counts"]["knowledge"] == 3
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "search",
+                "harvest sentinel",
+                "--type",
+                "doc",
+            ]
+        )
+        == 0
+    )
+    search_payload = json.loads(capsys.readouterr().out)
+    assert {item["kind"] for item in search_payload["results"]} == {"knowledge:doc"}
+    assert {item["scope"] for item in search_payload["results"]} == {"workspace"}
+    assert len(search_payload["results"]) == 3
+
+
 def test_capability_is_human_gated_candidate(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

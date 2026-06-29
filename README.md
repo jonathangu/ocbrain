@@ -34,9 +34,9 @@ Current surfaces:
 
 - SQLite ledger: `evidence`, `knowledge`, `knowledge_evidence`, `retrieval_uses`,
   `loop_liveness`, `family_scores`, and `memory`.
-- CLI: `evidence`, `value`, `knowledge`, `import-memory`, `search`, `digest`,
-  `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`, `liveness-check`,
-  `mcp`.
+- CLI: `evidence`, `value`, `knowledge`, `import-memory`, `import-history`,
+  `search`, `digest`, `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`,
+  `liveness-check`, `mcp`.
 - MCP: `brain.search`, `brain.get`, `brain.digest`, `brain.feedback`,
   write-gated `brain.propose`, write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
@@ -64,6 +64,20 @@ uv run --with-editable . ocbrain --pretty digest
 `import-memory` converts markdown memory files into final-spec immutable
 evidence plus current `doc` knowledge, then indexes redacted document text so
 `search`, `digest`, and MCP tools can return source-backed context.
+
+To harvest local runtime transcript stores:
+
+```bash
+uv run --with-editable . ocbrain import-history \
+  ~/.openclaw/agents ~/.openclaw/commitments ~/.openclaw/media/inbound \
+  ~/.codex/sessions ~/.codex/archived_sessions \
+  ~/.claude/projects ~/.claude/sessions ~/.claude/tasks
+```
+
+`import-history` catalogs every matched history file as evidence plus current
+`doc` knowledge. It records a source path, file-size/mtime fingerprint, and a
+bounded redacted head/tail text window so large transcript trees stay usable.
+Repeated imports skip already-harvested source paths before reading excerpts.
 
 ## MCP
 

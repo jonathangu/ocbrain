@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ from ocbrain.db import (
     upsert_knowledge,
     upsert_search_index,
 )
-from ocbrain.ids import content_hash
+from ocbrain.ids import content_hash, stable_id
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
@@ -100,6 +101,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum UTF-8 bytes to index per file",
     )
     import_memory_parser.set_defaults(func=cmd_import_memory)
+
+    import_history_parser = subparsers.add_parser(
+        "import-history",
+        help="Import runtime transcript/history files as source-backed doc knowledge",
+    )
+    import_history_parser.add_argument("paths", nargs="*", type=Path)
+    import_history_parser.add_argument(
+        "--manifest",
+        action="append",
+        type=Path,
+        default=[],
+        help="Newline-delimited file containing history file paths",
+    )
+    import_history_parser.add_argument("--project", default="workspace")
+    import_history_parser.add_argument("--privacy-scope", default="workspace")
+    import_history_parser.add_argument("--limit", type=int)
+    import_history_parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=20_000,
+        help="Maximum UTF-8 bytes to index per history file",
+    )
+    import_history_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Commit after this many imported files",
+    )
+    import_history_parser.set_defaults(func=cmd_import_history)
 
     digest_parser = subparsers.add_parser("digest", help="Show current knowledge digest")
     digest_parser.add_argument("--project")
@@ -342,6 +372,65 @@ def cmd_import_memory(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_history(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-200000")
+    files = history_files(args.paths, manifests=args.manifest)
+    if not files:
+        raise ValueError("pass at least one history path or --manifest")
+    if args.limit is not None:
+        files = files[: args.limit]
+    existing_sources = imported_history_sources(conn)
+    imported = 0
+    existing = 0
+    by_runtime: dict[str, int] = {}
+    samples: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    batch_size = max(args.batch_size, 1)
+    for path in files:
+        source_key = (str(path), f"{history_runtime(path)}_history_file")
+        if source_key in existing_sources:
+            existing += 1
+            continue
+        try:
+            result = import_history_file(
+                conn,
+                path,
+                project=args.project,
+                privacy_scope=args.privacy_scope,
+                max_bytes=args.max_bytes,
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            skipped.append({"path": str(path), "reason": str(exc)})
+            continue
+        if result is None:
+            skipped.append({"path": str(path), "reason": "empty"})
+            continue
+        imported += 1
+        by_runtime[result["runtime"]] = by_runtime.get(result["runtime"], 0) + 1
+        if len(samples) < 20:
+            samples.append(result)
+        existing_sources.add((result["path"], f'{result["runtime"]}_history_file'))
+        if imported % batch_size == 0:
+            conn.commit()
+    conn.commit()
+    output(
+        args,
+        {
+            "imported": imported,
+            "existing": existing,
+            "by_runtime": by_runtime,
+            "sample_files": samples,
+            "skipped_count": len(skipped),
+            "skipped": skipped[:50],
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
 def memory_files(paths: list[Path]) -> list[Path]:
     files: list[Path] = []
     for path in paths:
@@ -350,6 +439,47 @@ def memory_files(paths: list[Path]) -> list[Path]:
         elif path.suffix.lower() == ".md":
             files.append(path)
     return sorted(dict.fromkeys(path.resolve() for path in files))
+
+
+HISTORY_SUFFIXES = (
+    ".jsonl",
+    ".trajectory.jsonl",
+    ".jsonl.codex-app-server.json",
+    ".json",
+    ".md",
+)
+HISTORY_GLOBS = ("*.jsonl", "*.trajectory.jsonl", "*.jsonl.codex-app-server.json", "*.json", "*.md")
+
+
+def history_files(paths: list[Path], *, manifests: list[Path] | None = None) -> list[Path]:
+    files: list[Path] = []
+    seen: set[str] = set()
+    for manifest in manifests or []:
+        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            candidate = Path(line.strip())
+            key = str(candidate)
+            if key not in seen and candidate.is_file() and is_history_file(candidate):
+                files.append(candidate)
+                seen.add(key)
+    for path in paths:
+        if path.is_dir():
+            for pattern in HISTORY_GLOBS:
+                for candidate in path.rglob(pattern):
+                    key = str(candidate)
+                    if key not in seen and candidate.is_file():
+                        files.append(candidate)
+                        seen.add(key)
+        elif path.is_file() and is_history_file(path):
+            key = str(path)
+            if key not in seen:
+                files.append(path)
+                seen.add(key)
+    return sorted(files)
+
+
+def is_history_file(path: Path) -> bool:
+    name = path.name.lower()
+    return any(name.endswith(suffix) for suffix in HISTORY_SUFFIXES)
 
 
 def import_memory_file(
@@ -398,15 +528,148 @@ def import_memory_file(
         privacy_scope=privacy_scope,
     )
     link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
-    upsert_search_index(
-        conn,
-        knowledge_id,
-        "knowledge:doc",
-        title,
-        text,
-        source_uri,
-    )
+    if text:
+        upsert_search_index(
+            conn,
+            knowledge_id,
+            "knowledge:doc",
+            title,
+            text,
+            source_uri,
+        )
     return {"path": source_uri, "evidence_id": evidence_id, "knowledge_id": knowledge_id}
+
+
+def import_history_file(
+    conn,
+    path: Path,
+    *,
+    project: str | None,
+    privacy_scope: str,
+    max_bytes: int,
+) -> dict[str, str] | None:
+    size = path.stat().st_size
+    if size == 0:
+        return None
+    source_uri = str(path)
+    runtime = history_runtime(path)
+    digest = file_fingerprint(path)
+    text = redact_secrets(history_text_window(path, max_bytes=max_bytes))
+    title = history_title(path, runtime)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type=f"{runtime}_history_file",
+        source_runtime=runtime,
+        source_uri=source_uri,
+        content_hash=digest,
+        claim=(
+            f"{runtime} history file {path.name} ({size} bytes, fingerprinted): "
+            f"{compact_whitespace(text[:900])}"
+        ),
+        artifact_uri=source_uri,
+        artifact_hash=digest,
+        verifier_status="not_required",
+        project=project,
+        privacy_scope=privacy_scope,
+    )
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug=history_slug(path, runtime),
+        title=title,
+        body_uri=source_uri,
+        doc_kind=f"{runtime}_history",
+        status="current",
+        confidence=0.55,
+        content_hash=digest,
+        project=project,
+        privacy_scope=privacy_scope,
+    )
+    link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
+    if text:
+        upsert_search_index(
+            conn,
+            knowledge_id,
+            "knowledge:doc",
+            title,
+            text,
+            source_uri,
+        )
+    return {
+        "path": source_uri,
+        "runtime": runtime,
+        "evidence_id": evidence_id,
+        "knowledge_id": knowledge_id,
+    }
+
+
+def imported_history_sources(conn) -> set[tuple[str, str]]:
+    return {
+        (row["source_uri"], row["source_type"])
+        for row in conn.execute(
+            """
+            SELECT source_uri, source_type
+            FROM evidence
+            WHERE source_uri IS NOT NULL
+              AND source_type IN (
+                'openclaw_history_file',
+                'codex_history_file',
+                'claude_history_file',
+                'unknown_history_file'
+              )
+            """
+        )
+    }
+
+
+def file_fingerprint(path: Path) -> str:
+    stat = path.stat()
+    digest = hashlib.sha256()
+    digest.update(str(path).encode("utf-8", errors="replace"))
+    digest.update(b"\0")
+    digest.update(str(stat.st_size).encode())
+    digest.update(b"\0")
+    digest.update(str(stat.st_mtime_ns).encode())
+    return digest.hexdigest()
+
+
+def history_text_window(path: Path, *, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        if size <= max_bytes:
+            data = handle.read()
+        else:
+            head_len = max_bytes // 2
+            tail_len = max_bytes - head_len
+            head = handle.read(head_len)
+            handle.seek(max(size - tail_len, 0))
+            tail = handle.read(tail_len)
+            marker = f"\n\n[... {size - max_bytes} bytes omitted from middle ...]\n\n".encode()
+            data = head + marker + tail
+    return data.decode("utf-8", errors="replace")
+
+
+def history_runtime(path: Path) -> str:
+    parts = set(path.parts)
+    if ".codex" in parts:
+        return "codex"
+    if ".claude" in parts:
+        return "claude"
+    if ".openclaw" in parts:
+        return "openclaw"
+    return "unknown"
+
+
+def history_title(path: Path, runtime: str) -> str:
+    stem = path.name
+    for suffix in HISTORY_SUFFIXES:
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return f"{runtime} history: {stem}"[:160]
 
 
 def memory_slug(path: Path) -> str:
@@ -414,6 +677,13 @@ def memory_slug(path: Path) -> str:
     tail = parts[-3:] if len(parts) > 3 else parts
     slug = "-".join(tail).lower()
     return "".join(char if char.isalnum() else "-" for char in slug).strip("-")
+
+
+def history_slug(path: Path, runtime: str) -> str:
+    parts = [part for part in path.with_suffix("").parts if part not in {"/", ""}]
+    tail = parts[-4:] if len(parts) > 4 else parts
+    slug = f"{runtime}-history-{'-'.join(tail)}-{stable_id('path', str(path))[5:13]}"
+    return "".join(char if char.isalnum() else "-" for char in slug.lower()).strip("-")
 
 
 def cmd_digest(args: argparse.Namespace) -> int:
