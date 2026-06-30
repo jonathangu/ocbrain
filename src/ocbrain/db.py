@@ -137,6 +137,62 @@ CREATE TABLE IF NOT EXISTS family_scores (
   PRIMARY KEY (loop_id, family)
 );
 
+CREATE TABLE IF NOT EXISTS brain_events (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  kind TEXT CHECK (
+    kind IN (
+      'evidence_recorded',
+      'compilation_proposed',
+      'compilation_decided',
+      'correction_recorded',
+      'tombstone_recorded',
+      'scope_promoted'
+    )
+  ) NOT NULL,
+  writer TEXT NOT NULL,
+  session_id TEXT,
+  body_json TEXT NOT NULL,
+  body_hash TEXT NOT NULL,
+  prev_hash TEXT,
+  event_hash TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_brain_events_kind_ts ON brain_events(kind, ts);
+
+CREATE TABLE IF NOT EXISTS current_beliefs (
+  belief_id TEXT PRIMARY KEY,
+  body TEXT NOT NULL,
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  visibility TEXT NOT NULL,
+  egress_policy TEXT NOT NULL,
+  confidence REAL,
+  confidence_band TEXT,
+  evidence_ids TEXT NOT NULL,
+  status TEXT CHECK (
+    status IN ('current','superseded','retracted','tombstoned')
+  ) NOT NULL DEFAULT 'current',
+  pinned INTEGER NOT NULL DEFAULT 0,
+  approved_event_id TEXT NOT NULL,
+  last_event_id TEXT NOT NULL,
+  last_compiled_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_current_beliefs_scope
+  ON current_beliefs(scope_type, scope_id, status);
+
+CREATE TABLE IF NOT EXISTS egress_audits (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  target TEXT NOT NULL,
+  context_json TEXT NOT NULL,
+  query TEXT,
+  included_json TEXT NOT NULL,
+  rejected_json TEXT NOT NULL,
+  payload_hash TEXT NOT NULL
+);
+
 CREATE VIEW IF NOT EXISTS memory AS
  SELECT id, type, subject, predicate, value_numeric, value_text, value_bool,
         title, body_uri, project, privacy_scope
@@ -154,7 +210,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
 
 
 def now_iso() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).isoformat(timespec="microseconds")
 
 
 def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:

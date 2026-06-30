@@ -345,6 +345,137 @@ def test_import_memory_makes_markdown_searchable_and_digestible(
     assert digest_payload["documents"][0]["title"] == "OCBrain product check"
 
 
+def test_event_backfill_batches_past_already_projected_rows(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="bountiful-closeout",
+        title="Bountiful closeout",
+        body_uri="task-artifacts/bountiful.md",
+        doc_kind="closeout",
+        status="current",
+        confidence=0.82,
+        project="bountiful",
+        privacy_scope="project",
+    )
+    upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="ocbrain-closeout",
+        title="OCBrain closeout",
+        body_uri="task-artifacts/ocbrain.md",
+        doc_kind="closeout",
+        status="current",
+        confidence=0.84,
+        project="ocbrain",
+        privacy_scope="project",
+    )
+    conn.commit()
+    conn.close()
+
+    command = ["--db", str(db_path), "event-backfill", "--limit", "1"]
+    assert cli.main(command) == 0
+    first_payload = json.loads(capsys.readouterr().out)
+    assert first_payload["imported"] == 1
+
+    assert cli.main(command) == 0
+    second_payload = json.loads(capsys.readouterr().out)
+    assert second_payload["imported"] == 1
+    assert second_payload["items"][0]["knowledge_id"] != first_payload["items"][0]["knowledge_id"]
+
+    assert cli.main(command + ["--dry-run"]) == 0
+    dry_payload = json.loads(capsys.readouterr().out)
+    assert dry_payload["dry_run"] is True
+    assert dry_payload["would_import"] == 0
+    conn = connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 2
+
+
+def test_event_backfill_compilation_references_source_evidence_id(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="bountiful-stack",
+        title="Bountiful stack",
+        body_uri="task-artifacts/bountiful-stack.md",
+        doc_kind="closeout",
+        status="current",
+        confidence=0.88,
+        project="bountiful",
+        privacy_scope="project",
+    )
+    conn.commit()
+    conn.close()
+
+    assert cli.main(["--db", str(db_path), "event-backfill", "--limit", "1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    evidence_id = payload["items"][0]["evidence_id"]
+    assert evidence_id.startswith("evd_")
+
+    conn = connect(db_path)
+    proposed = conn.execute(
+        "SELECT body_json FROM brain_events WHERE kind = 'compilation_proposed'"
+    ).fetchone()
+    proposed_body = json.loads(proposed["body_json"])
+    assert proposed_body["belief_id"] == f"legacy:{knowledge_id}"
+    assert proposed_body["evidence_ids"] == [evidence_id]
+    assert not proposed_body["evidence_ids"][0].startswith("evt_")
+
+
+def test_event_backfill_all_classifies_and_rebuilds_once(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    for slug, title, project in [
+        ("bountiful-closeout", "Bountiful closeout", "workspace"),
+        ("pelican-plan", "Pelican plan", "workspace"),
+        ("ocbrain-guide", "OCBrain guide", "ocbrain"),
+    ]:
+        upsert_knowledge(
+            conn,
+            knowledge_type="doc",
+            gate="auto",
+            slug=slug,
+            title=title,
+            body_uri=f"task-artifacts/{slug}.md",
+            doc_kind="closeout",
+            status="current",
+            confidence=0.8,
+            project=project,
+            privacy_scope="workspace",
+        )
+    conn.commit()
+    conn.close()
+
+    assert cli.main(["--db", str(db_path), "event-backfill", "--all"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["imported"] == 3
+    assert payload["scope_counts"] == {
+        "personal_finance:pelican": 1,
+        "project:bountiful": 1,
+        "project:ocbrain": 1,
+    }
+    assert all(item["classification_reason"] for item in payload["items"])
+    conn = connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 3
+
+
 def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     codex_path = tmp_path / ".codex" / "sessions" / "2026" / "06" / "rollout.jsonl"

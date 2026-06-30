@@ -26,6 +26,12 @@ claims as evidence, compiles the current useful belief as knowledge, remembers
 how knowledge was retrieved and whether it helped, and exposes a compact MCP
 surface that agents can query before doing work.
 
+The product vision is one local/on-prem agent connector between Codex, Claude
+Code, and OpenClaw. The brain is one shared ledger, not separate per-runtime
+silos. The safety mechanism is scope, not storage partitioning: every evidence
+and knowledge row carries context, privacy, and egress boundaries that retrieval
+and compilation must honor.
+
 The core product idea is not "agents run themselves." The core product idea is
 "agents should consult a source-backed brain, emit evidence, and let a
 controlled compiler decide what becomes current memory."
@@ -68,9 +74,61 @@ OCBrain's contract has four parts:
 2. Knowledge is compiled, lifecycle-managed, and linked back to evidence.
 3. Runtime consumption is read-first and source-backed.
 4. Executable, prescriptive, or high-risk knowledge requires a human gate.
+5. Scope is a first-class dimension, and widening scope is a gated act.
 
 This contract matters more than any individual table, CLI flag, or transport.
 When making implementation decisions, preserve this shape.
+
+## Scope Model
+
+OCBrain uses one store with scope labels. Scope is not a folder, database, or
+runtime silo. It is a retrieval, compilation, privacy, and egress dimension on
+evidence and knowledge.
+
+The model has three practical bands:
+
+- Global doctrine: lessons that should travel everywhere, such as "never weaken
+  rules to clear red," "transport success is not product success," or
+  "train-serve skew is the risk."
+- Project-scoped facts: truths that are only valid in a context, such as a
+  product stack, lane registry, deployment path, or current task ledger.
+- Confidential-scoped material: client, money, credential-adjacent, medical, or
+  otherwise sensitive facts that must not surface outside their context or leave
+  the machine through hosted teacher calls unless explicitly allowed.
+
+The implemented scope tag is explicit:
+
+- `scope_type`: `global`, `project`, `repo`, `client`, `personal_finance`,
+  `task`, `session`, or `legacy_unscoped`.
+- `scope_id`: a stable label such as `global:doctrine`,
+  `project:bountiful`, `repo:jonathangu/backyard-ripe`, or `client:bihua`.
+- `visibility`: `public`, `internal`, `confidential`, or `secret`.
+- `egress_policy`: `hosted_ok`, `local_only`, `approval_required`, or
+  `prohibited`.
+- `provenance`: explicit, inferred, promoted, or quarantined.
+
+Default ingest must choose the narrowest known scope: current runtime, repo,
+project, task, or workspace. An unscoped write is a product smell and should be
+treated as a red flag, not a shortcut. Promotion from project-scoped to global is
+itself a human-gated event with evidence.
+
+Retrieval should score source candidates using at least relevance, scope match,
+recency, confidence, and source authority. Global doctrine is eligible by
+default. The current context is boosted. Other contexts are excluded or heavily
+penalized unless the user explicitly cross-searches. A Pelican fact and a
+Bountiful fact are not contradictions just because the strings disagree;
+contradiction ranking must respect scope.
+
+Compilation must be scope-aware. A teacher or summarizer compiling context `C`
+may receive only `C` plus global evidence by default. Confidential-scoped
+evidence is egress-gated. This is the hard requirement that keeps a local brain
+from becoming a client-data leak.
+
+The UI should reflect this shape. The primary lens defaults to the runtime/repo
+making the query. Retrieval preview should show which scoped evidence and global
+doctrine were selected so contamination is visible. Consolidation reports should
+call out cross-context promotion proposals separately from normal current
+beliefs.
 
 ## Product Users
 
@@ -136,13 +194,16 @@ apply paths are enabled by this repo.
 
 ## System Architecture
 
-OCBrain has four layers:
+OCBrain has five layers:
 
-1. Storage layer: SQLite tables, FTS search index, and the `memory` view.
-2. Domain layer: evidence, knowledge, links, retrieval feedback, maintenance,
+1. Storage layer: SQLite tables, FTS search index, event log, projections, and
+   the `memory` view.
+2. Event-sourced core: `brain_events`, `current_beliefs`, `scope.py`,
+   `retrieve.py`, and `egress.py`.
+3. Domain layer: evidence, knowledge, links, retrieval feedback, maintenance,
    proposals, excerpts, and loop ingest.
-3. Interfaces: CLI and stdio MCP.
-4. Runtime integration: managed instruction blocks and MCP tool installs.
+4. Interfaces: CLI and stdio MCP.
+5. Runtime integration: managed instruction blocks and MCP tool installs.
 
 The important architecture choice is that storage is simple, local, and
 auditable. The product does not need a distributed service to prove the core
@@ -174,6 +235,54 @@ Core fields:
 
 Evidence can come from closeouts, correction events, loop iterations, liveness
 tripwires, verifier outputs, or other source-backed runtime events.
+
+### Event-Sourced Core
+
+The new scoped core sits beside the legacy final-spec tables so live data can
+continue working while the stricter architecture matures.
+
+- `brain_events`: append-only event log with canonical JSON body, body hash,
+  previous event hash, and event hash.
+- `current_beliefs`: deterministic projection rebuilt from approved compilation
+  decisions, corrections, tombstones, and promotions.
+- `egress_audits`: recorded previews of evidence included/rejected before local
+  model, hosted teacher, or human export payloads.
+
+Event kinds:
+
+- `evidence_recorded`
+- `compilation_proposed`
+- `compilation_decided`
+- `correction_recorded`
+- `tombstone_recorded`
+- `scope_promoted`
+
+Pending compilations are invisible to retrieval. A belief reaches
+`current_beliefs` only after a decision event approves or edits a proposal.
+Corrections append events and then synchronously rebuild the projection before
+acknowledgement, so the next retrieval sees the correction.
+
+Compiled beliefs require at least one evidence id. Hard knowledge corrections
+are durable constraints: once a hard `mark_wrong`, `retract`, or `demote`
+correction targets a belief, the teacher path cannot re-derive that same belief
+id and must surface any future conflict instead.
+
+`event-dream` is the first local dream loop: it batches scoped evidence into
+pending compilation proposals, optionally records the egress preview, and leaves
+approval to the gate. It is deterministic and local; it does not call a hosted
+teacher model. The proposal records teacher rationale plus a reward band
+(`discard`, `weak`, `moderate`, or `strong`).
+
+`event-teacher-request` is the local hosted-teacher integration boundary. It
+builds a request package from hosted-eligible redacted evidence, includes the
+required JSON response schema for future teacher compilations, records the
+egress audit, and returns `approval_required`. It never dispatches the hosted
+call without later explicit approval.
+
+Scoped retrieval ranks visible contradiction candidates in the `contradictions`
+payload. Ranking is local and evidence-safe: it compares only current beliefs
+that are visible to the request context, so global doctrine can be weighed
+against project facts while confidential foreign scopes remain absent.
 
 ### Knowledge
 
@@ -335,19 +444,32 @@ launched with `--allow-writes`.
 
 Default tools:
 
-- `brain.search`: search evidence and knowledge.
+- `brain.search`: search evidence and knowledge. With a `context` object, it
+  calls the scoped event-core retrieval path.
+- `brain.preview`: preview the exact scoped retrieval payload agents would get.
+- `brain.egress_preview`: preview scope-filtered evidence before local or
+  hosted teacher egress.
 - `brain.digest`: return scoped current memory, docs, capabilities, and family
-  scores.
-- `brain.get`: retrieve one knowledge object by id.
+  scores; with `event_core`, `context`, or `since`, include event-core digest,
+  pending proposals, and runtime health from useful ledger writes.
+- `brain.get`: retrieve one event-core belief or legacy knowledge object by id.
 - `brain.feedback`: record retrieval usefulness.
 
 Write-gated tools:
 
+- `brain.ingest`: append scoped evidence to the event ledger.
+- `brain.proposals`: list pending or decided event-core compilation proposals.
+- `brain.forget`: append a gated tombstone so a belief stops serving.
 - `brain.propose`: write proposal markdown for one human-gated knowledge row.
 - `brain.mark_stale`: mark one knowledge row stale.
 
 With `--allow-writes`, `brain.feedback` can also approve or reject human-gated
-candidate knowledge.
+candidate knowledge, or append a durable correction using `layer`, `target`,
+`op`, `body`, and `hard`. It can also append a compilation decision using
+`proposal_event_id`, `decision`, optional `edited_body`, and `reason`.
+
+Runtime health is not a transport status. The event-core digest reports last
+useful write per writer/session so dead but connected runtimes are visible.
 
 MCP resources:
 
@@ -377,6 +499,20 @@ ocbrain evidence --claim "Codex emitted evidence."
 ocbrain value --subject runtime:codex --predicate shared_brain --bool true --status current --inject
 ocbrain knowledge --status current
 ocbrain search "query terms"
+ocbrain preview "rules red" --project bountiful
+ocbrain event-ingest --body "Never weaken rules to clear red." --global-doctrine
+ocbrain event-compile --belief-id belief:red-rule --body "Never weaken rules to clear red." --global-doctrine --approve
+ocbrain event-correct --target-layer belief --target-id belief:red-rule --op pin --hard
+ocbrain event-forget --target belief:red-rule --mode shred --reason "no longer serve"
+ocbrain event-dream --project bountiful --target local_model --record-egress
+ocbrain event-teacher-request --project bountiful --query "Bountiful"
+ocbrain event-proposals --project bountiful
+ocbrain event-decide --proposal-event-id evt_... --decision approve
+ocbrain event-digest --project bountiful
+ocbrain event-backfill --project workspace --type doc --limit 25
+ocbrain event-backfill --all --sample-limit 25
+ocbrain preview "rules red" --project bountiful --at-ts 2026-06-29T08:00:00+00:00
+ocbrain egress-preview --target hosted_teacher --project bountiful
 ocbrain digest
 ocbrain loop-ingest --loop-id LOOP --run-id RUN --artifacts PATH --dry-run --json
 ocbrain loop-ingest --loop-id LOOP --run-id RUN --artifacts PATH --apply --json
@@ -388,6 +524,20 @@ ocbrain liveness-check --runner-ledger loops/runner.sqlite
 ocbrain mcp
 ocbrain mcp --allow-writes
 ```
+
+`event-backfill --all` is for backed-up live migration of remaining legacy
+current knowledge into the event projection. It classifies each row into a
+project, confidential personal-finance/client scope, global doctrine, or
+quarantined legacy scope and returns sampled items plus total counts.
+
+`event-forget --mode shred` is a serving-layer crypto-shred receipt: the
+projection redacts the belief body and evidence ids, while the append-only ledger
+remains intact for audit unless a separately approved destructive operation is
+run outside OCBrain.
+
+`event-digest` includes a `quiet_loop` object whose checks are falsifiable:
+pending proposal count, scoped projection count, and useful ledger-write
+presence are reported as explicit observed values.
 
 Use `--db` to point at a specific SQLite ledger:
 
@@ -525,6 +675,10 @@ When in doubt, stage a candidate or proposal and require a human decision.
 ```text
 src/ocbrain/db.py            SQLite schema (DDL) and core persistence functions
 src/ocbrain/schema.py        Candidate/Evidence dataclasses and Target/Scope/Risk enums
+src/ocbrain/scope.py         scope tags, context matching, egress policy rules
+src/ocbrain/events.py        append-only event writes and projection rebuild
+src/ocbrain/retrieve.py      shared scoped retrieval and token estimator
+src/ocbrain/egress.py        egress preview, redaction, and audit logging
 src/ocbrain/cli.py           CLI parser and command handlers
 src/ocbrain/mcp.py           stdio MCP server, tools, resources, instructions
 src/ocbrain/loops.py         loop result ingest and family scoring

@@ -1,6 +1,8 @@
 # ocbrain
 
 Lightweight shared brain for Codex, Claude Code, OpenClaw, and future runtimes.
+It is one local/on-prem source-backed ledger with scope as a first-class
+dimension, not federated silos and not one undifferentiated memory pool.
 
 `ocbrain` follows the final OpenClawBrain spec: immutable evidence goes in,
 compiled current knowledge comes out. It is a librarian/compiler, not an
@@ -25,6 +27,10 @@ The bright line is readable versus executable or prescriptive. Capabilities,
 high-risk knowledge, and prescriptive constraints are human-gated and
 proposal-first.
 
+The scope line is just as important. Default ingest uses the narrowest known
+runtime/repo/task context. Global doctrine can surface everywhere, but promotion
+from project-scoped fact to global knowledge is deliberate and gated.
+
 ## Status
 
 The legacy `events`/`candidates`/review-queue model has been removed from the
@@ -33,12 +39,18 @@ active schema and CLI. Startup drops those old tables if they exist.
 Current surfaces:
 
 - SQLite ledger: `evidence`, `knowledge`, `knowledge_evidence`, `retrieval_uses`,
-  `loop_liveness`, `family_scores`, and `memory`.
+  `loop_liveness`, `family_scores`, `brain_events`, `current_beliefs`,
+  `egress_audits`, and `memory`.
 - CLI: `evidence`, `value`, `knowledge`, `import-memory`, `import-history`,
-  `search`, `digest`, `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`,
-  `liveness-check`, `mcp`.
-- MCP: `brain.search`, `brain.get`, `brain.digest`, `brain.feedback`,
-  write-gated `brain.propose`, write-gated `brain.mark_stale`.
+  `search`, `preview`, `event-ingest`, `event-compile`, `egress-preview`,
+  `event-correct`, `event-forget`, `event-dream`, `event-proposals`,
+  `event-decide`, `event-digest`, `event-teacher-request`, `event-backfill`,
+  `digest`, `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`,
+  `liveness-check`, and `mcp`.
+- MCP: `brain.search`, `brain.preview`, `brain.egress_preview`, `brain.get`,
+  `brain.teacher_request`, `brain.digest`, `brain.feedback`, write-gated
+  `brain.ingest`, write-gated `brain.proposals`, write-gated `brain.forget`,
+  write-gated `brain.propose`, and write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
   `brain://loop/families`.
 
@@ -79,6 +91,81 @@ uv run --with-editable . ocbrain import-history \
 bounded redacted head/tail text window so large transcript trees stay usable.
 Repeated imports skip already-harvested source paths before reading excerpts.
 
+To use the scoped event-sourced core directly:
+
+```bash
+uv run --with-editable . ocbrain event-ingest \
+  --body "Never weaken rules to clear red." \
+  --global-doctrine
+uv run --with-editable . ocbrain event-compile \
+  --belief-id belief:red-rule \
+  --body "Never weaken rules to clear red." \
+  --evidence-id evd:red-rule \
+  --global-doctrine \
+  --confidence 0.9 \
+  --approve
+uv run --with-editable . ocbrain --pretty preview "rules red" --project bountiful
+uv run --with-editable . ocbrain --pretty egress-preview \
+  --target hosted_teacher \
+  --project bountiful
+uv run --with-editable . ocbrain event-correct \
+  --target-layer belief \
+  --target-id belief:red-rule \
+  --op pin \
+  --hard
+uv run --with-editable . ocbrain event-forget \
+  --target belief:red-rule \
+  --mode soft \
+  --reason "no longer serve"
+uv run --with-editable . ocbrain --pretty event-dream \
+  --project bountiful \
+  --target local_model \
+  --record-egress
+uv run --with-editable . ocbrain --pretty event-proposals --project bountiful
+uv run --with-editable . ocbrain --pretty event-proposals --project bountiful --approval-packet
+uv run --with-editable . ocbrain event-decide \
+  --proposal-event-id evt_... \
+  --decision approve
+uv run --with-editable . ocbrain --pretty event-digest --project bountiful
+```
+
+Unscoped event writes are quarantined as `legacy_unscoped` with
+`egress_policy=local_only`; they are never silently promoted to global doctrine.
+Compiled beliefs require at least one evidence id. Hard corrections are durable
+constraints: once a hard `mark_wrong`, `retract`, or `demote` correction targets
+a belief, the teacher path cannot re-derive that same belief id.
+`event-dream` is a local deterministic consolidation pass that writes pending
+compilation proposals only. It does not call a hosted model and does not approve
+beliefs. `event-proposals` and `event-decide` are the CLI gate: decisions append
+`compilation_decided` events and then rebuild the projection. Proposed
+compilations carry teacher rationale plus a reward band (`discard`, `weak`,
+`moderate`, or `strong`) rather than a fragile decimal reward.
+Pass `event-proposals --approval-packet` to include a local, Telegram-ready gate
+packet with `/ocbrain_gate ...` approval text, MCP `brain.feedback` arguments,
+and exact `event-decide` argv actions. It never sends the packet; transport is
+an outer OpenClaw concern.
+`event-teacher-request` is the hosted-teacher bridge: it packages only
+hosted-eligible, redacted scoped evidence plus the required JSON response schema,
+records the egress audit, and returns `approval_required` without dispatching a
+hosted call.
+Scoped `preview` also returns a ranked `contradictions` list for visible belief
+pairs that share claim terms but disagree through explicit negation; foreign
+confidential scopes remain excluded from that ranking.
+`event-backfill` migrates existing current legacy knowledge into the scoped event
+core with deterministic scope classification. Use bounded slices while testing,
+or `--all` for the remaining corpus after taking a DB backup. Large outputs are
+sampled while preserving total counts.
+
+```bash
+uv run --with-editable . ocbrain event-backfill --project workspace --type doc --limit 25
+uv run --with-editable . ocbrain event-backfill --all --sample-limit 25
+```
+
+`event-forget --mode shred` appends a cryptographic tombstone receipt and stops
+serving the projected body/evidence ids for the belief. It does not destructively
+rewrite the append-only ledger; destructive deletion remains an outer, explicitly
+approved operational step.
+
 ## MCP
 
 ```bash
@@ -111,7 +198,35 @@ uv run --with-editable . ocbrain --db data/ocbrain.sqlite mcp --allow-writes
 }
 ```
 
-`brain.search` and `brain.get` return `retrieval_use_id` values. Call
+When `brain.search` receives a `context` object or `cross_scope=true`, it uses
+the same scoped event-core retrieval path as `brain.preview`:
+
+```json
+{
+  "query": "rules red Bountiful",
+  "context": { "project": "bountiful" },
+  "cross_scope": false
+}
+```
+
+`brain.egress_preview` shows which event evidence would be included or rejected
+before a local model, hosted teacher, or human export payload is assembled. Large
+included/rejected sets are sampled and include total counts, so hosted-teacher
+dry runs stay readable after full backfills.
+
+With `--allow-writes`, the connector exposes `brain.ingest` for scoped evidence
+appends, `brain.proposals` for gate review, and `brain.forget` for gated
+tombstones. `brain.feedback` can append durable corrections with `layer`,
+`target`, `op`, `body`, and `hard`, or append a compilation decision with
+`proposal_event_id` and `decision`; it does not write beliefs directly.
+
+`brain.digest` returns the legacy digest by default. Pass `event_core=true`, a
+`context`, or `since` to include event-core counts, pending proposals, scoped
+current beliefs, and a falsifiable quiet-loop surface. The event-core digest also
+reports runtime health as the last useful ledger write per writer/session, not
+transport availability.
+
+`brain.search` and legacy `brain.get` rows return `retrieval_use_id` values. Call
 `brain.feedback` with `helpful`, `used`, `irrelevant`, `ignored`, or `harmful`
 to record usefulness. With `--allow-writes`, `brain.feedback` can also approve
 or reject human-gated candidate knowledge:

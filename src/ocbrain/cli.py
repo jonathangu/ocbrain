@@ -22,11 +22,28 @@ from ocbrain.db import (
     upsert_knowledge,
     upsert_search_index,
 )
+from ocbrain.dream import dream
+from ocbrain.egress import egress_preview
+from ocbrain.events import (
+    approval_packet,
+    decide_compilation,
+    event_core_digest,
+    evidence_id_for,
+    list_compilation_proposals,
+    propose_compilation,
+    rebuild_projection,
+    record_correction,
+    record_evidence,
+    record_tombstone,
+)
 from ocbrain.ids import content_hash, stable_id
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
 from ocbrain.proposals import write_proposal
+from ocbrain.retrieve import retrieve
+from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
+from ocbrain.teacher import hosted_teacher_request
 from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
 
 
@@ -85,6 +102,172 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--loop-id")
     search_parser.add_argument("--family")
     search_parser.set_defaults(func=cmd_search)
+
+    preview_parser = subparsers.add_parser(
+        "preview",
+        help="Preview the exact scoped retrieval payload from the event-sourced core",
+    )
+    preview_parser.add_argument("query")
+    add_context_args(preview_parser)
+    preview_parser.add_argument("--limit", type=int, default=12)
+    preview_parser.add_argument("--cross-scope", action="store_true")
+    preview_parser.add_argument("--at-ts")
+    preview_parser.set_defaults(func=cmd_preview)
+
+    ingest_parser = subparsers.add_parser(
+        "event-ingest",
+        help="Append scoped evidence to the event-sourced core",
+    )
+    ingest_parser.add_argument("--body", required=True)
+    ingest_parser.add_argument("--kind", default="observation")
+    ingest_parser.add_argument("--writer", default="ocbrain")
+    ingest_parser.add_argument("--artifact-ref")
+    add_context_args(ingest_parser)
+    ingest_parser.add_argument("--global-doctrine", action="store_true")
+    ingest_parser.set_defaults(func=cmd_event_ingest)
+
+    compile_parser = subparsers.add_parser(
+        "event-compile",
+        help="Append and optionally approve a compiled belief event",
+    )
+    compile_parser.add_argument("--belief-id", required=True)
+    compile_parser.add_argument("--body", required=True)
+    compile_parser.add_argument("--evidence-id", action="append", default=[])
+    compile_parser.add_argument("--confidence", type=float)
+    compile_parser.add_argument(
+        "--reward-band",
+        choices=["discard", "weak", "moderate", "strong"],
+    )
+    compile_parser.add_argument("--approve", action="store_true")
+    add_context_args(compile_parser)
+    compile_parser.add_argument("--global-doctrine", action="store_true")
+    compile_parser.set_defaults(func=cmd_event_compile)
+
+    correct_parser = subparsers.add_parser(
+        "event-correct",
+        help="Append a durable correction and synchronously rebuild the projection",
+    )
+    correct_parser.add_argument(
+        "--target-layer",
+        choices=["evidence", "knowledge", "belief"],
+        required=True,
+    )
+    correct_parser.add_argument("--target-id", required=True)
+    correct_parser.add_argument(
+        "--op",
+        choices=["mark_wrong", "edit", "pin", "demote", "reframe", "retract"],
+        required=True,
+    )
+    correct_parser.add_argument("--body")
+    correct_parser.add_argument("--author", default="human:jonathan")
+    correct_parser.add_argument("--hard", action="store_true")
+    correct_parser.set_defaults(func=cmd_event_correct)
+
+    forget_parser = subparsers.add_parser(
+        "event-forget",
+        help="Append a tombstone and synchronously rebuild the projection",
+    )
+    forget_parser.add_argument("--target", required=True)
+    forget_parser.add_argument("--mode", choices=["soft", "shred"], default="soft")
+    forget_parser.add_argument("--reason")
+    forget_parser.add_argument("--approved-by", default="human:jonathan")
+    forget_parser.set_defaults(func=cmd_event_forget)
+
+    dream_parser = subparsers.add_parser(
+        "event-dream",
+        help="Batch scoped evidence into pending compilation proposals",
+    )
+    add_context_args(dream_parser)
+    dream_parser.add_argument("--since-ts")
+    dream_parser.add_argument("--target", default="local_model")
+    dream_parser.add_argument("--record-egress", action="store_true")
+    dream_parser.add_argument("--limit", type=int, default=20)
+    dream_parser.set_defaults(func=cmd_event_dream)
+
+    proposals_parser = subparsers.add_parser(
+        "event-proposals",
+        help="List pending or decided event-core compilation proposals",
+    )
+    add_context_args(proposals_parser)
+    proposals_parser.add_argument("--include-decided", action="store_true")
+    proposals_parser.add_argument("--limit", type=int, default=50)
+    proposals_parser.add_argument(
+        "--approval-packet",
+        action="store_true",
+        help="Include a Telegram-ready local approval packet without sending it",
+    )
+    proposals_parser.set_defaults(func=cmd_event_proposals)
+
+    decide_parser = subparsers.add_parser(
+        "event-decide",
+        help="Append a gate decision for one compilation proposal",
+    )
+    decide_parser.add_argument("--proposal-event-id", required=True)
+    decide_parser.add_argument(
+        "--decision",
+        choices=["approve", "reject", "edit", "shadow"],
+        required=True,
+    )
+    decide_parser.add_argument("--actor", default="human:jonathan")
+    decide_parser.add_argument("--edited-body")
+    decide_parser.add_argument("--reason")
+    decide_parser.set_defaults(func=cmd_event_decide)
+
+    event_digest_parser = subparsers.add_parser(
+        "event-digest",
+        help="Return scoped event-core digest, pending proposals, and current beliefs",
+    )
+    add_context_args(event_digest_parser)
+    event_digest_parser.add_argument("--since-ts")
+    event_digest_parser.add_argument("--limit", type=int, default=20)
+    event_digest_parser.set_defaults(func=cmd_event_digest)
+
+    egress_parser = subparsers.add_parser(
+        "egress-preview",
+        help="Preview scope-filtered evidence before local or hosted teacher egress",
+    )
+    egress_parser.add_argument("--target", default="hosted_teacher")
+    egress_parser.add_argument("--query")
+    egress_parser.add_argument("--record", action="store_true")
+    add_context_args(egress_parser)
+    egress_parser.set_defaults(func=cmd_egress_preview)
+
+    teacher_parser = subparsers.add_parser(
+        "event-teacher-request",
+        help="Prepare a hosted-teacher request package without dispatch",
+    )
+    add_context_args(teacher_parser)
+    teacher_parser.add_argument("--query")
+    teacher_parser.add_argument("--objective", default="compile_scoped_beliefs")
+    teacher_parser.add_argument("--model", default="hosted_teacher")
+    teacher_parser.add_argument("--limit", type=int, default=20)
+    teacher_parser.add_argument("--no-record", action="store_true")
+    teacher_parser.set_defaults(func=cmd_event_teacher_request)
+
+    backfill_parser = subparsers.add_parser(
+        "event-backfill",
+        help="Backfill current legacy knowledge into the scoped event-sourced core",
+    )
+    backfill_parser.add_argument("--limit", type=int, default=100)
+    backfill_parser.add_argument(
+        "--sample-limit",
+        type=int,
+        default=100,
+        help="Maximum planned/imported items to include in command output",
+    )
+    backfill_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Backfill all remaining matching current legacy rows in one transaction",
+    )
+    backfill_parser.add_argument("--project")
+    backfill_parser.add_argument("--type")
+    backfill_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Classify the next legacy rows without appending event-core writes",
+    )
+    backfill_parser.set_defaults(func=cmd_event_backfill)
 
     import_memory_parser = subparsers.add_parser(
         "import-memory",
@@ -215,6 +398,26 @@ def output(args: argparse.Namespace, payload) -> None:
     print(json.dumps(payload, indent=2 if args.pretty else None, sort_keys=True))
 
 
+def add_context_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project")
+    parser.add_argument("--repo")
+    parser.add_argument("--client")
+    parser.add_argument("--task")
+    parser.add_argument("--session")
+    parser.add_argument("--runtime")
+
+
+def context_from_args(args: argparse.Namespace) -> ScopeContext:
+    return ScopeContext(
+        project=getattr(args, "project", None),
+        repo=getattr(args, "repo", None),
+        client=getattr(args, "client", None),
+        task=getattr(args, "task", None),
+        session=getattr(args, "session", None),
+        runtime=getattr(args, "runtime", None),
+    )
+
+
 def open_db(args: argparse.Namespace):
     conn = connect(args.db)
     init_db(conn)
@@ -334,6 +537,440 @@ def cmd_search(args: argparse.Namespace) -> int:
     ]
     output(args, {"query": args.query, "filters": filters, "results": rows})
     return 0
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    output(
+        args,
+        retrieve(
+            conn,
+            args.query,
+            context=context_from_args(args),
+            limit=args.limit,
+            cross_scope=args.cross_scope,
+            at_ts=args.at_ts,
+        ),
+    )
+    return 0
+
+
+def cmd_event_ingest(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    scope = global_scope() if args.global_doctrine else resolve_write_scope(context_from_args(args))
+    event_id = record_evidence(
+        conn,
+        body=args.body,
+        kind=args.kind,
+        context=context_from_args(args),
+        scope=scope,
+        writer=args.writer,
+        session_id=args.session,
+        artifact_ref=args.artifact_ref,
+    )
+    conn.commit()
+    output(args, {"event_id": event_id, "scope": scope.to_dict(), "counts": counts(conn)})
+    return 0
+
+
+def cmd_event_compile(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    scope = global_scope() if args.global_doctrine else resolve_write_scope(context_from_args(args))
+    proposal_id = propose_compilation(
+        conn,
+        belief_id=args.belief_id,
+        body=args.body,
+        evidence_ids=args.evidence_id,
+        scope=scope,
+        confidence=args.confidence,
+        reward_band=args.reward_band,
+        session_id=args.session,
+    )
+    decision_id = None
+    if args.approve:
+        decision_id = decide_compilation(conn, proposal_event_id=proposal_id, decision="approve")
+    else:
+        rebuild_projection(conn)
+    conn.commit()
+    output(
+        args,
+        {
+            "proposal_event_id": proposal_id,
+            "decision_event_id": decision_id,
+            "scope": scope.to_dict(),
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def cmd_event_correct(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    event_id = record_correction(
+        conn,
+        target_layer=args.target_layer,
+        target_id=args.target_id,
+        op=args.op,
+        body=args.body,
+        author=args.author,
+        hard=args.hard,
+    )
+    conn.commit()
+    output(args, {"event_id": event_id, "kind": "correction_recorded", "counts": counts(conn)})
+    return 0
+
+
+def cmd_event_forget(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    event_id = record_tombstone(
+        conn,
+        target=args.target,
+        mode=args.mode,
+        reason=args.reason,
+        approved_by=args.approved_by,
+    )
+    conn.commit()
+    output(args, {"event_id": event_id, "kind": "tombstone_recorded", "counts": counts(conn)})
+    return 0
+
+
+def cmd_event_dream(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = dream(
+        conn,
+        context=context_from_args(args),
+        since_ts=args.since_ts,
+        target=args.target,
+        record_egress=args.record_egress,
+        limit=args.limit,
+    )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_event_proposals(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    context = context_from_args(args)
+    proposals = list_compilation_proposals(
+        conn,
+        context=context,
+        include_decided=args.include_decided,
+        limit=args.limit,
+    )
+    payload = {"proposals": proposals}
+    if args.approval_packet:
+        payload["approval_packet"] = approval_packet(
+            proposals,
+            context=context,
+            cli_prefix=["ocbrain", "--db", str(args.db)],
+        )
+    output(
+        args,
+        payload,
+    )
+    return 0
+
+
+def cmd_event_decide(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    event_id = decide_compilation(
+        conn,
+        proposal_event_id=args.proposal_event_id,
+        decision=args.decision,
+        actor=args.actor,
+        edited_body=args.edited_body,
+        reason=args.reason,
+    )
+    conn.commit()
+    output(args, {"event_id": event_id, "decision": args.decision, "counts": counts(conn)})
+    return 0
+
+
+def cmd_event_digest(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    output(
+        args,
+        event_core_digest(
+            conn,
+            context=context_from_args(args),
+            since_ts=args.since_ts,
+            limit=args.limit,
+        ),
+    )
+    return 0
+
+
+def cmd_egress_preview(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = egress_preview(
+        conn,
+        context=context_from_args(args),
+        target=args.target,
+        query=args.query,
+        record=args.record,
+    )
+    if args.record:
+        conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_event_teacher_request(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    result = hosted_teacher_request(
+        conn,
+        context=context_from_args(args),
+        query=args.query,
+        objective=args.objective,
+        model=args.model,
+        limit=args.limit,
+        record=not args.no_record,
+    )
+    if not args.no_record:
+        conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_event_backfill(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    rebuild_projection(conn)
+    limit = None if args.all else args.limit
+    rows = legacy_rows_for_backfill(
+        conn,
+        limit=limit,
+        project=args.project,
+        knowledge_type=args.type,
+    )
+    planned = [legacy_backfill_plan_item(row) for row in rows]
+    if args.dry_run:
+        output(
+            args,
+            {
+                "dry_run": True,
+                "would_import": len(planned),
+                "scope_counts": scope_counts(planned),
+                "items": planned[: args.sample_limit],
+                "items_sampled": len(planned) > args.sample_limit,
+                "counts": counts(conn),
+            },
+        )
+        return 0
+    imported: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for row, plan_item in zip(rows, planned, strict=True):
+        belief_id = f"legacy:{row['id']}"
+        if current_belief_exists(conn, belief_id):
+            skipped.append({"knowledge_id": row["id"], "reason": "already_projected"})
+            continue
+        scope = scope_from_legacy_row(row)
+        body = legacy_row_body(row)
+        artifact_ref = row["body_uri"] or row["id"]
+        kind = f"legacy_{row['type']}"
+        source_evidence_id = evidence_id_for(
+            body=body,
+            kind=kind,
+            artifact_ref=artifact_ref,
+            scope=scope,
+        )
+        evidence_event_id = record_evidence(
+            conn,
+            body=body,
+            kind=kind,
+            scope=scope,
+            writer="ocbrain-backfill",
+            artifact_ref=artifact_ref,
+        )
+        proposal_id = propose_compilation(
+            conn,
+            belief_id=belief_id,
+            body=body,
+            evidence_ids=[source_evidence_id],
+            scope=scope,
+            confidence=row["confidence"],
+            writer="ocbrain-backfill",
+            check_hard_block=False,
+        )
+        decision_id = decide_compilation(
+            conn,
+            proposal_event_id=proposal_id,
+            decision="approve",
+            actor="ocbrain-backfill",
+            rebuild=False,
+            check_existing=False,
+        )
+        imported.append(
+            {
+                "knowledge_id": row["id"],
+                "belief_id": belief_id,
+                "scope_id": plan_item["scope_id"],
+                "scope_type": plan_item["scope_type"],
+                "classification_reason": plan_item["classification_reason"],
+                "evidence_id": source_evidence_id,
+                "evidence_event_id": evidence_event_id,
+                "decision_event_id": decision_id,
+            }
+        )
+    rebuild_projection(conn)
+    conn.commit()
+    output(
+        args,
+        {
+            "imported": len(imported),
+            "scope_counts": scope_counts(imported),
+            "skipped": skipped,
+            "items": imported[: args.sample_limit],
+            "items_sampled": len(imported) > args.sample_limit,
+            "counts": counts(conn),
+        },
+    )
+    return 0
+
+
+def legacy_rows_for_backfill(
+    conn,
+    *,
+    limit: int | None,
+    project: str | None = None,
+    knowledge_type: str | None = None,
+):
+    clauses = ["status = 'current'"]
+    params: list[str | int] = []
+    if project:
+        clauses.append("project = ?")
+        params.append(project)
+    if knowledge_type:
+        clauses.append("type = ?")
+        params.append(knowledge_type)
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = "LIMIT ?"
+        params.append(limit)
+    return list(
+        conn.execute(
+            f"""
+            SELECT *
+            FROM knowledge
+            WHERE {' AND '.join(clauses)}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM current_beliefs
+                WHERE current_beliefs.belief_id = 'legacy:' || knowledge.id
+              )
+            ORDER BY updated_at DESC, id ASC
+            {limit_clause}
+            """,
+            params,
+        )
+    )
+
+
+def legacy_backfill_plan_item(row) -> dict[str, str]:
+    classification = classify_legacy_row(row)
+    scope = classification["scope"]
+    return {
+        "knowledge_id": row["id"],
+        "belief_id": f"legacy:{row['id']}",
+        "knowledge_type": row["type"],
+        "project": row["project"] or "",
+        "privacy_scope": row["privacy_scope"],
+        "scope_type": scope.scope_type,
+        "scope_id": scope.scope_id,
+        "visibility": scope.visibility,
+        "egress_policy": scope.egress_policy,
+        "provenance": scope.provenance,
+        "classification_reason": ";".join(classification["reasons"]),
+    }
+
+
+def scope_counts(items: list[dict[str, str]]) -> dict[str, int]:
+    counts_by_scope: dict[str, int] = {}
+    for item in items:
+        scope_id = item.get("scope_id") or "unknown"
+        counts_by_scope[scope_id] = counts_by_scope.get(scope_id, 0) + 1
+    return dict(sorted(counts_by_scope.items()))
+
+
+def current_belief_exists(conn, belief_id: str) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM current_beliefs WHERE belief_id = ? LIMIT 1", (belief_id,)
+        ).fetchone()
+    )
+
+
+def scope_from_legacy_row(row) -> ScopeTag:
+    return classify_legacy_row(row)["scope"]
+
+
+def classify_legacy_row(row) -> dict[str, object]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            row["project"],
+            row["title"],
+            row["subject"],
+            row["predicate"],
+            row["body_uri"],
+            row["doc_kind"],
+        )
+    ).lower()
+    privacy_scope = row["privacy_scope"]
+    if "bihua" in text or "cormorant" in text:
+        return {
+            "scope": ScopeTag(
+                "client",
+                "client:bihua",
+                visibility="confidential",
+                egress_policy="local_only",
+                provenance="inferred",
+            ),
+            "reasons": ["matched cormorant/bihua client terms"],
+        }
+    if "pelican" in text:
+        return {
+            "scope": ScopeTag(
+                "personal_finance",
+                "personal_finance:pelican",
+                visibility="confidential",
+                egress_policy="local_only",
+                provenance="inferred",
+            ),
+            "reasons": ["matched pelican personal-finance terms"],
+        }
+    if "bountiful" in text or "backyard-ripe" in text:
+        return {
+            "scope": ScopeTag("project", "project:bountiful", provenance="inferred"),
+            "reasons": ["matched bountiful/backyard-ripe project terms"],
+        }
+    if "ocbrain" in text or row["project"] == "ocbrain":
+        return {
+            "scope": ScopeTag("project", "project:ocbrain", provenance="inferred"),
+            "reasons": ["matched ocbrain project terms"],
+        }
+    if privacy_scope == "public":
+        return {
+            "scope": global_scope(),
+            "reasons": ["legacy row is public"],
+        }
+    return {
+        "scope": resolve_write_scope(ScopeContext()),
+        "reasons": ["no narrow scope signal; quarantined as legacy unscoped"],
+    }
+
+
+def legacy_row_body(row) -> str:
+    if row["type"] == "value":
+        value = row["value_text"]
+        if row["value_bool"] is not None:
+            value = str(bool(row["value_bool"]))
+        elif row["value_numeric"] is not None:
+            value = str(row["value_numeric"])
+        return f"{row['subject']} {row['predicate']} {value}".strip()
+    return " ".join(str(value or "") for value in (row["title"], row["body_uri"])).strip()
 
 
 def cmd_import_memory(args: argparse.Namespace) -> int:
