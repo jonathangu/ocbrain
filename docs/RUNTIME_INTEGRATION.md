@@ -30,6 +30,9 @@ Before non-trivial work: call brain.digest (scope = this project/task).
 <!-- END OCBRAIN MANAGED BLOCK -->
 ```
 
+For the full agent operating contract, see
+[`AGENT_USE_GUIDE.md`](AGENT_USE_GUIDE.md).
+
 ## MCP Server
 
 Run read-first MCP:

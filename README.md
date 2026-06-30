@@ -54,9 +54,11 @@ Current surfaces:
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
   `brain://loop/families`.
 
-For a full product and engineering walkthrough, read
-[`docs/ULTIMATE_GUIDE.md`](docs/ULTIMATE_GUIDE.md). For a pickup guide for
-another agent, read [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md).
+For agent runtime behavior, read
+[`docs/AGENT_USE_GUIDE.md`](docs/AGENT_USE_GUIDE.md). For a full product and
+engineering walkthrough, read [`docs/ULTIMATE_GUIDE.md`](docs/ULTIMATE_GUIDE.md).
+For a pickup guide for another agent, read
+[`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md).
 
 ## Quick Start
 
