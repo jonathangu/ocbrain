@@ -34,32 +34,56 @@ def append_event(
     ts = now_iso()
     body_json = canonical_json(body)
     body_hash = sha256_text(body_json)
-    prev_hash = conn.execute(
-        "SELECT event_hash FROM brain_events ORDER BY rowid DESC LIMIT 1"
-    ).fetchone()
-    prev_hash_text = prev_hash["event_hash"] if prev_hash else None
-    event_hash = sha256_text(
-        canonical_json(
-            {
-                "ts": ts,
-                "kind": kind,
-                "writer": writer,
-                "session_id": session_id,
-                "body_hash": body_hash,
-                "prev_hash": prev_hash_text,
-            }
+    # The chain-tail read and the insert must be one atomic unit: two concurrent
+    # writers that both read the same tail would insert sibling events claiming
+    # the same prev_hash and silently fork the tamper-evidence chain. BEGIN
+    # IMMEDIATE takes the write lock before the tail is read; if this connection
+    # already has a transaction open, the caller owns the write window and the
+    # read+insert stay inside it.
+    started_transaction = not conn.in_transaction
+    if started_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        prev_hash = conn.execute(
+            "SELECT event_hash FROM brain_events ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        prev_hash_text = prev_hash["event_hash"] if prev_hash else None
+        event_hash = sha256_text(
+            canonical_json(
+                {
+                    "ts": ts,
+                    "kind": kind,
+                    "writer": writer,
+                    "session_id": session_id,
+                    "body_hash": body_hash,
+                    "prev_hash": prev_hash_text,
+                }
+            )
         )
-    )
-    event_id = stable_id("evt", kind, event_hash)
-    conn.execute(
-        """
-        INSERT INTO brain_events (
-          id, ts, kind, writer, session_id, body_json, body_hash, prev_hash, event_hash
+        event_id = stable_id("evt", kind, event_hash)
+        conn.execute(
+            """
+            INSERT INTO brain_events (
+              id, ts, kind, writer, session_id, body_json, body_hash, prev_hash, event_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                ts,
+                kind,
+                writer,
+                session_id,
+                body_json,
+                body_hash,
+                prev_hash_text,
+                event_hash,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (event_id, ts, kind, writer, session_id, body_json, body_hash, prev_hash_text, event_hash),
-    )
+    except BaseException:
+        if started_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
     return event_id
 
 
@@ -165,6 +189,17 @@ def decide_compilation(
         existing = proposal_decision_event(conn, proposal_event_id)
         if existing is not None:
             raise ValueError(f"proposal already decided: {proposal_event_id}")
+    if decision in {"approve", "edit"}:
+        belief_id = proposal_belief_id(conn, proposal_event_id)
+        if belief_id is not None:
+            if hard_blocked_belief(conn, belief_id):
+                raise PermissionError(
+                    f"cannot {decision}: belief is blocked by a hard correction: {belief_id}"
+                )
+            if tombstoned_belief(conn, belief_id):
+                raise PermissionError(
+                    f"cannot {decision}: belief is tombstoned: {belief_id}"
+                )
     event_id = append_event(
         conn,
         "compilation_decided",
@@ -192,8 +227,13 @@ def record_correction(
     author: str = "human:jonathan",
     hard: bool = False,
 ) -> str:
-    if target_layer not in {"evidence", "knowledge", "belief"}:
-        raise ValueError("target_layer must be evidence, knowledge, or belief")
+    if target_layer == "evidence":
+        raise ValueError(
+            "evidence-layer corrections are not applied by the projection; "
+            "correct the derived belief instead"
+        )
+    if target_layer not in {"knowledge", "belief"}:
+        raise ValueError("target_layer must be knowledge or belief")
     event_id = append_event(
         conn,
         "correction_recorded",
@@ -251,7 +291,7 @@ def fold_projection(
     events = list(iter_events(conn, at_ts=at_ts))
     proposals: dict[str, dict[str, Any]] = {}
     projected: dict[str, dict[str, Any]] = {}
-    tombstoned_targets: set[str] = set()
+    tombstoned_targets: dict[str, dict[str, Any]] = {}
 
     for event in events:
         body = json.loads(event["body_json"])
@@ -264,15 +304,26 @@ def fold_projection(
             apply_correction(event, body, projected)
         elif kind == "tombstone_recorded":
             target = body["target"]
-            tombstoned_targets.add(target)
-            if target in projected:
-                projected[target]["status"] = "tombstoned"
-                if body.get("mode") == "shred":
-                    projected[target]["body"] = "[shredded by tombstone]"
-                    projected[target]["evidence_ids"] = []
-                projected[target]["last_event_id"] = event["id"]
+            tombstone = tombstoned_targets.setdefault(target, {"mode": "soft"})
+            if body.get("mode") == "shred":
+                tombstone["mode"] = "shred"
+            tombstone["event_id"] = event["id"]
         elif kind == "scope_promoted":
             apply_scope_promotion(event, body, projected)
+
+    # Tombstones win regardless of event order at fold time: a compilation
+    # decision (or any other event) replaying after a tombstone for the same
+    # target must never resurrect a tombstoned/shredded belief, so tombstones
+    # are applied last over whatever the fold projected.
+    for target, tombstone in tombstoned_targets.items():
+        belief = projected.get(target)
+        if belief is None:
+            continue
+        belief["status"] = "tombstoned"
+        if tombstone["mode"] == "shred":
+            belief["body"] = "[shredded by tombstone]"
+            belief["evidence_ids"] = []
+        belief["last_event_id"] = tombstone["event_id"]
 
     return projected
 
@@ -341,6 +392,27 @@ def iter_events(conn: sqlite3.Connection, *, at_ts: str | None = None):
         )
 
 
+def proposal_belief_id(conn: sqlite3.Connection, proposal_event_id: str) -> str | None:
+    row = conn.execute(
+        "SELECT body_json FROM brain_events WHERE id = ? AND kind = 'compilation_proposed'",
+        (proposal_event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    belief_id = json.loads(row["body_json"]).get("belief_id")
+    return str(belief_id) if belief_id else None
+
+
+def tombstoned_belief(conn: sqlite3.Connection, belief_id: str) -> bool:
+    for row in iter_events(conn):
+        if row["kind"] != "tombstone_recorded":
+            continue
+        body = json.loads(row["body_json"])
+        if body.get("target") == belief_id:
+            return True
+    return False
+
+
 def hard_blocked_belief(conn: sqlite3.Connection, belief_id: str) -> bool:
     for row in iter_events(conn):
         if row["kind"] != "correction_recorded":
@@ -364,6 +436,8 @@ def get_current_belief(conn: sqlite3.Connection, belief_id: str) -> dict[str, An
     if row is None:
         return None
     evidence_ids = json.loads(row["evidence_ids"])
+    tombstoned = row["status"] == "tombstoned"
+    shredded = tombstoned and row["body"] == "[shredded by tombstone]"
     provenance = []
     for event in iter_events(conn):
         body = json.loads(event["body_json"])
@@ -375,6 +449,13 @@ def get_current_belief(conn: sqlite3.Connection, belief_id: str) -> dict[str, An
             body.get("target_id") == belief_id or body.get("target") == belief_id
         ):
             provenance.append(event_summary(event, body))
+    if tombstoned:
+        # Never re-serve tombstoned/shredded content through provenance: the
+        # projection row is the redaction source of truth, so event bodies must
+        # not leak what the tombstone removed.
+        provenance = [
+            redact_provenance_entry(entry, shredded=shredded) for entry in provenance
+        ]
     return {
         "object_kind": "belief",
         "belief_id": row["belief_id"],
@@ -445,6 +526,26 @@ def event_summary(event: sqlite3.Row, body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def redact_provenance_entry(entry: dict[str, Any], *, shredded: bool) -> dict[str, Any]:
+    """Strip belief content from a provenance entry for a tombstoned belief.
+
+    Soft tombstones hide proposal/decision bodies; shred tombstones redact every
+    body-bearing field plus evidence ids, matching the projection serving policy.
+    """
+    kind = entry["kind"]
+    if not shredded and kind not in {"compilation_proposed", "compilation_decided"}:
+        return entry
+    marker = "[shredded by tombstone]" if shredded else "[redacted by tombstone]"
+    body = dict(entry["body"])
+    if body.get("body"):
+        body["body"] = marker
+    if body.get("edited_body"):
+        body["edited_body"] = marker
+    if shredded and body.get("evidence_ids"):
+        body["evidence_ids"] = []
+    return entry | {"body": body}
+
+
 def proposal_decision_event(
     conn: sqlite3.Connection, proposal_event_id: str
 ) -> dict[str, Any] | None:
@@ -455,6 +556,17 @@ def proposal_decision_event(
         if body.get("proposal_event_id") == proposal_event_id:
             return event_summary(event, body)
     return None
+
+
+def scope_visible(scope: ScopeTag, context: ScopeContext) -> bool:
+    """Mirror retrieve()'s hard exclusion for scoped read surfaces.
+
+    An empty/absent context is most-restrictive for confidential data, never a
+    bypass: without a matching context, confidential/secret rows stay hidden.
+    """
+    if context.to_dict():
+        return scope_match(scope, context) != 0
+    return not scope.confidential
 
 
 def list_compilation_proposals(
@@ -472,7 +584,7 @@ def list_compilation_proposals(
             continue
         body = json.loads(event["body_json"])
         scope = ScopeTag.from_dict(body.get("scope"))
-        if context.to_dict() and scope_match(scope, context) == 0:
+        if not scope_visible(scope, context):
             continue
         decision = decisions.get(event["id"])
         if decision is not None and not include_decided:
@@ -613,10 +725,8 @@ def event_core_digest(
             continue
         body = json.loads(event["body_json"])
         scope_data = body.get("scope")
-        if scope_data and context.to_dict():
-            scope = ScopeTag.from_dict(scope_data)
-            if scope_match(scope, context) == 0:
-                continue
+        if scope_data and not scope_visible(ScopeTag.from_dict(scope_data), context):
+            continue
         event_counts[event["kind"]] = event_counts.get(event["kind"], 0) + 1
         recent_events.append(
             {
@@ -713,7 +823,7 @@ def count_scoped_current(conn: sqlite3.Connection, *, context: ScopeContext) -> 
             visibility=row["visibility"],
             egress_policy=row["egress_policy"],
         )
-        if context.to_dict() and scope_match(scope, context) == 0:
+        if not scope_visible(scope, context):
             continue
         total += 1
     return total
@@ -735,10 +845,8 @@ def runtime_health(
     for event in iter_events(conn):
         body = json.loads(event["body_json"])
         scope_data = body.get("scope")
-        if scope_data and context.to_dict():
-            scope = ScopeTag.from_dict(scope_data)
-            if scope_match(scope, context) == 0:
-                continue
+        if scope_data and not scope_visible(ScopeTag.from_dict(scope_data), context):
+            continue
         writer = event["writer"]
         row = by_writer.setdefault(
             writer,
@@ -790,7 +898,7 @@ def scoped_current_beliefs(
             visibility=row["visibility"],
             egress_policy=row["egress_policy"],
         )
-        if context.to_dict() and scope_match(scope, context) == 0:
+        if not scope_visible(scope, context):
             continue
         rows.append(
             {

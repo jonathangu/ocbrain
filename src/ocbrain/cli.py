@@ -6,6 +6,13 @@ import json
 import sys
 from pathlib import Path
 
+from ocbrain.bundle import (
+    BundleExportError,
+    BundleImportError,
+    export_bundle,
+    import_bundle,
+    write_bundle_file,
+)
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -44,7 +51,14 @@ from ocbrain.proposals import write_proposal
 from ocbrain.retrieve import retrieve
 from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
 from ocbrain.teacher import hosted_teacher_request
-from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
+from ocbrain.text import (
+    compact_whitespace,
+    find_probable_secret_leaks,
+    redact_secrets,
+    title_from_text,
+)
+
+PRIVACY_SCOPES = ("private", "workspace", "project", "public")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_parser.add_argument("--artifact-hash")
     evidence_parser.add_argument("--verifier-status", default="unknown")
     evidence_parser.add_argument("--project")
-    evidence_parser.add_argument("--privacy-scope", default="workspace")
+    evidence_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="workspace")
     evidence_parser.set_defaults(func=cmd_evidence)
 
     knowledge_parser = subparsers.add_parser("knowledge", help="List knowledge rows")
@@ -89,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     promote_parser.add_argument("--inject", action="store_true")
     promote_parser.add_argument("--confidence", type=float)
     promote_parser.add_argument("--project")
-    promote_parser.add_argument("--privacy-scope", default="workspace")
+    promote_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="workspace")
     promote_parser.set_defaults(func=cmd_value)
 
     search_parser = subparsers.add_parser("search", help="Search evidence and knowledge")
@@ -275,13 +289,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_memory_parser.add_argument("paths", nargs="+", type=Path)
     import_memory_parser.add_argument("--project", default="workspace")
-    import_memory_parser.add_argument("--privacy-scope", default="workspace")
+    import_memory_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_memory_parser.add_argument("--limit", type=int)
     import_memory_parser.add_argument(
         "--max-bytes",
         type=int,
         default=50_000,
         help="Maximum UTF-8 bytes to index per file",
+    )
+    import_memory_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan, redact, and report what would be written without touching the DB",
+    )
+    import_memory_parser.add_argument(
+        "--event-core",
+        action="store_true",
+        help="Also append a scoped evidence_recorded event per imported file",
     )
     import_memory_parser.set_defaults(func=cmd_import_memory)
 
@@ -298,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Newline-delimited file containing history file paths",
     )
     import_history_parser.add_argument("--project", default="workspace")
-    import_history_parser.add_argument("--privacy-scope", default="workspace")
+    import_history_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_history_parser.add_argument("--limit", type=int)
     import_history_parser.add_argument(
         "--max-bytes",
@@ -311,6 +335,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Commit after this many imported files",
+    )
+    import_history_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan, redact, and report what would be written without touching the DB",
+    )
+    import_history_parser.add_argument(
+        "--event-core",
+        action="store_true",
+        help="Also append a scoped evidence_recorded event per imported file",
     )
     import_history_parser.set_defaults(func=cmd_import_history)
 
@@ -367,6 +401,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     liveness_parser.add_argument("--runner-ledger", type=Path)
     liveness_parser.set_defaults(func=cmd_liveness_check)
+
+    export_bundle_parser = subparsers.add_parser(
+        "export-bundle",
+        help="Write a shareable evidence bundle file gated by human_export egress policy",
+    )
+    export_bundle_parser.add_argument("--output", type=Path, required=True)
+    export_bundle_parser.add_argument(
+        "--scope-type",
+        action="append",
+        default=[],
+        dest="scope_types",
+        help="Repeatable; pair each with one --scope-id to select a scope",
+    )
+    export_bundle_parser.add_argument(
+        "--scope-id",
+        action="append",
+        default=[],
+        dest="scope_ids",
+        help="Repeatable; pair each with one --scope-type to select a scope",
+    )
+    export_bundle_parser.add_argument("--query")
+    export_bundle_parser.add_argument("--limit", type=int)
+    export_bundle_parser.add_argument(
+        "--label",
+        default="ocbrain",
+        help="Hostname-free origin label embedded in the bundle",
+    )
+    export_bundle_parser.set_defaults(func=cmd_export_bundle)
+
+    import_bundle_parser = subparsers.add_parser(
+        "import-bundle",
+        help="Append a bundle's evidence as scoped events; beliefs are recompiled locally",
+    )
+    import_bundle_parser.add_argument("path", type=Path)
+    import_bundle_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the full import plan without writing anything",
+    )
+    import_bundle_parser.add_argument("--actor", default="human:jonathan")
+    import_bundle_parser.set_defaults(func=cmd_import_bundle)
 
     mcp_parser = subparsers.add_parser("mcp", help="Run stdio MCP server")
     mcp_parser.add_argument(
@@ -735,7 +810,7 @@ def cmd_event_teacher_request(args: argparse.Namespace) -> int:
 
 def cmd_event_backfill(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     rebuild_projection(conn)
     limit = None if args.all else args.limit
@@ -975,47 +1050,87 @@ def legacy_row_body(row) -> str:
 
 def cmd_import_memory(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    files = memory_files(args.paths)
+    files, sweep_skipped = memory_files(args.paths)
     if args.limit is not None:
         files = files[: args.limit]
     imported: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = list(sweep_skipped)
+    secret_leaks: list[dict[str, object]] = []
+    event_core = {"events_appended": 0, "deduped": 0}
+    event_ids = event_core_evidence_ids(conn) if args.event_core and not args.dry_run else set()
     for path in files:
         try:
-            result = import_memory_file(
-                conn,
-                path,
-                project=args.project,
-                privacy_scope=args.privacy_scope,
-                max_bytes=args.max_bytes,
-            )
-        except OSError as exc:
+            prepared = prepare_memory_import(path, max_bytes=args.max_bytes)
+        except (OSError, UnicodeError, MemoryError) as exc:
             skipped.append({"path": str(path), "reason": str(exc)})
             continue
-        if result is None:
+        if prepared is None:
             skipped.append({"path": str(path), "reason": "empty"})
-        else:
-            imported.append(result)
+            continue
+        if args.dry_run:
+            leaks = find_probable_secret_leaks(prepared["raw"])
+            if leaks:
+                secret_leaks.append({"path": prepared["path"], "leaks": leaks})
+            imported.append({"path": prepared["path"], "slug": prepared["slug"]})
+            continue
+        result = write_memory_import(
+            conn,
+            prepared,
+            project=args.project,
+            privacy_scope=args.privacy_scope,
+        )
+        if args.event_core:
+            event_id, evidence_id = append_harvest_event(
+                conn,
+                runtime="openclaw",
+                kind="openclaw_memory",
+                body=prepared["excerpt"],
+                artifact_ref=prepared["path"],
+                slug=prepared["slug"],
+                existing_ids=event_ids,
+            )
+            if event_id is None:
+                event_core["deduped"] += 1
+            else:
+                event_core["events_appended"] += 1
+            result["event_core_evidence_id"] = evidence_id
+        imported.append(result)
+    if args.dry_run:
+        output(
+            args,
+            {
+                "dry_run": True,
+                "would_import": len(imported),
+                "skipped_count": len(skipped),
+                "skipped": skipped,
+                "files": imported,
+                "secret_leak_count": len(secret_leaks),
+                "secret_leaks": secret_leaks,
+                "counts": counts(conn),
+            },
+        )
+        return 0
     conn.commit()
-    output(
-        args,
-        {
-            "imported": len(imported),
-            "skipped": skipped,
-            "files": imported,
-            "counts": counts(conn),
-        },
-    )
+    payload = {
+        "imported": len(imported),
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "files": imported,
+        "counts": counts(conn),
+    }
+    if args.event_core:
+        payload["event_core"] = event_core
+    output(args, payload)
     return 0
 
 
 def cmd_import_history(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-200000")
-    files = history_files(args.paths, manifests=args.manifest)
-    if not files:
+    files, sweep_skipped = history_files(args.paths, manifests=args.manifest)
+    if not files and not sweep_skipped:
         raise ValueError("pass at least one history path or --manifest")
     if args.limit is not None:
         files = files[: args.limit]
@@ -1024,7 +1139,10 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     existing = 0
     by_runtime: dict[str, int] = {}
     samples: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = list(sweep_skipped)
+    secret_leaks: list[dict[str, object]] = []
+    event_core = {"events_appended": 0, "deduped": 0}
+    event_ids = event_core_evidence_ids(conn) if args.event_core and not args.dry_run else set()
     batch_size = max(args.batch_size, 1)
     for path in files:
         source_key = (str(path), f"{history_runtime(path)}_history_file")
@@ -1032,50 +1150,146 @@ def cmd_import_history(args: argparse.Namespace) -> int:
             existing += 1
             continue
         try:
-            result = import_history_file(
-                conn,
-                path,
-                project=args.project,
-                privacy_scope=args.privacy_scope,
-                max_bytes=args.max_bytes,
-            )
-        except (OSError, UnicodeError, ValueError) as exc:
+            prepared = prepare_history_import(path, max_bytes=args.max_bytes)
+        except (OSError, UnicodeError, ValueError, MemoryError) as exc:
             skipped.append({"path": str(path), "reason": str(exc)})
             continue
-        if result is None:
+        if prepared is None:
             skipped.append({"path": str(path), "reason": "empty"})
             continue
         imported += 1
-        by_runtime[result["runtime"]] = by_runtime.get(result["runtime"], 0) + 1
+        by_runtime[prepared["runtime"]] = by_runtime.get(prepared["runtime"], 0) + 1
+        if args.dry_run:
+            leaks = find_probable_secret_leaks(prepared["raw"])
+            if leaks:
+                secret_leaks.append({"path": prepared["path"], "leaks": leaks})
+            if len(samples) < 20:
+                samples.append(
+                    {
+                        "path": prepared["path"],
+                        "runtime": prepared["runtime"],
+                        "slug": prepared["slug"],
+                    }
+                )
+            continue
+        result = write_history_import(
+            conn,
+            prepared,
+            project=args.project,
+            privacy_scope=args.privacy_scope,
+        )
+        if args.event_core:
+            event_id, evidence_id = append_harvest_event(
+                conn,
+                runtime=prepared["runtime"],
+                kind=f"{prepared['runtime']}_history",
+                body=prepared["excerpt"],
+                artifact_ref=prepared["path"],
+                slug=prepared["slug"],
+                existing_ids=event_ids,
+            )
+            if event_id is None:
+                event_core["deduped"] += 1
+            else:
+                event_core["events_appended"] += 1
+            result["event_core_evidence_id"] = evidence_id
         if len(samples) < 20:
             samples.append(result)
         existing_sources.add((result["path"], f'{result["runtime"]}_history_file'))
         if imported % batch_size == 0:
             conn.commit()
+    if args.dry_run:
+        output(
+            args,
+            {
+                "dry_run": True,
+                "would_import": imported,
+                "existing": existing,
+                "by_runtime": by_runtime,
+                "sample_files": samples,
+                "skipped_count": len(skipped),
+                "skipped": skipped[:50],
+                "secret_leak_count": len(secret_leaks),
+                "secret_leaks": secret_leaks[:50],
+                "counts": counts(conn),
+            },
+        )
+        return 0
     conn.commit()
-    output(
-        args,
-        {
-            "imported": imported,
-            "existing": existing,
-            "by_runtime": by_runtime,
-            "sample_files": samples,
-            "skipped_count": len(skipped),
-            "skipped": skipped[:50],
-            "counts": counts(conn),
-        },
-    )
+    payload = {
+        "imported": imported,
+        "existing": existing,
+        "by_runtime": by_runtime,
+        "sample_files": samples,
+        "skipped_count": len(skipped),
+        "skipped": skipped[:50],
+        "counts": counts(conn),
+    }
+    if args.event_core:
+        payload["event_core"] = event_core
+    output(args, payload)
     return 0
 
 
-def memory_files(paths: list[Path]) -> list[Path]:
+SENSITIVE_FILENAMES = frozenset(
+    {
+        "auth.json",
+        "credentials.json",
+        ".credentials.json",
+        "config.json",
+        "settings.json",
+        "secrets.json",
+        "mcp.json",
+        "keychain.json",
+    }
+)
+
+
+def is_sensitive_filename(name: str) -> bool:
+    lowered = name.lower()
+    if lowered in SENSITIVE_FILENAMES:
+        return True
+    if lowered.startswith(".env"):
+        return True
+    return lowered.endswith((".pem", ".key"))
+
+
+def sweep_skip_reason(candidate: Path, *, sweep_root: Path | None) -> str | None:
+    if sweep_root is not None:
+        relative = candidate.relative_to(sweep_root)
+        if any(part.startswith(".") for part in relative.parts):
+            return "hidden_path"
+    if is_sensitive_filename(candidate.name):
+        return "sensitive_filename"
+    return None
+
+
+def memory_files(paths: list[Path]) -> tuple[list[Path], list[dict[str, str]]]:
     files: list[Path] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def consider(candidate: Path, *, sweep_root: Path | None = None) -> None:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        reason = sweep_skip_reason(candidate, sweep_root=sweep_root)
+        if reason is not None:
+            skipped.append({"path": key, "reason": reason})
+            return
+        files.append(resolved)
+
     for path in paths:
         if path.is_dir():
-            files.extend(sorted(path.rglob("*.md")))
+            root = path.resolve()
+            for candidate in root.rglob("*.md"):
+                if candidate.is_file():
+                    consider(candidate, sweep_root=root)
         elif path.suffix.lower() == ".md":
-            files.append(path)
-    return sorted(dict.fromkeys(path.resolve() for path in files))
+            consider(path)
+    return sorted(files), skipped
 
 
 HISTORY_SUFFIXES = (
@@ -1088,30 +1302,40 @@ HISTORY_SUFFIXES = (
 HISTORY_GLOBS = ("*.jsonl", "*.trajectory.jsonl", "*.jsonl.codex-app-server.json", "*.json", "*.md")
 
 
-def history_files(paths: list[Path], *, manifests: list[Path] | None = None) -> list[Path]:
+def history_files(
+    paths: list[Path], *, manifests: list[Path] | None = None
+) -> tuple[list[Path], list[dict[str, str]]]:
     files: list[Path] = []
+    skipped: list[dict[str, str]] = []
     seen: set[str] = set()
+
+    def consider(candidate: Path, *, sweep_root: Path | None = None) -> None:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        reason = sweep_skip_reason(candidate, sweep_root=sweep_root)
+        if reason is not None:
+            skipped.append({"path": key, "reason": reason})
+            return
+        files.append(resolved)
+
     for manifest in manifests or []:
         for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
             candidate = Path(line.strip())
-            key = str(candidate)
-            if key not in seen and candidate.is_file() and is_history_file(candidate):
-                files.append(candidate)
-                seen.add(key)
+            if line.strip() and candidate.is_file() and is_history_file(candidate):
+                consider(candidate)
     for path in paths:
         if path.is_dir():
+            root = path.resolve()
             for pattern in HISTORY_GLOBS:
-                for candidate in path.rglob(pattern):
-                    key = str(candidate)
-                    if key not in seen and candidate.is_file():
-                        files.append(candidate)
-                        seen.add(key)
+                for candidate in root.rglob(pattern):
+                    if candidate.is_file():
+                        consider(candidate, sweep_root=root)
         elif path.is_file() and is_history_file(path):
-            key = str(path)
-            if key not in seen:
-                files.append(path)
-                seen.add(key)
-    return sorted(files)
+            consider(path)
+    return sorted(files), skipped
 
 
 def is_history_file(path: Path) -> bool:
@@ -1119,31 +1343,42 @@ def is_history_file(path: Path) -> bool:
     return any(name.endswith(suffix) for suffix in HISTORY_SUFFIXES)
 
 
-def import_memory_file(
+def prepare_memory_import(path: Path, *, max_bytes: int) -> dict[str, str] | None:
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    if not raw.strip():
+        return None
+    redacted = redact_secrets(raw)
+    text = window_text(redacted, max_bytes=max_bytes)
+    return {
+        "path": str(path),
+        "raw": raw,
+        "digest": content_hash(raw),
+        "text": text,
+        "title": title_from_text(text, path.stem),
+        "slug": memory_slug(path),
+        "name": path.name,
+        "excerpt": compact_whitespace(text)[:900],
+    }
+
+
+def write_memory_import(
     conn,
-    path: Path,
+    prepared: dict[str, str],
     *,
     project: str | None,
     privacy_scope: str,
-    max_bytes: int,
-) -> dict[str, str] | None:
-    raw = path.read_text(encoding="utf-8", errors="replace")
-    if not raw.strip():
-        return None
-    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode(
-        "utf-8", errors="replace"
-    )
-    text = redact_secrets(truncated)
-    title = title_from_text(text, path.stem)
-    source_uri = str(path)
-    digest = content_hash(raw)
+) -> dict[str, str]:
+    source_uri = prepared["path"]
+    digest = prepared["digest"]
+    text = prepared["text"]
+    title = prepared["title"]
     evidence_id = upsert_evidence(
         conn,
         source_type="memory_file",
         source_runtime="openclaw",
         source_uri=source_uri,
         content_hash=digest,
-        claim=f"Memory file {path.name}: {compact_whitespace(text[:900])}",
+        claim=f"Memory file {prepared['name']}: {prepared['excerpt']}",
         artifact_uri=source_uri,
         artifact_hash=digest,
         verifier_status="not_required",
@@ -1154,7 +1389,7 @@ def import_memory_file(
         conn,
         knowledge_type="doc",
         gate="auto",
-        slug=memory_slug(path),
+        slug=prepared["slug"],
         title=title,
         body_uri=source_uri,
         doc_kind="memory",
@@ -1177,22 +1412,40 @@ def import_memory_file(
     return {"path": source_uri, "evidence_id": evidence_id, "knowledge_id": knowledge_id}
 
 
-def import_history_file(
-    conn,
-    path: Path,
-    *,
-    project: str | None,
-    privacy_scope: str,
-    max_bytes: int,
-) -> dict[str, str] | None:
+def prepare_history_import(path: Path, *, max_bytes: int) -> dict[str, str] | None:
     size = path.stat().st_size
     if size == 0:
         return None
-    source_uri = str(path)
     runtime = history_runtime(path)
-    digest = file_fingerprint(path)
-    text = redact_secrets(history_text_window(path, max_bytes=max_bytes))
-    title = history_title(path, runtime)
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    redacted = redact_secrets(raw)
+    text = window_text(redacted, max_bytes=max_bytes)
+    return {
+        "path": str(path),
+        "runtime": runtime,
+        "size": str(size),
+        "raw": raw,
+        "digest": file_fingerprint(path),
+        "text": text,
+        "title": history_title(path, runtime),
+        "slug": history_slug(path, runtime),
+        "name": path.name,
+        "excerpt": compact_whitespace(text)[:900],
+    }
+
+
+def write_history_import(
+    conn,
+    prepared: dict[str, str],
+    *,
+    project: str | None,
+    privacy_scope: str,
+) -> dict[str, str]:
+    source_uri = prepared["path"]
+    runtime = prepared["runtime"]
+    digest = prepared["digest"]
+    text = prepared["text"]
+    title = prepared["title"]
     evidence_id = upsert_evidence(
         conn,
         source_type=f"{runtime}_history_file",
@@ -1200,8 +1453,8 @@ def import_history_file(
         source_uri=source_uri,
         content_hash=digest,
         claim=(
-            f"{runtime} history file {path.name} ({size} bytes, fingerprinted): "
-            f"{compact_whitespace(text[:900])}"
+            f"{runtime} history file {prepared['name']} "
+            f"({prepared['size']} bytes, fingerprinted): {prepared['excerpt']}"
         ),
         artifact_uri=source_uri,
         artifact_hash=digest,
@@ -1213,7 +1466,7 @@ def import_history_file(
         conn,
         knowledge_type="doc",
         gate="auto",
-        slug=history_slug(path, runtime),
+        slug=prepared["slug"],
         title=title,
         body_uri=source_uri,
         doc_kind=f"{runtime}_history",
@@ -1239,6 +1492,53 @@ def import_history_file(
         "evidence_id": evidence_id,
         "knowledge_id": knowledge_id,
     }
+
+
+def harvest_event_scope(slug: str) -> ScopeTag:
+    return ScopeTag(
+        "session",
+        f"session:{slug}",
+        visibility="confidential",
+        egress_policy="local_only",
+        provenance="inferred",
+    )
+
+
+def event_core_evidence_ids(conn) -> set[str]:
+    ids: set[str] = set()
+    for row in conn.execute(
+        "SELECT body_json FROM brain_events WHERE kind = 'evidence_recorded'"
+    ):
+        evidence_id = json.loads(row["body_json"]).get("evidence_id")
+        if evidence_id:
+            ids.add(str(evidence_id))
+    return ids
+
+
+def append_harvest_event(
+    conn,
+    *,
+    runtime: str,
+    kind: str,
+    body: str,
+    artifact_ref: str,
+    slug: str,
+    existing_ids: set[str],
+) -> tuple[str | None, str]:
+    scope = harvest_event_scope(slug)
+    evidence_id = evidence_id_for(body=body, kind=kind, artifact_ref=artifact_ref, scope=scope)
+    if evidence_id in existing_ids:
+        return None, evidence_id
+    event_id = record_evidence(
+        conn,
+        body=body,
+        kind=kind,
+        scope=scope,
+        writer=f"harvest:{runtime}",
+        artifact_ref=artifact_ref,
+    )
+    existing_ids.add(evidence_id)
+    return event_id, evidence_id
 
 
 def imported_history_sources(conn) -> set[tuple[str, str]]:
@@ -1271,22 +1571,21 @@ def file_fingerprint(path: Path) -> str:
     return digest.hexdigest()
 
 
-def history_text_window(path: Path, *, max_bytes: int) -> str:
+def window_text(text: str, *, max_bytes: int) -> str:
+    """Head/tail window over already-redacted text, keeping an omitted-middle marker."""
     if max_bytes <= 0:
         return ""
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size <= max_bytes:
-            data = handle.read()
-        else:
-            head_len = max_bytes // 2
-            tail_len = max_bytes - head_len
-            head = handle.read(head_len)
-            handle.seek(max(size - tail_len, 0))
-            tail = handle.read(tail_len)
-            marker = f"\n\n[... {size - max_bytes} bytes omitted from middle ...]\n\n".encode()
-            data = head + marker + tail
-    return data.decode("utf-8", errors="replace")
+    if len(text) * 4 <= max_bytes:
+        return text
+    data = text.encode("utf-8", errors="replace")
+    if len(data) <= max_bytes:
+        return text
+    head_len = max_bytes // 2
+    tail_len = max_bytes - head_len
+    head = data[:head_len].decode("utf-8", errors="replace")
+    tail = data[len(data) - tail_len :].decode("utf-8", errors="replace")
+    marker = f"\n\n[... {len(data) - max_bytes} bytes omitted from middle ...]\n\n"
+    return head + marker + tail
 
 
 def history_runtime(path: Path) -> str:
@@ -1310,10 +1609,11 @@ def history_title(path: Path, runtime: str) -> str:
 
 
 def memory_slug(path: Path) -> str:
-    parts = [part for part in path.with_suffix("").parts if part not in {"/", ""}]
+    resolved = path.resolve()
+    parts = [part for part in resolved.with_suffix("").parts if part not in {"/", ""}]
     tail = parts[-3:] if len(parts) > 3 else parts
-    slug = "-".join(tail).lower()
-    return "".join(char if char.isalnum() else "-" for char in slug).strip("-")
+    slug = f"{'-'.join(tail)}-{stable_id('path', str(resolved))[5:13]}"
+    return "".join(char if char.isalnum() else "-" for char in slug.lower()).strip("-")
 
 
 def history_slug(path: Path, runtime: str) -> str:
@@ -1400,6 +1700,55 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
     result = check_loop_liveness(conn, runner_ledger=args.runner_ledger)
     conn.commit()
     output(args, result.as_dict() | {"counts": counts(conn)})
+    return 0
+
+
+def cmd_export_bundle(args: argparse.Namespace) -> int:
+    if len(args.scope_types) != len(args.scope_ids):
+        print(
+            "export-bundle: pass --scope-type and --scope-id in matched pairs",
+            file=sys.stderr,
+        )
+        return 2
+    conn = open_db(args)
+    try:
+        result = export_bundle(
+            conn,
+            db_path=args.db,
+            label=args.label,
+            scopes=list(zip(args.scope_types, args.scope_ids, strict=True)),
+            query=args.query,
+            limit=args.limit,
+        )
+    except BundleExportError as exc:
+        print(f"export-bundle refused: {exc}", file=sys.stderr)
+        return 1
+    conn.commit()
+    write_bundle_file(args.output, result["bundle"])
+    output(
+        args,
+        {
+            "output": str(args.output),
+            "count": result["count"],
+            "skipped": result["skipped"],
+            "skipped_count": result["skipped_count"],
+            "audit_id": result["audit_id"],
+            "payload_hash": result["payload_hash"],
+        },
+    )
+    return 0
+
+
+def cmd_import_bundle(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    try:
+        result = import_bundle(conn, args.path, dry_run=args.dry_run, actor=args.actor)
+    except BundleImportError as exc:
+        print(f"import-bundle failed: {exc}", file=sys.stderr)
+        return 1
+    if not args.dry_run:
+        conn.commit()
+    output(args, result)
     return 0
 
 

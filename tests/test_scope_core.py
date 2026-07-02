@@ -1,10 +1,14 @@
 import json
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from ocbrain.db import connect, init_db
 from ocbrain.dream import dream
 from ocbrain.egress import egress_preview
 from ocbrain.events import (
+    append_event,
     approval_packet,
     decide_compilation,
     event_core_digest,
@@ -889,9 +893,326 @@ def test_mcp_teacher_request_packages_without_dispatch(tmp_path: Path) -> None:
                 },
             },
         },
+        allow_writes=True,
     )
     payload = json.loads(response["result"]["content"][0]["text"])
 
     assert payload["call_performed"] is False
     assert payload["dispatch_state"] == "approval_required"
+    assert payload["recorded"] is True
     assert payload["summary"]["audit_id"].startswith("egress_")
+
+
+def test_tombstone_wins_over_late_decision_replay(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    record_evidence(
+        conn,
+        body="SECRET: api key sk-live-123",
+        context=ScopeContext(project="bountiful"),
+    )
+    proposal = propose_compilation(
+        conn,
+        belief_id="belief:secret",
+        body="SECRET: api key sk-live-123",
+        evidence_ids=["evd:secret"],
+        scope=ScopeTag("project", "project:bountiful"),
+        confidence=0.9,
+    )
+    decide_compilation(conn, proposal_event_id=proposal, decision="approve")
+    record_tombstone(conn, target="belief:secret", mode="shred", reason="shred request")
+
+    # Simulate a decision event replaying after the tombstone in the ledger
+    # (e.g. a writer re-proposed the same belief id and a decision landed later).
+    replay = propose_compilation(
+        conn,
+        belief_id="belief:secret",
+        body="SECRET: api key sk-live-123",
+        evidence_ids=["evd:secret"],
+        scope=ScopeTag("project", "project:bountiful"),
+        confidence=0.9,
+    )
+    append_event(
+        conn,
+        "compilation_decided",
+        {
+            "proposal_event_id": replay,
+            "decision": "approve",
+            "actor": "human:jonathan",
+            "edited_body": None,
+            "reason": None,
+        },
+    )
+    rebuild_projection(conn)
+
+    row = get_current_belief(conn, "belief:secret")
+    assert row is not None
+    assert row["status"] == "tombstoned"
+    assert row["body"] == "[shredded by tombstone]"
+    assert row["evidence_ids"] == []
+    assert "sk-live-123" not in json.dumps(row)
+
+
+def test_tombstone_on_pending_proposal_is_not_a_silent_noop(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    proposal = propose_compilation(
+        conn,
+        belief_id="belief:pending-shred",
+        body="Pending secret that gets shredded before any decision.",
+        evidence_ids=["evd:pending-shred"],
+        scope=ScopeTag("project", "project:bountiful"),
+        confidence=0.9,
+    )
+    record_tombstone(conn, target="belief:pending-shred", mode="shred", reason="shred")
+    append_event(
+        conn,
+        "compilation_decided",
+        {
+            "proposal_event_id": proposal,
+            "decision": "approve",
+            "actor": "human:jonathan",
+            "edited_body": None,
+            "reason": None,
+        },
+    )
+    rebuild_projection(conn)
+
+    row = get_current_belief(conn, "belief:pending-shred")
+    assert row is not None
+    assert row["status"] == "tombstoned"
+    assert row["body"] == "[shredded by tombstone]"
+
+
+def test_evidence_layer_correction_is_refused_not_silently_ignored(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    with pytest.raises(ValueError, match="evidence-layer corrections are not applied"):
+        record_correction(
+            conn,
+            target_layer="evidence",
+            target_id="evd:secret",
+            op="retract",
+            body=None,
+            hard=True,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM brain_events").fetchone()[0] == 0
+
+
+def test_tombstoned_belief_provenance_never_serves_proposal_bodies(tmp_path: Path) -> None:
+    conn = seeded_scoped_core(tmp_path)
+
+    record_tombstone(conn, target="belief:bountiful-stack", mode="shred", reason="shred")
+    shredded = get_current_belief(conn, "belief:bountiful-stack")
+    assert shredded is not None
+    assert shredded["body"] == "[shredded by tombstone]"
+    assert "React 19" not in json.dumps(shredded)
+    proposal_entries = [
+        entry for entry in shredded["provenance"] if entry["kind"] == "compilation_proposed"
+    ]
+    assert proposal_entries
+    assert all(
+        entry["body"]["body"] == "[shredded by tombstone]" for entry in proposal_entries
+    )
+    assert all(entry["body"]["evidence_ids"] == [] for entry in proposal_entries)
+    assert shredded["evidence_provenance"] == []
+
+    record_tombstone(conn, target="belief:global-rules-red", mode="soft", reason="forget")
+    soft = get_current_belief(conn, "belief:global-rules-red")
+    assert soft is not None
+    assert soft["status"] == "tombstoned"
+    soft_proposals = [
+        entry for entry in soft["provenance"] if entry["kind"] == "compilation_proposed"
+    ]
+    assert soft_proposals
+    assert all(
+        entry["body"]["body"] == "[redacted by tombstone]" for entry in soft_proposals
+    )
+
+
+def test_empty_context_excludes_confidential_everywhere(tmp_path: Path) -> None:
+    conn = seeded_scoped_core(tmp_path)
+    propose_compilation(
+        conn,
+        belief_id="belief:bihua-pending",
+        body="Bihua confidential pending item.",
+        evidence_ids=["evd:bihua-pending"],
+        scope=ScopeTag(
+            "client",
+            "client:bihua",
+            visibility="confidential",
+            egress_policy="local_only",
+        ),
+        confidence=0.7,
+    )
+
+    digest = event_core_digest(conn)
+    encoded = json.dumps(digest)
+    belief_ids = {item["belief_id"] for item in digest["current_beliefs"]}
+    pending_ids = {item["belief_id"] for item in digest["pending_compilations"]}
+    writers = {item["writer"] for item in digest["runtime_health"]}
+
+    assert "belief:bountiful-stack" in belief_ids
+    assert "belief:global-rules-red" in belief_ids
+    assert "belief:cormorant-lanes" not in belief_ids
+    assert "belief:pelican-options" not in belief_ids
+    assert "belief:bihua-pending" not in pending_ids
+    assert "belief:bihua-pending" not in {
+        item["belief_id"] for item in list_compilation_proposals(conn)
+    }
+    assert "sk-123456789012345678901234" not in encoded
+    assert "Cormorant" not in encoded
+    # Writers whose only writes are confidential must not surface either.
+    assert "openclaw" not in writers
+
+
+def test_decide_compilation_refuses_hard_blocked_or_tombstoned_belief(
+    tmp_path: Path,
+) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    blocked = propose_compilation(
+        conn,
+        belief_id="belief:wrong",
+        body="Dangerous wrong advice.",
+        evidence_ids=["evd:wrong"],
+        scope=ScopeTag("project", "project:bountiful"),
+        confidence=0.8,
+    )
+    record_correction(
+        conn,
+        target_layer="belief",
+        target_id="belief:wrong",
+        op="mark_wrong",
+        body="Do not approve this.",
+        hard=True,
+    )
+    with pytest.raises(PermissionError, match="hard correction"):
+        decide_compilation(conn, proposal_event_id=blocked, decision="approve")
+
+    doomed = propose_compilation(
+        conn,
+        belief_id="belief:gone",
+        body="Tombstoned while still pending.",
+        evidence_ids=["evd:gone"],
+        scope=ScopeTag("project", "project:bountiful"),
+        confidence=0.8,
+    )
+    record_tombstone(conn, target="belief:gone", mode="soft", reason="forget")
+    with pytest.raises(PermissionError, match="tombstoned"):
+        decide_compilation(conn, proposal_event_id=doomed, decision="edit")
+    # Rejecting still works so the pending queue can be cleared.
+    decide_compilation(conn, proposal_event_id=doomed, decision="reject")
+    assert get_current_belief(conn, "belief:gone") is None
+    assert get_current_belief(conn, "belief:wrong") is None
+
+
+def test_client_context_confidential_defaults_survive_id_precedence() -> None:
+    contexts = (
+        ScopeContext(client="bihua", task="t1"),
+        ScopeContext(client="bihua", session="s1"),
+        ScopeContext(client="bihua", repo="bihua-app"),
+        ScopeContext(client="bihua", repo="bihua-app", session="s1", task="t1"),
+    )
+    for context in contexts:
+        tag = resolve_write_scope(context)
+        assert tag.visibility == "confidential"
+        assert tag.egress_policy == "local_only"
+        assert tag.confidential is True
+
+    # Id precedence itself is unchanged.
+    tag = resolve_write_scope(ScopeContext(client="bihua", repo="bihua-app", session="s1"))
+    assert tag.scope_type == "session"
+    assert tag.scope_id == "session:s1"
+
+    # Without a client in context, inferred scopes keep their normal defaults.
+    plain = resolve_write_scope(ScopeContext(task="t1"))
+    assert plain.visibility == "internal"
+    assert plain.confidential is False
+
+
+def test_init_db_drop_guard_leaves_user_events_table_intact(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    raw = sqlite3.connect(db_path)
+    raw.execute("CREATE TABLE events (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+    raw.execute("INSERT INTO events VALUES ('user-1', 'user payload')")
+    # A genuine legacy candidates table (distinctive hints_json column) is dropped.
+    raw.execute(
+        "CREATE TABLE candidates ("
+        " id TEXT PRIMARY KEY, event_id TEXT, target TEXT, title TEXT, body TEXT,"
+        " confidence REAL, scope TEXT, risk TEXT, status TEXT, claim_key TEXT,"
+        " hints_json TEXT, evidence_json TEXT, created_at TEXT, updated_at TEXT)"
+    )
+    raw.commit()
+    raw.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+    names = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "events" in names
+    assert "candidates" not in names
+    assert conn.execute("SELECT payload FROM events WHERE id = 'user-1'").fetchone()[
+        "payload"
+    ] == "user payload"
+
+    legacy_path = tmp_path / "legacy.sqlite"
+    raw = sqlite3.connect(legacy_path)
+    raw.execute(
+        "CREATE TABLE events ("
+        " id TEXT PRIMARY KEY, source_type TEXT, source_uri TEXT, content_hash TEXT,"
+        " title TEXT, summary TEXT, body TEXT, scope TEXT, metadata_json TEXT,"
+        " created_at TEXT, ingested_at TEXT, triaged_at TEXT)"
+    )
+    raw.commit()
+    raw.close()
+    legacy_conn = connect(legacy_path)
+    init_db(legacy_conn)
+    legacy_names = {
+        row["name"]
+        for row in legacy_conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert "events" not in legacy_names
+
+
+def test_concurrent_appends_cannot_fork_hash_chain(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn_a = connect(db_path)
+    init_db(conn_a)
+    conn_b = connect(db_path)
+    conn_b.execute("PRAGMA busy_timeout=100")
+
+    def evidence_body(name: str) -> dict:
+        return {
+            "evidence_id": f"evd:{name}",
+            "kind": "observation",
+            "body": f"observation {name}",
+            "artifact_ref": None,
+            "scope": ScopeTag("project", "project:bountiful").to_dict(),
+        }
+
+    append_event(conn_a, "evidence_recorded", evidence_body("a"))
+    # Writer A holds the ledger write lock until commit, so a second writer
+    # cannot read the same chain tail and insert a sibling event.
+    with pytest.raises(sqlite3.OperationalError):
+        append_event(conn_b, "evidence_recorded", evidence_body("b"))
+    assert not conn_b.in_transaction
+
+    conn_a.commit()
+    append_event(conn_b, "evidence_recorded", evidence_body("b"))
+    conn_b.commit()
+    append_event(conn_a, "evidence_recorded", evidence_body("c"))
+    conn_a.commit()
+
+    rows = list(
+        conn_a.execute("SELECT prev_hash, event_hash FROM brain_events ORDER BY rowid ASC")
+    )
+    assert len(rows) == 3
+    assert rows[0]["prev_hash"] is None
+    hashes = [row["event_hash"] for row in rows]
+    assert len(set(hashes)) == len(hashes)
+    for prev_row, row in zip(rows, rows[1:], strict=False):
+        assert row["prev_hash"] == prev_row["event_hash"]

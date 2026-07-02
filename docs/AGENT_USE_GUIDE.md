@@ -187,6 +187,18 @@ Requires explicit human approval:
 - Package release.
 - Destructive data deletion.
 
+## Harvest And Bundle Sharing
+
+`import-memory`, `import-history`, `export-bundle`, and `import-bundle` are
+human CLI commands, not MCP tools. Agents do not harvest transcript stores and
+do not export or import bundles; moving a bundle file between machines is a
+human action. Harvested history lands `private`/confidential by default, and
+imported bundle evidence is capped at `egress_policy=approval_required` and
+becomes belief only through the human-gated `event-dream` →
+`event-proposals` → `event-decide` flow. Agents consume the results the normal
+read-first way: `brain.digest`, `brain.search`, and `brain.preview` with a
+narrow matching context.
+
 ## Healthy Install Smoke Test
 
 Use these MCP calls when checking a live local install:

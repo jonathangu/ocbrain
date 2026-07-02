@@ -1,4 +1,6 @@
+import io
 import json
+import sys
 
 from ocbrain.db import (
     connect,
@@ -7,7 +9,35 @@ from ocbrain.db import (
     upsert_evidence,
     upsert_knowledge,
 )
-from ocbrain.mcp import handle_request
+from ocbrain.events import decide_compilation, propose_compilation, record_tombstone
+from ocbrain.mcp import handle_request, serve
+from ocbrain.scope import ScopeTag
+
+
+def seed_belief(conn, belief_id, body, scope, confidence=0.8):
+    proposal = propose_compilation(
+        conn,
+        belief_id=belief_id,
+        body=body,
+        evidence_ids=[f"evd:{belief_id}"],
+        scope=scope,
+        confidence=confidence,
+    )
+    decide_compilation(conn, proposal_event_id=proposal, decision="approve")
+    conn.commit()
+
+
+def call_tool_request(conn, name, arguments, *, request_id=1, allow_writes=False):
+    return handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        allow_writes=allow_writes,
+    )
 
 
 def test_mcp_initialize_includes_agent_conduct_guardrails(tmp_path):
@@ -404,3 +434,240 @@ def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
     assert rejected_payload["status"] == "archived"
     assert rejected_row["status"] == "archived"
     assert rejected_row["invalidation_reason"] == "not ready"
+
+
+def test_mcp_get_confidential_belief_requires_include_private(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    seed_belief(
+        conn,
+        "belief:acme-secret",
+        "Acme lane registry holds the confidential client onboarding token.",
+        ScopeTag(
+            "client",
+            "client:acme",
+            visibility="confidential",
+            egress_policy="local_only",
+        ),
+    )
+
+    denied = call_tool_request(conn, "brain.get", {"id": "belief:acme-secret"})
+    assert denied["error"]["code"] == -32001
+    assert "include_private" in denied["error"]["message"]
+    assert "onboarding token" not in json.dumps(denied)
+
+    allowed = call_tool_request(
+        conn,
+        "brain.get",
+        {"id": "belief:acme-secret", "include_private": True},
+        request_id=2,
+    )
+    payload = json.loads(allowed["result"]["content"][0]["text"])
+    assert payload["object_kind"] == "belief"
+    assert "onboarding token" in payload["body"]
+
+
+def test_mcp_get_tombstoned_belief_gated_and_shredded_body_stays_shredded(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    seed_belief(
+        conn,
+        "belief:old-stack",
+        "Bountiful stack uses Express with Neon.",
+        ScopeTag("project", "project:bountiful", egress_policy="hosted_ok"),
+    )
+    record_tombstone(conn, target="belief:old-stack", mode="shred", reason="cleanup")
+    conn.commit()
+
+    denied = call_tool_request(conn, "brain.get", {"id": "belief:old-stack"})
+    assert denied["error"]["code"] == -32001
+    assert "include_candidate" in denied["error"]["message"]
+
+    allowed = call_tool_request(
+        conn,
+        "brain.get",
+        {"id": "belief:old-stack", "include_candidate": True},
+        request_id=2,
+    )
+    payload = json.loads(allowed["result"]["content"][0]["text"])
+    assert payload["status"] == "tombstoned"
+    assert payload["body"] == "[shredded by tombstone]"
+    assert "Express with Neon" not in allowed["result"]["content"][0]["text"]
+
+
+def test_mcp_non_object_frames_answered_with_invalid_request(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    for frame in ([], [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], 5, "x", True, None):
+        response = handle_request(conn, frame)
+        assert response["error"]["code"] == -32600
+        assert response["id"] is None
+
+    follow_up = handle_request(conn, {"jsonrpc": "2.0", "id": 9, "method": "ping"})
+    assert follow_up == {"jsonrpc": "2.0", "id": 9, "result": {}}
+
+
+def test_mcp_serve_loop_survives_non_object_frames(tmp_path, monkeypatch):
+    frames = "\n".join(
+        ["[]", "5", '"x"', "null", "{not json", '{"jsonrpc":"2.0","id":7,"method":"ping"}']
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(frames + "\n"))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+
+    exit_code = serve(tmp_path / "ocbrain.sqlite")
+
+    assert exit_code == 0
+    lines = [json.loads(line) for line in out.getvalue().splitlines()]
+    assert [line["error"]["code"] for line in lines[:4]] == [-32600] * 4
+    assert lines[4]["error"]["code"] == -32700
+    assert lines[5] == {"jsonrpc": "2.0", "id": 7, "result": {}}
+
+
+def test_mcp_notifications_are_never_answered(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    assert handle_request(conn, {"jsonrpc": "2.0", "method": "bogus"}) is None
+    assert (
+        handle_request(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "brain.get", "arguments": {}},
+            },
+        )
+        is None
+    )
+    assert (
+        handle_request(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "brain.mark_stale", "arguments": {"id": "nope"}},
+            },
+        )
+        is None
+    )
+
+    answered = handle_request(conn, {"jsonrpc": "2.0", "id": 4, "method": "bogus"})
+    assert answered["error"]["code"] == -32601
+
+
+def test_mcp_preview_excluded_reports_buckets_without_scope_metadata(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    seed_belief(
+        conn,
+        "belief:acme-secret",
+        "Acme lane registry is confidential.",
+        ScopeTag(
+            "client",
+            "client:acme",
+            visibility="confidential",
+            egress_policy="local_only",
+        ),
+    )
+    seed_belief(
+        conn,
+        "belief:foreign-stack",
+        "Foreign project uses Express.",
+        ScopeTag("project", "project:foreign", egress_policy="hosted_ok"),
+    )
+    seed_belief(
+        conn,
+        "belief:bountiful-stack",
+        "Bountiful stack uses React 19.",
+        ScopeTag("project", "project:bountiful", egress_policy="hosted_ok"),
+    )
+
+    response = call_tool_request(
+        conn,
+        "brain.preview",
+        {"query": "stack React Express registry", "context": {"project": "bountiful"}},
+    )
+    text = response["result"]["content"][0]["text"]
+    payload = json.loads(text)
+
+    assert payload["excluded_count"] == 2
+    assert payload["excluded_reasons"] == {
+        "confidential_scope_mismatch": 1,
+        "scope_mismatch": 1,
+    }
+    assert "excluded" not in payload
+    assert "belief:acme-secret" not in text
+    assert "client:acme" not in text
+    assert "belief:foreign-stack" not in text
+    assert "project:foreign" not in text
+
+
+def test_mcp_egress_recording_requires_allow_writes(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    def audit_count():
+        return conn.execute("SELECT COUNT(*) AS n FROM egress_audits").fetchone()["n"]
+
+    denied = call_tool_request(conn, "brain.egress_preview", {"record": True})
+    denied_payload = json.loads(denied["result"]["content"][0]["text"])
+    assert denied_payload["recorded"] is False
+    assert "--allow-writes" in denied_payload["record_denied_reason"]
+    assert "audit_id" not in denied_payload
+    assert audit_count() == 0
+
+    recorded = call_tool_request(
+        conn, "brain.egress_preview", {"record": True}, request_id=2, allow_writes=True
+    )
+    recorded_payload = json.loads(recorded["result"]["content"][0]["text"])
+    assert recorded_payload["recorded"] is True
+    assert recorded_payload["audit_id"]
+    assert audit_count() == 1
+
+    teacher_denied = call_tool_request(conn, "brain.teacher_request", {}, request_id=3)
+    teacher_denied_payload = json.loads(teacher_denied["result"]["content"][0]["text"])
+    assert teacher_denied_payload["recorded"] is False
+    assert "--allow-writes" in teacher_denied_payload["record_denied_reason"]
+    assert audit_count() == 1
+
+    teacher_recorded = call_tool_request(
+        conn, "brain.teacher_request", {}, request_id=4, allow_writes=True
+    )
+    teacher_recorded_payload = json.loads(teacher_recorded["result"]["content"][0]["text"])
+    assert teacher_recorded_payload["recorded"] is True
+    assert audit_count() == 2
+
+    dry = call_tool_request(
+        conn, "brain.teacher_request", {"dry_run": True}, request_id=5, allow_writes=True
+    )
+    dry_payload = json.loads(dry["result"]["content"][0]["text"])
+    assert dry_payload["recorded"] is False
+    assert "record_denied_reason" not in dry_payload
+    assert audit_count() == 2
+
+
+def test_mcp_feedback_rejects_evidence_layer(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    listed = handle_request(
+        conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, allow_writes=True
+    )
+    feedback_tool = next(
+        tool for tool in listed["result"]["tools"] if tool["name"] == "brain.feedback"
+    )
+    layer_enum = feedback_tool["inputSchema"]["properties"]["layer"]["enum"]
+    assert layer_enum == ["knowledge", "belief"]
+
+    rejected = call_tool_request(
+        conn,
+        "brain.feedback",
+        {"target": "belief:x", "layer": "evidence", "op": "mark_wrong"},
+        request_id=2,
+        allow_writes=True,
+    )
+    assert rejected["error"]["code"] == -32602
+    assert "knowledge or belief" in rejected["error"]["message"]
+    assert conn.execute("SELECT COUNT(*) AS n FROM brain_events").fetchone()["n"] == 0

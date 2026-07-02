@@ -69,7 +69,7 @@ def retrieve(
 ) -> dict[str, Any]:
     context = context or ScopeContext()
     scored: list[RetrievalItem] = []
-    excluded: list[dict[str, Any]] = []
+    excluded_reasons: dict[str, int] = {}
     excluded_count = 0
     for row in belief_rows(conn, at_ts=at_ts):
         if row["status"] != "current":
@@ -82,15 +82,11 @@ def retrieve(
         )
         scope_weight = scope_match(scope, context, cross_scope=cross_scope)
         if scope_weight == 0:
+            # Never disclose belief ids or scope metadata for out-of-scope
+            # beliefs: report only aggregate, non-sensitive reason buckets.
             excluded_count += 1
-            if len(excluded) < limit:
-                excluded.append(
-                    {
-                        "belief_id": row["belief_id"],
-                        "scope": scope.to_dict(),
-                        "reason": "scope_mismatch",
-                    }
-                )
+            reason = "confidential_scope_mismatch" if scope.confidential else "scope_mismatch"
+            excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
             continue
         relevance = lexical_relevance(query, row["body"])
         if relevance == 0:
@@ -133,7 +129,7 @@ def retrieve(
         "applied_global": [
             item for item in item_dicts if item["scope"]["scope_type"] == "global"
         ],
-        "excluded": excluded,
+        "excluded_reasons": excluded_reasons,
         "excluded_count": excluded_count,
         "token_budget": estimate_tokens([item["body"] for item in item_dicts]),
     }

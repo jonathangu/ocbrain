@@ -1,6 +1,6 @@
 # OCBrain Ultimate Guide
 
-Last updated: 2026-06-25
+Last updated: 2026-07-02
 
 This is the coding and product guide for OCBrain as it exists in this repo.
 It is meant for humans and agents who need to understand, maintain, extend, or
@@ -499,6 +499,13 @@ ocbrain evidence --claim "Codex emitted evidence."
 ocbrain value --subject runtime:codex --predicate shared_brain --bool true --status current --inject
 ocbrain knowledge --status current
 ocbrain search "query terms"
+ocbrain import-memory MEMORY.md memory/ --dry-run
+ocbrain import-memory MEMORY.md memory/ --event-core
+ocbrain import-history ~/.codex/sessions --dry-run
+ocbrain import-history ~/.codex/sessions --event-core
+ocbrain export-bundle --output bundle.json --scope-type project --scope-id project:bountiful
+ocbrain import-bundle bundle.json --dry-run
+ocbrain import-bundle bundle.json
 ocbrain preview "rules red" --project bountiful
 ocbrain event-ingest --body "Never weaken rules to clear red." --global-doctrine
 ocbrain event-compile --belief-id belief:red-rule --body "Never weaken rules to clear red." --global-doctrine --approve
@@ -550,6 +557,53 @@ Use `--pretty` when humans need to read JSON:
 ```bash
 ocbrain --pretty digest
 ```
+
+## Harvest Pipeline
+
+`import-memory` and `import-history` pull local markdown memory files and
+runtime transcript stores into the brain. Both default to
+`--privacy-scope private`, so harvested material never lands wider than
+private unless the human widens it explicitly. Both support `--dry-run`,
+which scans and redacts without touching the DB and reports what would be
+imported, what would be skipped, and probable secret leaks. Directory sweeps
+skip hidden dotfiles/dot-directories and credential-like filenames (`.env*`,
+`*.pem`, `*.key`, `auth.json`, `credentials.json`, and similar), reporting
+each skip rather than silently dropping it.
+
+With `--event-core`, each imported file also appends one scoped
+`evidence_recorded` event (per-file `session:` scope, `confidential`,
+`local_only`, writer `harvest:<runtime>`), deduplicated by content-derived
+evidence id. That makes harvested history a first-class input to the scoped
+workflow: `event-dream` batches it into pending compilation proposals,
+`event-proposals`/`event-decide` gate those into `current_beliefs`, and
+`brain.search`/`brain.preview` serve the compiled beliefs under a matching
+context. Without `--event-core`, `event-backfill` migrates the harvested
+legacy rows into the event core with deterministic scope classification.
+
+## Bundle Sharing
+
+`export-bundle` and `import-bundle` move evidence between machines as one
+plain JSON file. This is deliberately not sync: the design honors the "no
+implicit network sync" principle because sharing is explicit, file-based, and
+human-initiated. `bundle.py` contains no network code; the human moves the
+file (AirDrop, USB, iCloud, rsync) themselves.
+
+Export runs every evidence body through secret redaction and the
+`human_export` egress gate, skips and reports `local_only` items, and refuses
+outright when the selection includes `egress_policy=prohibited` evidence —
+checked before `--limit` is applied so a limit can never hide a refusal, and
+before any file is written. Each successful export records an `egress_audits`
+row and stamps a tamper-evident `payload_hash` plus a hostname-free origin
+label.
+
+Import verifies the schema version and payload hash (refusing modified
+bundles), dedupes on content-derived evidence ids, caps imported egress at
+`approval_required` so a friend's `hosted_ok` never silently re-egresses from
+the recipient's machine, refuses `prohibited` items, and appends scoped
+`evidence_recorded` events only — never beliefs. Recipients compile beliefs
+locally through the human-gated `event-dream` → `event-proposals` →
+`event-decide` flow. `import-bundle --dry-run` prints the full import plan
+without writing anything.
 
 ## Main User Journeys
 
@@ -679,6 +733,7 @@ src/ocbrain/scope.py         scope tags, context matching, egress policy rules
 src/ocbrain/events.py        append-only event writes and projection rebuild
 src/ocbrain/retrieve.py      shared scoped retrieval and token estimator
 src/ocbrain/egress.py        egress preview, redaction, and audit logging
+src/ocbrain/bundle.py        file-based evidence bundle export/import
 src/ocbrain/cli.py           CLI parser and command handlers
 src/ocbrain/mcp.py           stdio MCP server, tools, resources, instructions
 src/ocbrain/loops.py         loop result ingest and family scoring
@@ -833,6 +888,8 @@ Focused areas:
 - `tests/test_db_flow.py`: DB, CLI-style flows, proposal/excerpt behavior.
 - `tests/test_mcp.py`: MCP tools, resources, write gating, feedback.
 - `tests/test_loops.py`: loop ingest, verification, family scoring.
+- `tests/test_scope_core.py`: scoped event core, retrieval, egress gates.
+- `tests/test_bundle.py`: bundle export/import safety behavior.
 
 When adding a feature, prefer a focused test that proves the product invariant.
 For safety behavior, assert the denied path as well as the allowed path.
@@ -939,7 +996,8 @@ Avoid:
 - unattended skill installation
 - automatic policy application
 - loop scheduling inside OCBrain
-- implicit network sync
+- implicit network sync (bundle sharing stays explicit, file-based, and
+  human-initiated)
 - broad generated instruction dumps
 - opaque model-written memory promotion
 

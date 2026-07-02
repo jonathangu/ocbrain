@@ -3,6 +3,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from ocbrain import cli
 from ocbrain.db import (
     connect,
@@ -20,6 +22,7 @@ from ocbrain.db import (
 from ocbrain.excerpt import write_excerpt
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.proposals import write_proposal
+from ocbrain.text import find_probable_secret_leaks, redact_secrets
 
 
 def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
@@ -301,6 +304,8 @@ def test_import_memory_makes_markdown_searchable_and_digestible(
                 str(memory_path),
                 "--project",
                 "ocbrain",
+                "--privacy-scope",
+                "workspace",
             ]
         )
         == 0
@@ -508,6 +513,8 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
                 str(tmp_path / ".codex" / "sessions"),
                 str(tmp_path / ".openclaw" / "agents"),
                 str(tmp_path / ".claude" / "projects"),
+                "--privacy-scope",
+                "workspace",
             ]
         )
         == 0
@@ -970,3 +977,367 @@ def test_liveness_check_reads_runner_ledger_and_writes_tripwire_evidence(tmp_pat
 
     assert result.changed == 2
     assert {"heartbeat_starved", "no_ledger_writes"} <= tripwires
+
+
+def _write_history_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def test_redact_secrets_covers_json_and_assignment_shapes() -> None:
+    cases = {
+        '{"api_key": "hunter2-super-secret"}': "hunter2-super-secret",
+        '{"ANTHROPIC_API_KEY": "sk-ant-api03-abcdef123456"}': "sk-ant-api03",
+        'export OPENAI_API_KEY="sk-proj-abc"': "sk-proj-abc",
+        'password = "hunter2"': "hunter2",
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG": "wJalrXUtnFEMI",
+        '{\\"api_key\\": \\"zq9-topsecret-hunter2\\"}': "zq9-topsecret",
+        '{"accessToken": "sk-ant-oat01-verysecret1234"}': "sk-ant-oat01",
+        '{"refreshToken": "rt-999-refresh-secret"}': "rt-999-refresh-secret",
+        '{"apiKey": "camelCaseSecretValue"}': "camelCaseSecretValue",
+        '"Authorization": "Bearer abcdef0123456789abcdef"': "abcdef0123456789abcdef",
+        "sk-ant-api03-longtokenvalue1234567890": "longtokenvalue",
+    }
+    for text, secret in cases.items():
+        redacted = redact_secrets(text)
+        assert secret not in redacted, text
+        assert "[REDACTED]" in redacted, text
+        assert find_probable_secret_leaks(text), text
+        assert not find_probable_secret_leaks(redacted), text
+    benign = "no secrets here, just a sentence about tokens of appreciation"
+    assert redact_secrets("plain prose stays untouched") == "plain prose stays untouched"
+    assert find_probable_secret_leaks(benign) == []
+
+
+def test_import_history_defaults_to_private_scope(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    _write_history_file(
+        tmp_path / ".claude" / "projects" / "ws" / "sess.jsonl",
+        json.dumps({"content": "private harvest sentinel"}) + "\n",
+    )
+
+    assert (
+        cli.main(
+            ["--db", str(db_path), "import-history", str(tmp_path / ".claude" / "projects")]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["imported"] == 1
+
+    conn = connect(db_path)
+    scopes = {row["privacy_scope"] for row in conn.execute("SELECT privacy_scope FROM evidence")}
+    assert scopes == {"private"}
+    scopes = {row["privacy_scope"] for row in conn.execute("SELECT privacy_scope FROM knowledge")}
+    assert scopes == {"private"}
+    conn.close()
+
+    # Default (non --include-private) search must not serve the transcript.
+    assert cli.main(["--db", str(db_path), "search", "private harvest sentinel"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"] == []
+    assert (
+        cli.main(
+            ["--db", str(db_path), "search", "private harvest sentinel", "--include-private"]
+        )
+        == 0
+    )
+    assert len(json.loads(capsys.readouterr().out)["results"]) > 0
+
+
+def test_import_memory_defaults_to_private_scope(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    memory_path = tmp_path / "memory" / "note.md"
+    _write_history_file(memory_path, "# Note\n\nprivate memory sentinel\n")
+
+    assert cli.main(["--db", str(db_path), "import-memory", str(memory_path)]) == 0
+    assert json.loads(capsys.readouterr().out)["imported"] == 1
+
+    conn = connect(db_path)
+    scopes = {row["privacy_scope"] for row in conn.execute("SELECT privacy_scope FROM knowledge")}
+    assert scopes == {"private"}
+    conn.close()
+
+    assert cli.main(["--db", str(db_path), "search", "private memory sentinel"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"] == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["evidence", "--claim", "x", "--privacy-scope", "Private"],
+        ["value", "--subject", "s", "--predicate", "p", "--text", "v", "--privacy-scope", "secret"],
+        ["import-memory", "note.md", "--privacy-scope", "personal"],
+        ["import-history", ".claude", "--privacy-scope", "Workspace"],
+    ],
+)
+def test_privacy_scope_flags_reject_invalid_values(tmp_path: Path, argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--db", str(tmp_path / "ocbrain.sqlite"), *argv])
+    assert excinfo.value.code == 2
+
+
+def test_import_history_sweep_skips_credentials_and_hidden_files(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    root = tmp_path / ".codex"
+    _write_history_file(root / "sessions" / "rollout.jsonl", '{"content": "safe sentinel"}\n')
+    _write_history_file(root / "auth.json", '{"OPENAI_API_KEY": "sk-proj-swept-credential"}')
+    _write_history_file(root / "sessions" / "settings.json", '{"theme": "dark"}')
+    _write_history_file(
+        root / ".hidden" / "session.jsonl", '{"content": "dotdir transcript"}\n'
+    )
+    _write_history_file(root / "sessions" / ".env.json", '{"TOKEN": "abc"}')
+
+    assert cli.main(["--db", str(db_path), "import-history", str(root)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["imported"] == 1
+    assert payload["counts"]["evidence"] == 1
+    reasons = {item["path"]: item["reason"] for item in payload["skipped"]}
+    assert reasons[str((root / "auth.json").resolve())] == "sensitive_filename"
+    assert reasons[str((root / "sessions" / "settings.json").resolve())] == "sensitive_filename"
+    assert reasons[str((root / ".hidden" / "session.jsonl").resolve())] == "hidden_path"
+    assert reasons[str((root / "sessions" / ".env.json").resolve())] == "hidden_path"
+    assert payload["skipped_count"] == 4
+
+    conn = connect(db_path)
+    stored = " ".join(row["claim"] for row in conn.execute("SELECT claim FROM evidence"))
+    assert "sk-proj-swept-credential" not in stored
+    assert "safe sentinel" in stored
+
+
+def test_import_history_reharvest_is_idempotent_across_path_spellings(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    _write_history_file(
+        tmp_path / ".claude" / "projects" / "ws" / "sess.jsonl",
+        '{"content": "idempotent sentinel"}\n',
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert cli.main(["--db", str(db_path), "import-history", ".claude/projects"]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["imported"] == 1
+
+    # Same tree via a different spelling: absolute path instead of relative.
+    absolute = str(tmp_path / ".claude" / "projects")
+    assert cli.main(["--db", str(db_path), "import-history", absolute]) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["imported"] == 0
+    assert second["existing"] == 1
+    assert second["counts"]["evidence"] == 1
+    assert second["counts"]["knowledge"] == 1
+
+
+def test_import_history_redacts_before_windowing(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    key_body = "SECRETKEYMATERIAL" * 120
+    pem = (
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        f"{key_body}\n"
+        "-----END OPENSSH PRIVATE KEY-----"
+    )
+    # The key starts inside the head window and ends beyond it: the old
+    # truncate-then-redact order stored the key body verbatim.
+    content = ("x" * 9500) + "\n" + pem + "\n" + ("y" * 15000)
+    _write_history_file(tmp_path / ".claude" / "projects" / "ws" / "big.jsonl", content)
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(tmp_path / ".claude" / "projects"),
+                "--max-bytes",
+                "20000",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["imported"] == 1
+
+    conn = connect(db_path)
+    bodies = " ".join(row["body"] for row in conn.execute("SELECT body FROM search_index"))
+    claims = " ".join(row["claim"] for row in conn.execute("SELECT claim FROM evidence"))
+    assert "SECRETKEYMATERIAL" not in bodies
+    assert "SECRETKEYMATERIAL" not in claims
+    assert "[REDACTED_PRIVATE_KEY]" in bodies
+    assert "bytes omitted from middle" in bodies
+
+
+def test_import_history_dry_run_writes_nothing_and_reports_leaks(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    _write_history_file(
+        tmp_path / ".claude" / "projects" / "ws" / "sess.jsonl",
+        '{"api_key": "dryrun-secret-value", "content": "dry sentinel"}\n',
+    )
+    _write_history_file(tmp_path / ".claude" / "auth.json", "{}")
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(tmp_path / ".claude"),
+                "--dry-run",
+                "--event-core",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["would_import"] == 1
+    assert payload["by_runtime"] == {"claude": 1}
+    assert payload["skipped_count"] == 1
+    assert payload["secret_leak_count"] == 1
+    assert payload["secret_leaks"][0]["leaks"] == ["json_quoted_secret"]
+    assert payload["counts"]["evidence"] == 0
+    assert payload["counts"]["knowledge"] == 0
+
+    conn = connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM brain_events").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM search_index").fetchone()[0] == 0
+
+
+def test_import_memory_dry_run_writes_nothing(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    memory_path = tmp_path / "memory" / "note.md"
+    _write_history_file(memory_path, "password = \"hunter2\"\n")
+
+    assert (
+        cli.main(
+            ["--db", str(db_path), "import-memory", str(memory_path), "--dry-run"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["dry_run"] is True
+    assert payload["would_import"] == 1
+    assert payload["secret_leak_count"] == 1
+    assert "assigned_secret" in payload["secret_leaks"][0]["leaks"]
+
+    conn = connect(db_path)
+    assert conn.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM knowledge").fetchone()[0] == 0
+
+
+def test_import_memory_event_core_emits_scoped_deduped_events(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    memory_path = tmp_path / "memory" / "2026-07-01.md"
+    _write_history_file(memory_path, "# Daily\n\nevent core sentinel apiKey: \"topsecret99\"\n")
+
+    command = ["--db", str(db_path), "import-memory", str(memory_path), "--event-core"]
+    assert cli.main(command) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["imported"] == 1
+    assert first["event_core"] == {"events_appended": 1, "deduped": 0}
+    evidence_id = first["files"][0]["event_core_evidence_id"]
+    assert evidence_id.startswith("evd_")
+
+    # Re-import: same content-derived evidence id must be deduped, not re-appended.
+    assert cli.main(command) == 0
+    second = json.loads(capsys.readouterr().out)
+    assert second["event_core"] == {"events_appended": 0, "deduped": 1}
+    assert second["files"][0]["event_core_evidence_id"] == evidence_id
+
+    conn = connect(db_path)
+    events = list(
+        conn.execute(
+            "SELECT writer, body_json FROM brain_events WHERE kind = 'evidence_recorded'"
+        )
+    )
+    assert len(events) == 1
+    assert events[0]["writer"] == "harvest:openclaw"
+    body = json.loads(events[0]["body_json"])
+    assert body["evidence_id"] == evidence_id
+    assert body["kind"] == "openclaw_memory"
+    assert body["artifact_ref"] == str(memory_path.resolve())
+    assert len(body["body"]) <= 900
+    assert "topsecret99" not in body["body"]
+    assert body["scope"]["scope_type"] == "session"
+    assert body["scope"]["scope_id"].startswith("session:")
+    assert body["scope"]["visibility"] == "confidential"
+    assert body["scope"]["egress_policy"] == "local_only"
+
+
+def test_import_history_event_core_uses_runtime_writer_and_kind(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    history_path = tmp_path / ".codex" / "sessions" / "rollout.jsonl"
+    _write_history_file(history_path, '{"content": "codex event sentinel"}\n')
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(tmp_path / ".codex"),
+                "--event-core",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["event_core"] == {"events_appended": 1, "deduped": 0}
+
+    conn = connect(db_path)
+    event = conn.execute(
+        "SELECT writer, body_json FROM brain_events WHERE kind = 'evidence_recorded'"
+    ).fetchone()
+    assert event["writer"] == "harvest:codex"
+    body = json.loads(event["body_json"])
+    assert body["kind"] == "codex_history"
+    assert body["artifact_ref"] == str(history_path.resolve())
+    assert body["scope"]["visibility"] == "confidential"
+    assert body["scope"]["egress_policy"] == "local_only"
+
+
+def test_import_memory_distinct_paths_with_same_tail_do_not_collide(
+    tmp_path: Path, capsys
+) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    for clone, title in [("cloneA", "Alpha notes"), ("cloneB", "Beta notes")]:
+        _write_history_file(
+            tmp_path / clone / "docs" / "memory" / "notes.md", f"# {title}\n\nbody\n"
+        )
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-memory",
+                str(tmp_path / "cloneA" / "docs" / "memory"),
+                str(tmp_path / "cloneB" / "docs" / "memory"),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["imported"] == 2
+    assert payload["counts"]["knowledge"] == 2
+
+    conn = connect(db_path)
+    titles = {row["title"] for row in conn.execute("SELECT title FROM knowledge")}
+    assert titles == {"Alpha notes", "Beta notes"}
+    slugs = {row["slug"] for row in conn.execute("SELECT slug FROM knowledge")}
+    assert len(slugs) == 2
+
+
+def test_harvest_commands_do_not_disable_sqlite_durability() -> None:
+    source = Path(cli.__file__).read_text(encoding="utf-8")
+    assert "synchronous=OFF" not in source
+    assert "synchronous=NORMAL" in source

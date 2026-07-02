@@ -137,12 +137,22 @@ def resolve_write_scope(
     if isinstance(explicit, dict):
         return ScopeTag.from_dict(explicit)
     context = context or ScopeContext()
+    # A client in context always means client-grade confidentiality defaults,
+    # even when a task/session/repo id takes precedence for the scope id: a task
+    # context must never silently downgrade a client's confidentiality defaults.
+    client_defaults: dict[str, str] = (
+        {"visibility": "confidential", "egress_policy": "local_only"}
+        if context.client
+        else {}
+    )
     if context.task:
-        return ScopeTag("task", f"task:{context.task}", provenance="inferred")
+        return ScopeTag("task", f"task:{context.task}", provenance="inferred", **client_defaults)
     if context.session:
-        return ScopeTag("session", f"session:{context.session}", provenance="inferred")
+        return ScopeTag(
+            "session", f"session:{context.session}", provenance="inferred", **client_defaults
+        )
     if context.repo:
-        return ScopeTag("repo", f"repo:{context.repo}", provenance="inferred")
+        return ScopeTag("repo", f"repo:{context.repo}", provenance="inferred", **client_defaults)
     if context.client:
         return ScopeTag(
             "client",

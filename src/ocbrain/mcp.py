@@ -59,7 +59,10 @@ def serve(db_path: Path, *, allow_writes: bool = False) -> int:
             sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
             continue
-        response = handle_request(conn, request, allow_writes=allow_writes)
+        try:
+            response = handle_request(conn, request, allow_writes=allow_writes)
+        except Exception as exc:  # noqa: BLE001 - the stdio loop must survive.
+            response = error_response(None, -32603, f"internal error: {exc}")
         if response is None:
             continue
         sys.stdout.write(json.dumps(response) + "\n")
@@ -68,11 +71,24 @@ def serve(db_path: Path, *, allow_writes: bool = False) -> int:
 
 
 def handle_request(
+    conn, request: Any, *, allow_writes: bool = False
+) -> dict[str, Any] | None:
+    if not isinstance(request, dict):
+        # JSON-RPC 2.0: a message that is not an object is an Invalid Request.
+        return error_response(None, -32600, "invalid request: message must be a JSON object")
+    is_notification = "id" not in request
+    response = dispatch_request(conn, request, allow_writes=allow_writes)
+    if is_notification:
+        # Servers must never reply to notifications, including on errors.
+        return None
+    return response
+
+
+def dispatch_request(
     conn, request: dict[str, Any], *, allow_writes: bool = False
 ) -> dict[str, Any] | None:
     method = request.get("method")
     request_id = request.get("id")
-    is_notification = "id" not in request
     try:
         if method == "initialize":
             result = {
@@ -95,13 +111,13 @@ def handle_request(
             result = read_resource(conn, request.get("params", {}).get("uri"))
         else:
             return error_response(request_id, -32601, f"unknown method: {method}")
-        if is_notification:
-            return None
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     except KeyError as exc:
         return error_response(request_id, -32602, f"missing argument: {exc.args[0]}")
     except PermissionError as exc:
         return error_response(request_id, -32001, str(exc))
+    except ValueError as exc:
+        return error_response(request_id, -32602, str(exc))
     except Exception as exc:  # noqa: BLE001 - MCP errors must be serialized.
         return error_response(request_id, -32000, str(exc))
 
@@ -172,17 +188,26 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         return text_result(payload)
     if name == "brain.egress_preview":
         target = optional_string(arguments, "target") or "hosted_teacher"
+        record_requested = bool(arguments.get("record"))
+        record = record_requested and allow_writes
         payload = egress_preview(
             conn,
             context=context_from_arguments(arguments),
             target=target,
             query=optional_string(arguments, "query"),
-            record=bool(arguments.get("record")),
+            record=record,
         )
-        if arguments.get("record"):
+        payload["recorded"] = record
+        if record_requested and not allow_writes:
+            payload["record_denied_reason"] = (
+                "recording egress audits requires --allow-writes; ran without recording"
+            )
+        if record:
             conn.commit()
         return text_result(payload)
     if name == "brain.teacher_request":
+        dry_run = bool(arguments.get("dry_run"))
+        record = not dry_run and allow_writes
         payload = hosted_teacher_request(
             conn,
             context=context_from_arguments(arguments),
@@ -190,9 +215,14 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
             objective=optional_string(arguments, "objective") or "compile_scoped_beliefs",
             model=optional_string(arguments, "model") or "hosted_teacher",
             limit=min(max(int(arguments.get("limit", 20)), 1), 50),
-            record=not bool(arguments.get("dry_run")),
+            record=record,
         )
-        if not arguments.get("dry_run"):
+        payload["recorded"] = record
+        if not dry_run and not allow_writes:
+            payload["record_denied_reason"] = (
+                "recording egress audits requires --allow-writes; treated as dry_run"
+            )
+        if record:
             conn.commit()
         return text_result(payload)
     if name == "brain.digest":
@@ -224,6 +254,14 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         requested_id = require_string(arguments, "id")
         belief = get_current_belief(conn, requested_id)
         if belief is not None:
+            # Enforce the same gates as the legacy knowledge path below. Shredded
+            # bodies stay shredded: the projection row served by
+            # get_current_belief is the redaction source of truth.
+            belief_scope = ScopeTag.from_dict(belief["scope"])
+            if belief_scope.confidential and not arguments.get("include_private"):
+                raise PermissionError("confidential belief requires explicit include_private")
+            if belief["status"] != "current" and not arguments.get("include_candidate"):
+                raise PermissionError("non-current belief requires explicit include_candidate")
             log_retrieval_use(
                 conn,
                 None,
@@ -271,9 +309,12 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         if {"target", "layer", "op"} <= set(arguments):
             if not allow_writes:
                 raise PermissionError("brain.feedback correction writes require --allow-writes")
+            layer = require_string(arguments, "layer")
+            if layer not in {"knowledge", "belief"}:
+                raise ValueError("layer must be knowledge or belief")
             event_id = record_correction(
                 conn,
-                target_layer=require_string(arguments, "layer"),
+                target_layer=layer,
                 target_id=require_string(arguments, "target"),
                 op=require_string(arguments, "op"),
                 body=optional_string(arguments, "body"),
@@ -608,7 +649,7 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
                     "reason": {"type": "string"},
                     "note": {"type": "string"},
                     "target": {"type": "string"},
-                    "layer": {"type": "string", "enum": ["evidence", "knowledge", "belief"]},
+                    "layer": {"type": "string", "enum": ["knowledge", "belief"]},
                     "op": {
                         "type": "string",
                         "enum": ["mark_wrong", "edit", "pin", "demote", "reframe", "retract"],

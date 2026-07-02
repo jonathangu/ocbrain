@@ -46,7 +46,7 @@ Current surfaces:
   `event-correct`, `event-forget`, `event-dream`, `event-proposals`,
   `event-decide`, `event-digest`, `event-teacher-request`, `event-backfill`,
   `digest`, `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`,
-  `liveness-check`, and `mcp`.
+  `liveness-check`, `export-bundle`, `import-bundle`, and `mcp`.
 - MCP: `brain.search`, `brain.preview`, `brain.egress_preview`, `brain.get`,
   `brain.teacher_request`, `brain.digest`, `brain.feedback`, write-gated
   `brain.ingest`, write-gated `brain.proposals`, write-gated `brain.forget`,
@@ -79,10 +79,14 @@ uv run --with-editable . ocbrain --pretty digest
 evidence plus current `doc` knowledge, then indexes redacted document text so
 `search`, `digest`, and MCP tools can return source-backed context.
 
-To harvest local runtime transcript stores:
+To harvest local runtime transcript stores, preview first, then import:
 
 ```bash
-uv run --with-editable . ocbrain import-history \
+uv run --with-editable . ocbrain --pretty import-history --dry-run \
+  ~/.openclaw/agents ~/.openclaw/commitments ~/.openclaw/media/inbound \
+  ~/.codex/sessions ~/.codex/archived_sessions \
+  ~/.claude/projects ~/.claude/sessions ~/.claude/tasks
+uv run --with-editable . ocbrain import-history --event-core \
   ~/.openclaw/agents ~/.openclaw/commitments ~/.openclaw/media/inbound \
   ~/.codex/sessions ~/.codex/archived_sessions \
   ~/.claude/projects ~/.claude/sessions ~/.claude/tasks
@@ -92,6 +96,37 @@ uv run --with-editable . ocbrain import-history \
 `doc` knowledge. It records a source path, file-size/mtime fingerprint, and a
 bounded redacted head/tail text window so large transcript trees stay usable.
 Repeated imports skip already-harvested source paths before reading excerpts.
+
+Harvest safety defaults for `import-memory` and `import-history`:
+
+- Both commands default to `--privacy-scope private`. Pass
+  `--privacy-scope workspace|project|public` explicitly to widen.
+- `--dry-run` scans and redacts without touching the DB. It reports what would
+  be imported (`would_import`), what would be skipped, and any probable secret
+  leaks the redactor flags (`secret_leak_count`/`secret_leaks`), so you can
+  inspect the plan before anything is written.
+- Directory sweeps skip hidden dotfiles and dot-directories (reason
+  `hidden_path`) and credential-like filenames such as `.env*`, `*.pem`,
+  `*.key`, `auth.json`, `credentials.json`, `.credentials.json`,
+  `secrets.json`, `settings.json`, `config.json`, `mcp.json`, and
+  `keychain.json` (reason `sensitive_filename`). Skips are reported in the
+  output, never silently dropped.
+- `--event-core` additionally appends one scoped `evidence_recorded` event per
+  imported file into the event core (per-file `session:` scope,
+  `confidential` visibility, `egress_policy=local_only`, writer
+  `harvest:<runtime>`), deduplicated by content-derived evidence id across
+  repeated imports.
+
+Harvested history becomes retrievable in the scoped workflow through the full
+pipeline: `import-history --event-core` (or plain `import-history` followed by
+`event-backfill` to migrate the legacy rows) puts scoped evidence in the event
+core, `event-dream` batches it into pending compilation proposals,
+`event-proposals` and `event-decide` gate those into `current_beliefs`, and
+`brain.search`/`brain.preview` (or the CLI `search`/`preview`) then serve the
+compiled beliefs under a matching context. Harvest events are scoped per file
+as `session:<slug>` (the slug appears in the import output), so pass a
+matching narrow context — e.g. `--session <slug>` or a `context` object over
+MCP — when dreaming or retrieving.
 
 To use the scoped event-sourced core directly:
 
@@ -167,6 +202,52 @@ uv run --with-editable . ocbrain event-backfill --all --sample-limit 25
 serving the projected body/evidence ids for the belief. It does not destructively
 rewrite the append-only ledger; destructive deletion remains an outer, explicitly
 approved operational step.
+
+## Share Your Brain With Friends
+
+Sharing is an explicit, file-based, human-initiated CLI action. There is no
+network sync: `export-bundle` writes one plain JSON file, you move that file
+however you like (AirDrop, USB stick, iCloud Drive, rsync), and the recipient
+imports it.
+
+```bash
+# On your machine: export shareable evidence to one bundle file.
+uv run --with-editable . ocbrain export-bundle \
+  --output brain-bundle.json \
+  --scope-type project --scope-id project:bountiful \
+  --query "deploy" \
+  --label jon-brain
+
+# Move brain-bundle.json to the other machine however you like.
+
+# On their machine: inspect the full import plan first, then import.
+uv run --with-editable . ocbrain --pretty import-bundle brain-bundle.json --dry-run
+uv run --with-editable . ocbrain import-bundle brain-bundle.json --actor human:friend
+```
+
+`--scope-type`/`--scope-id` are repeatable matched pairs that narrow the
+selection; `--query` and `--limit` narrow it further; `--label` embeds a
+hostname-free origin label in the bundle.
+
+Safety properties:
+
+- Export runs every evidence body through secret redaction and the
+  `human_export` egress gate. `local_only` items are skipped and reported,
+  never exported.
+- Export refuses outright when the selection contains any
+  `egress_policy=prohibited` evidence. The refusal is checked before
+  `--limit` is applied — a limit can never hide it — and no bundle file is
+  written. Narrow with `--scope-type`/`--scope-id` or `--query` instead.
+- Every successful export records an `egress_audits` row, and the bundle
+  carries a tamper-evident `payload_hash`.
+- Import verifies the schema version and the payload hash and refuses
+  modified bundles; already-present content-derived evidence ids are deduped.
+- Import caps egress at `approval_required`: a friend's `hosted_ok` evidence
+  can never silently re-egress from your machine, and items marked
+  `prohibited` are never ingested.
+- Import appends scoped `evidence_recorded` events only — never beliefs. The
+  recipient compiles beliefs locally through the human-gated
+  `event-dream` → `event-proposals` → `event-decide` flow.
 
 ## MCP
 

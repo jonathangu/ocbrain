@@ -105,6 +105,19 @@ OpenClaw provider-safe tool names:
 
 No unattended cron or heartbeat loop is enabled by this install.
 
+## Harvest And Bundle Sharing Are Human CLI Actions
+
+Routine agent MCP stays read-first; none of the following are MCP tools.
+Harvesting local memory and transcript stores (`import-memory`,
+`import-history` — both defaulting to `--privacy-scope private`, with
+`--dry-run` previews, credential-file/dotfile skipping, and `--event-core` to
+land scoped events in the event core) and moving a brain between machines
+(`export-bundle` / `import-bundle`) are explicit human CLI actions run in a
+terminal. Bundles are plain files the human moves by hand; there is no network
+sync. Agents see harvested or imported evidence only after local human-gated
+compilation, through the normal `brain.digest`/`brain.search`/`brain.preview`
+surface.
+
 ## Proof Commands
 
 ```bash
@@ -152,4 +165,14 @@ uv run --with-editable . ocbrain event-teacher-request \
   --query "Bountiful"
 uv run --with-editable . ocbrain preview "rules red" --project bountiful
 uv run --with-editable . ocbrain egress-preview --target hosted_teacher --project bountiful
+```
+
+Harvest and bundle smoke:
+
+```bash
+uv run --with-editable . ocbrain import-history --dry-run ~/.codex/sessions
+uv run --with-editable . ocbrain import-history --event-core ~/.codex/sessions
+uv run --with-editable . ocbrain export-bundle --output /tmp/bundle.json
+uv run --with-editable . ocbrain import-bundle /tmp/bundle.json --dry-run
+uv run --with-editable . ocbrain import-bundle /tmp/bundle.json
 ```

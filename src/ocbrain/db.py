@@ -19,13 +19,6 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
-DROP TABLE IF EXISTS events;
-DROP TABLE IF EXISTS candidates;
-DROP TABLE IF EXISTS artifact_links;
-DROP TABLE IF EXISTS invalidations;
-DROP TABLE IF EXISTS candidate_decisions;
-DROP TABLE IF EXISTS legacy_evidence;
-
 CREATE TABLE IF NOT EXISTS evidence (
   id TEXT PRIMARY KEY,
   source_type TEXT NOT NULL,
@@ -220,7 +213,70 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+# Legacy ocbrain tables burned down at startup, ordered so referencing tables are
+# dropped before the tables they reference. Each name maps to a distinctive marker
+# column plus the full legacy column set; a table is only dropped when it provably
+# matches the legacy ocbrain shape (marker column present, or every column drawn
+# from the legacy definition), so init can never destroy an unrelated user table
+# that merely happens to be named 'events' etc.
+_LEGACY_TABLES: dict[str, tuple[str, frozenset[str]]] = {
+    "artifact_links": (
+        "candidate_id",
+        frozenset(
+            {"id", "candidate_id", "surface", "uri", "line_start", "line_end",
+             "applied_at", "applied_by"}
+        ),
+    ),
+    "invalidations": (
+        "old_candidate_id",
+        frozenset({"id", "old_candidate_id", "new_candidate_id", "reason", "created_at"}),
+    ),
+    "candidate_decisions": (
+        "candidate_id",
+        frozenset(
+            {"id", "candidate_id", "action", "actor", "reason", "previous_status",
+             "next_status", "created_at"}
+        ),
+    ),
+    "candidates": (
+        "hints_json",
+        frozenset(
+            {"id", "event_id", "target", "title", "body", "confidence", "scope", "risk",
+             "status", "claim_key", "hints_json", "evidence_json", "created_at", "updated_at"}
+        ),
+    ),
+    "legacy_evidence": (
+        "excerpt",
+        frozenset(
+            {"id", "event_id", "kind", "uri", "excerpt", "line_start", "line_end", "created_at"}
+        ),
+    ),
+    "events": (
+        "triaged_at",
+        frozenset(
+            {"id", "source_type", "source_uri", "content_hash", "title", "summary", "body",
+             "scope", "metadata_json", "created_at", "ingested_at", "triaged_at"}
+        ),
+    ),
+}
+
+
+def _drop_legacy_tables(conn: sqlite3.Connection) -> None:
+    for table, (marker_column, legacy_columns) in _LEGACY_TABLES.items():
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+        ).fetchone()
+        if not exists:
+            continue
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if marker_column in columns or columns <= legacy_columns:
+            conn.execute(f"DROP TABLE {table}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
+    # Drop legacy tables before SCHEMA runs (and before PRAGMA foreign_keys=ON)
+    # so legacy cross-table references never block the burn-down.
+    _drop_legacy_tables(conn)
     conn.executescript(SCHEMA)
     _migrate_schema(conn)
     conn.commit()
