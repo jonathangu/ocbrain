@@ -105,6 +105,29 @@ OpenClaw provider-safe tool names:
 
 No unattended cron or heartbeat loop is enabled by this install.
 
+### Agent Skill Install
+
+The brain-first contract also ships as a portable skill at
+`skills/ocbrain/SKILL.md` — one file valid for both Claude Code and OpenClaw
+(Agent Skills format). Install it alongside the MCP wiring with the standalone
+human-run script:
+
+```bash
+scripts/install-skills                 # ~/.claude/skills/ocbrain + ~/.openclaw/skills/ocbrain
+scripts/install-skills --dry-run       # plan only
+scripts/install-skills --claude-only   # or --openclaw-only
+scripts/install-skills --uninstall     # remove exactly the managed copies
+```
+
+`CLAUDE_SKILLS_DIR` and `OPENCLAW_SKILLS_DIR` override the target roots. The
+OpenClaw target is the shared managed root (`~/.openclaw/skills`), visible to
+all agents; a same-named skill in an agent workspace (`<workspace>/skills`)
+takes precedence and would shadow it.
+
+By design this is a human-run script, not an `ocbrain` subcommand:
+ocbrain-the-CLI never installs skills or executable workflows. Keep that
+bright line.
+
 ## Harvest And Bundle Sharing Are Human CLI Actions
 
 Routine agent MCP stays read-first; none of the following are MCP tools.

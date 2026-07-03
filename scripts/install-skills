@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# install-skills — standalone, human-run installer for the ocbrain agent skill.
+#
+# BRIGHT LINE: ocbrain-the-CLI never installs skills. Installing an executable
+# skill is a deliberate human action, so this lives as a plain script in
+# scripts/ and must NOT become an `ocbrain` subcommand. Keep it that way.
+#
+# Copies skills/ocbrain/ into:
+#   - Claude Code user skills:  ${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}/ocbrain
+#   - OpenClaw managed skills:  ${OPENCLAW_SKILLS_DIR:-$HOME/.openclaw/skills}/ocbrain
+#     (verified against https://docs.openclaw.ai/tools/skills — the shared
+#     "managed/local skills" root visible to all agents. Note precedence:
+#     a same-named skill in <workspace>/skills silently shadows this copy.)
+#
+# Idempotent: a re-run rewrites the managed copy only when content differs.
+# Reversible: --uninstall removes exactly the managed ocbrain/ folder and
+# nothing else. Other skills in the target roots are never touched.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+SKILL_NAME="ocbrain"
+SRC_DIR="$REPO_ROOT/skills/$SKILL_NAME"
+
+CLAUDE_ROOT="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+OPENCLAW_ROOT="${OPENCLAW_SKILLS_DIR:-$HOME/.openclaw/skills}"
+
+DRY_RUN=0
+UNINSTALL=0
+DO_CLAUDE=1
+DO_OPENCLAW=1
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/install-skills [--dry-run] [--uninstall] [--claude-only | --openclaw-only]
+
+Human-run installer for the ocbrain agent skill (skills/ocbrain/).
+By design, ocbrain-the-CLI never installs skills; a human runs this script.
+
+Targets (override roots with CLAUDE_SKILLS_DIR / OPENCLAW_SKILLS_DIR):
+  Claude Code   ~/.claude/skills/ocbrain
+  OpenClaw      ~/.openclaw/skills/ocbrain   (shared managed-skills root)
+
+Flags:
+  --dry-run        Print the plan; write and remove nothing.
+  --uninstall      Remove the managed ocbrain skill copies (exactly ours).
+  --claude-only    Only touch the Claude Code target.
+  --openclaw-only  Only touch the OpenClaw target.
+  -h, --help       Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --claude-only) DO_OPENCLAW=0 ;;
+    --openclaw-only) DO_CLAUDE=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [[ $DO_CLAUDE -eq 0 && $DO_OPENCLAW -eq 0 ]]; then
+  echo "error: --claude-only and --openclaw-only are mutually exclusive" >&2
+  exit 2
+fi
+
+if [[ ! -f "$SRC_DIR/SKILL.md" ]]; then
+  echo "error: skill source missing: $SRC_DIR/SKILL.md" >&2
+  exit 1
+fi
+
+# Returns 0 when the installed copy exists and matches the source exactly.
+same_content() {
+  local dest="$1"
+  [[ -d "$dest" ]] && diff -r -q "$SRC_DIR" "$dest" >/dev/null 2>&1
+}
+
+install_one() {
+  local label="$1" root="$2"
+  local dest="$root/$SKILL_NAME"
+  if same_content "$dest"; then
+    echo "plan  [$label] up-to-date: $dest"
+    return 0
+  fi
+  if [[ -e "$dest" ]]; then
+    echo "plan  [$label] update (content differs): $dest"
+  else
+    echo "plan  [$label] install: $dest"
+  fi
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "done  [$label] dry-run: no changes made"
+    return 0
+  fi
+  mkdir -p "$root" || { echo "error [$label] cannot create $root" >&2; return 1; }
+  rm -rf "$dest" || { echo "error [$label] cannot replace $dest" >&2; return 1; }
+  cp -R "$SRC_DIR" "$dest" || { echo "error [$label] copy failed into $dest" >&2; return 1; }
+  echo "done  [$label] installed: $dest"
+}
+
+uninstall_one() {
+  local label="$1" root="$2"
+  local dest="$root/$SKILL_NAME"
+  if [[ ! -e "$dest" ]]; then
+    echo "plan  [$label] nothing installed at: $dest"
+    return 0
+  fi
+  echo "plan  [$label] remove: $dest"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "done  [$label] dry-run: no changes made"
+    return 0
+  fi
+  rm -rf "$dest" || { echo "error [$label] cannot remove $dest" >&2; return 1; }
+  echo "done  [$label] removed: $dest"
+}
+
+run_target() {
+  local label="$1" root="$2"
+  if [[ $UNINSTALL -eq 1 ]]; then
+    uninstall_one "$label" "$root"
+  else
+    install_one "$label" "$root"
+  fi
+}
+
+FAILURES=0
+if [[ $DO_CLAUDE -eq 1 ]]; then
+  run_target "claude" "$CLAUDE_ROOT" || FAILURES=$((FAILURES + 1))
+fi
+if [[ $DO_OPENCLAW -eq 1 ]]; then
+  run_target "openclaw" "$OPENCLAW_ROOT" || FAILURES=$((FAILURES + 1))
+fi
+
+if [[ $FAILURES -gt 0 ]]; then
+  echo "error: $FAILURES target(s) failed" >&2
+  exit 1
+fi

@@ -318,6 +318,24 @@ or reject human-gated candidate knowledge:
 { "id": "know_...", "decision": "approve", "actor": "jon" }
 ```
 
+## Agent Skill
+
+`skills/ocbrain/SKILL.md` is a portable Agent Skills package carrying the
+brain-first operating contract (digest first, narrowest true scope, evidence
+over orders, feedback duty). One SKILL.md serves both Claude Code and OpenClaw.
+
+Install it with the standalone human-run script:
+
+```bash
+scripts/install-skills              # Claude Code + OpenClaw
+scripts/install-skills --dry-run    # plan only, writes nothing
+scripts/install-skills --uninstall  # remove exactly the managed copies
+```
+
+Installation is human-run by design: `ocbrain` the CLI never installs skills
+(the readable-versus-executable bright line), so there is deliberately no
+`ocbrain install-skills` subcommand.
+
 ## Loop Ingest
 
 `ocbrain` observes loop result envelopes as evidence; it does not run the loop.
