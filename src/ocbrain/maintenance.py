@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from ocbrain.db import upsert_evidence
-from ocbrain.ids import content_hash
+from ocbrain.ids import content_hash, stable_id
 
 
 @dataclass(frozen=True)
@@ -133,11 +134,59 @@ def prune_knowledge(
     return MaintenanceResult("prune", len(details), details)
 
 
+def _emit_heal_signal(
+    conn: sqlite3.Connection,
+    *,
+    knowledge_id: str,
+    role: str,
+    polarity: str,
+    weight: float,
+    winner_id: str,
+    loser_id: str,
+    evidence_id: str,
+    timestamp: str,
+) -> str:
+    """Persist a ``heal_superseded`` signal (spec §5.2 / §2.2 maintenance row).
+
+    Uses the shared ``stable_id('sig', source, source_ref, kind, content_hash)``
+    recipe so a re-run of :func:`heal_conflicts` collapses to the same row
+    (INSERT OR IGNORE), keeping the emission idempotent.
+    """
+    details = {"role": role, "winner": winner_id, "loser": loser_id}
+    details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+    source_ref = f"{winner_id}:{loser_id}"
+    signal_id = stable_id(
+        "sig", "maintenance", source_ref, "heal_superseded", content_hash(details_json)
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO signal_events (
+          id, kind, polarity, weight, source, source_ref, session_key,
+          knowledge_id, evidence_id, details, occurred_at, created_at
+        )
+        VALUES (?, 'heal_superseded', ?, ?, 'maintenance', ?, NULL, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal_id,
+            polarity,
+            weight,
+            source_ref,
+            knowledge_id,
+            evidence_id,
+            details_json,
+            timestamp,
+            timestamp,
+        ),
+    )
+    return signal_id
+
+
 def heal_conflicts(
     conn: sqlite3.Connection,
     *,
     numeric_threshold: float = 0.0,
     now: datetime | None = None,
+    on_supersede: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> MaintenanceResult:
     timestamp = now or datetime.now(UTC)
     details: list[dict[str, Any]] = []
@@ -210,6 +259,31 @@ def heal_conflicts(
                 """,
                 (winner["id"], evidence_id, timestamp.isoformat()),
             )
+            # Loser loses (bad 0.4); winner is reinforced (good 0.3) — spec §5.2.
+            _emit_heal_signal(
+                conn,
+                knowledge_id=loser["id"],
+                role="loser",
+                polarity="bad",
+                weight=0.4,
+                winner_id=winner["id"],
+                loser_id=loser["id"],
+                evidence_id=evidence_id,
+                timestamp=timestamp.isoformat(),
+            )
+            _emit_heal_signal(
+                conn,
+                knowledge_id=winner["id"],
+                role="winner",
+                polarity="good",
+                weight=0.3,
+                winner_id=winner["id"],
+                loser_id=loser["id"],
+                evidence_id=evidence_id,
+                timestamp=timestamp.isoformat(),
+            )
+            if on_supersede is not None:
+                on_supersede(dict(winner), dict(loser))
             details.append(
                 {
                     "winner": winner["id"],

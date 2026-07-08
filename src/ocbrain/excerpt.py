@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ocbrain.db import PUBLIC_SCOPES, list_current_knowledge, log_retrieval_use
+from ocbrain.text import find_probable_injection, find_probable_secret_leaks
 
 BEGIN = "<!-- BEGIN OCBRAIN MANAGED BLOCK -->"
 END = "<!-- END OCBRAIN MANAGED BLOCK -->"
@@ -35,11 +36,18 @@ def build_excerpt(
         "- Loop work: do not repeat exhausted families unless spec/env hash changed.",
         "",
     ]
-    if rows:
-        for row in rows:
-            label = row["title"] or row["subject"] or row["slug"] or row["id"]
-            lines.append(f"- [{row['type']}/{row['status']}] {label} [{row['id']}]")
-    else:
+    rendered = 0
+    for row in rows:
+        label = row["title"] or row["subject"] or row["slug"] or row["id"]
+        line = f"- [{row['type']}/{row['status']}] {label} [{row['id']}]"
+        # Belt-and-suspenders (spec §5.6-3): the query already excludes quarantined
+        # rows via list_current_knowledge; additionally scan each rendered line and
+        # drop it on any injection or secret-leak hit before it reaches an agent.
+        if find_probable_injection(line) or find_probable_secret_leaks(line):
+            continue
+        lines.append(line)
+        rendered += 1
+    if not rendered:
         lines.append("- No current injectable ocbrain knowledge for this scope.")
     lines += ["", END, ""]
     return "\n".join(lines)
