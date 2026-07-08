@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ocbrain import cli
 from ocbrain.db import (
+    admit_knowledge,
     connect,
     counts,
     get_current_doc,
@@ -19,7 +20,6 @@ from ocbrain.db import (
 )
 from ocbrain.excerpt import write_excerpt
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
-from ocbrain.proposals import write_proposal
 
 
 def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
@@ -538,7 +538,9 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
     assert len(search_payload["results"]) == 3
 
 
-def test_capability_is_human_gated_candidate(tmp_path: Path) -> None:
+def test_capability_no_longer_force_gated(tmp_path: Path) -> None:
+    # v0.2 removed the gate-forcing block: a high-risk capability written with
+    # gate='auto', status='current' is no longer demoted to a human candidate.
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
 
@@ -556,8 +558,8 @@ def test_capability_is_human_gated_candidate(tmp_path: Path) -> None:
         (knowledge_id,),
     ).fetchone()
 
-    assert row["gate"] == "human"
-    assert row["status"] == "candidate"
+    assert row["gate"] == "auto"
+    assert row["status"] == "current"
 
 
 def test_search_filters_loop_tagged_knowledge(tmp_path: Path) -> None:
@@ -634,7 +636,9 @@ def test_cli_evidence_and_value_digest(tmp_path: Path, capsys) -> None:
     assert payload["counts"]["knowledge"] == 1
 
 
-def test_human_gated_knowledge_proposal_and_stale(tmp_path: Path) -> None:
+def test_candidate_admit_and_stale(tmp_path: Path) -> None:
+    # v0.2: the human proposal queue is gone; a candidate is admitted to current
+    # via admit_knowledge (no gate predicate) and can still be marked stale.
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
     evidence_id = upsert_evidence(
@@ -648,7 +652,7 @@ def test_human_gated_knowledge_proposal_and_stale(tmp_path: Path) -> None:
     knowledge_id = upsert_knowledge(
         conn,
         knowledge_type="capability",
-        gate="human",
+        gate="auto",
         slug="verified-test-workflow",
         title="Verified test workflow",
         body_uri="/tmp/result.json",
@@ -659,11 +663,12 @@ def test_human_gated_knowledge_proposal_and_stale(tmp_path: Path) -> None:
     link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
     conn.commit()
 
-    proposal = write_proposal(conn, knowledge_id, tmp_path / "proposals")
-    content = proposal.read_text(encoding="utf-8")
-    assert "object_kind: knowledge" in content
-    assert "Human-gated. Do not auto-apply." in content
-    assert "Repeated verified success" in content
+    assert admit_knowledge(conn, knowledge_id, actor="ocbrain-autopilot")
+    row = conn.execute(
+        "SELECT status, approved_by FROM knowledge WHERE id = ?", (knowledge_id,)
+    ).fetchone()
+    assert row["status"] == "current"
+    assert row["approved_by"] == "ocbrain-autopilot"
 
     assert mark_knowledge_stale(conn, knowledge_id)
     row = conn.execute("SELECT status FROM knowledge WHERE id = ?", (knowledge_id,)).fetchone()

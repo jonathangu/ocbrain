@@ -31,7 +31,6 @@ from ocbrain.events import (
     record_evidence,
     record_tombstone,
 )
-from ocbrain.proposals import write_proposal
 from ocbrain.retrieve import retrieve
 from ocbrain.scope import ScopeContext, ScopeTag
 from ocbrain.teacher import hosted_teacher_request
@@ -320,15 +319,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
             raise ValueError(f"candidate human-gated knowledge not found: {knowledge_id}")
         conn.commit()
         return text_result({"id": knowledge_id, "decision": decision, "status": status})
-    if name == "brain.propose":
-        if not allow_writes:
-            raise PermissionError("brain.propose requires --allow-writes")
-        path = write_proposal(
-            conn,
-            require_string(arguments, "id"),
-            Path(arguments.get("output_dir", "proposals")),
-        )
-        return text_result({"proposal": str(path)})
     if name == "brain.ingest":
         if not allow_writes:
             raise PermissionError("brain.ingest requires --allow-writes")
@@ -685,20 +675,6 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
                             "actor": {"type": "string"},
                         },
                         "required": ["target"],
-                    },
-                },
-                {
-                    "name": "brain.propose",
-                    "description": (
-                        "Write a proposal markdown file for one human-gated knowledge row."
-                    ),
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "output_dir": {"type": "string"},
-                        },
-                        "required": ["id"],
                     },
                 },
                 {

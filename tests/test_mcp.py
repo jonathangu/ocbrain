@@ -49,8 +49,10 @@ def test_mcp_write_tools_are_opt_in(tmp_path):
     )
     names = {tool["name"] for tool in response["result"]["tools"]}
 
-    assert "brain.propose" in names
+    # brain.propose is deleted in v0.2 (spec §5.1-4) — gone from every tool list.
+    assert "brain.propose" not in names
     assert "brain.mark_stale" in names
+    assert {"brain.ingest", "brain.forget", "brain.proposals"} <= names
 
 
 def test_mcp_get_current_knowledge_by_default_and_candidate_with_flag(tmp_path):
@@ -226,21 +228,14 @@ def test_mcp_wiki_resource_renders_evidence(tmp_path):
     assert "Runtime integration docs were verified." in content["text"]
 
 
-def test_mcp_propose_and_mark_stale_are_write_gated(tmp_path):
+def test_mcp_propose_tool_removed_and_mark_stale_write_gated(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
-    evidence_id = upsert_evidence(
-        conn,
-        source_type="loop_iteration",
-        source_uri="/tmp/result.json",
-        content_hash="hash-capability-result",
-        claim="Repeated verified success suggests a reusable test workflow.",
-        verifier_status="passed",
-    )
     knowledge_id = upsert_knowledge(
         conn,
         knowledge_type="capability",
-        gate="human",
+        gate="auto",
+        origin="loop",
         slug="verified-test-workflow",
         title="Verified test workflow",
         body_uri="/tmp/result.json",
@@ -248,10 +243,10 @@ def test_mcp_propose_and_mark_stale_are_write_gated(tmp_path):
         risk="high",
         confidence=0.82,
     )
-    link_knowledge_evidence(conn, knowledge_id, evidence_id, relation="derived_from")
     conn.commit()
 
-    denied = handle_request(
+    # brain.propose no longer exists — dispatch fails as an unknown tool (spec §5.1-4).
+    removed = handle_request(
         conn,
         {
             "jsonrpc": "2.0",
@@ -259,24 +254,22 @@ def test_mcp_propose_and_mark_stale_are_write_gated(tmp_path):
             "method": "tools/call",
             "params": {"name": "brain.propose", "arguments": {"id": knowledge_id}},
         },
+        allow_writes=True,
     )
-    assert denied["error"]["code"] == -32001
+    assert "error" in removed
+    assert "unknown tool" in removed["error"]["message"]
 
-    proposed = handle_request(
+    # mark_stale still honours the write gate.
+    denied = handle_request(
         conn,
         {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {
-                "name": "brain.propose",
-                "arguments": {"id": knowledge_id, "output_dir": str(tmp_path / "proposals")},
-            },
+            "params": {"name": "brain.mark_stale", "arguments": {"id": knowledge_id}},
         },
-        allow_writes=True,
     )
-    payload = json.loads(proposed["result"]["content"][0]["text"])
-    assert payload["proposal"].endswith(f"knowledge-capability-{knowledge_id}.md")
+    assert denied["error"]["code"] == -32001
 
     stale = handle_request(
         conn,

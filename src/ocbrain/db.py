@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ocbrain.ids import stable_id
+from ocbrain.ids import content_hash, stable_id
+from ocbrain.text import find_probable_injection, find_probable_secret_leaks
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
 PUBLIC_SCOPES = ("workspace", "project", "public")
@@ -206,6 +207,113 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   body,
   path UNINDEXED
 );
+
+-- v0.2 additive tables (spec §1.2). CREATE ... IF NOT EXISTS keeps init_db idempotent.
+CREATE TABLE IF NOT EXISTS signal_events (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  polarity TEXT NOT NULL,
+  weight REAL NOT NULL,
+  source TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  session_key TEXT,
+  knowledge_id TEXT REFERENCES knowledge(id),
+  evidence_id TEXT REFERENCES evidence(id),
+  details TEXT,
+  occurred_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sig_knowledge ON signal_events(knowledge_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sig_kind ON signal_events(kind, created_at);
+CREATE INDEX IF NOT EXISTS idx_sig_session ON signal_events(session_key);
+
+CREATE TABLE IF NOT EXISTS harvest_watermarks (
+  domain TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  watermark TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (domain, stream)
+);
+
+CREATE TABLE IF NOT EXISTS judge_runs (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  model TEXT NOT NULL,
+  status TEXT NOT NULL,
+  item_count INTEGER NOT NULL DEFAULT 0,
+  request_hash TEXT,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  response_json TEXT,
+  egress_audit_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_judge_ts ON judge_runs(ts);
+
+CREATE TABLE IF NOT EXISTS autopilot_runs (
+  id TEXT PRIMARY KEY,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  stages_json TEXT,
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dataset_examples (
+  id TEXT PRIMARY KEY,
+  dataset TEXT CHECK (dataset IN ('sft','dpo','persona')) NOT NULL,
+  content_hash TEXT NOT NULL,
+  dedup_key TEXT NOT NULL,
+  source_kind TEXT CHECK (source_kind IN
+    ('openclaw_session','claude_session','codex_session',
+     'correction_event','git_commit','authored_doc')) NOT NULL,
+  source_uri TEXT,
+  source_span TEXT,
+  evidence_ids TEXT NOT NULL,
+  privacy_scope TEXT CHECK (privacy_scope IN ('private','workspace','project','public'))
+    NOT NULL DEFAULT 'workspace',
+  quality_label TEXT CHECK (quality_label IN ('good','neutral','bad','excluded')) NOT NULL,
+  quality_confidence REAL,
+  quality_reasons TEXT,
+  n_turns INTEGER,
+  n_chars INTEGER,
+  example_json TEXT NOT NULL,
+  session_id TEXT,
+  occurred_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(dataset, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_dsx_dataset_label ON dataset_examples(dataset, quality_label);
+CREATE INDEX IF NOT EXISTS idx_dsx_dedup ON dataset_examples(dataset, dedup_key);
+CREATE INDEX IF NOT EXISTS idx_dsx_occurred ON dataset_examples(dataset, occurred_at);
+
+CREATE TABLE IF NOT EXISTS dataset_sources (
+  source_uri TEXT NOT NULL,
+  dataset TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  mined_at TEXT NOT NULL,
+  examples_emitted INTEGER NOT NULL DEFAULT 0,
+  status TEXT CHECK (status IN ('mined','skipped','error')) NOT NULL DEFAULT 'mined',
+  detail TEXT,
+  PRIMARY KEY (source_uri, dataset)
+);
+
+CREATE TABLE IF NOT EXISTS dataset_exports (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  dataset TEXT NOT NULL,
+  path TEXT NOT NULL,
+  min_scope TEXT NOT NULL,
+  min_label TEXT NOT NULL,
+  format TEXT NOT NULL,
+  example_count INTEGER NOT NULL,
+  excluded_count INTEGER NOT NULL,
+  bytes INTEGER NOT NULL,
+  payload_hash TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  egress_audit_id TEXT
+);
 """
 
 
@@ -226,14 +334,60 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+# v0.2 additive columns (spec §1.1). Applied via _ensure_column so both fresh
+# and existing DBs converge without any table rebuild or CHECK edits. Labels are
+# enforced in code, not by CHECK constraints (additive ALTER cannot add CHECKs).
+_V2_KNOWLEDGE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("origin", "TEXT"),
+    ("quarantine_reason", "TEXT"),
+    ("quality_label", "TEXT"),
+    ("quality_confidence", "REAL"),
+    ("quality_updated_at", "TEXT"),
+    ("promote_score", "REAL"),
+)
+_V2_EVIDENCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("injection_scan_status", "TEXT"),
+    ("injection_scan_hits", "TEXT"),
+)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Add ``column`` to ``table`` if absent. Additive-only; never rebuilds."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+def _rebuild_memory_view(conn: sqlite3.Connection) -> None:
+    """Rebuild the injectable ``memory`` view to exclude quarantined rows (§1.3).
+
+    Views hold no data, so DROP + CREATE is additive-safe. Runs after the v0.2
+    columns exist so the ``quarantine_reason`` predicate always resolves.
+    """
+    conn.execute("DROP VIEW IF EXISTS memory")
+    conn.execute(
+        """
+        CREATE VIEW memory AS
+          SELECT * FROM knowledge
+          WHERE status = 'current' AND inject = 1 AND quarantine_reason IS NULL
+        """
+    )
+
+
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """Reshape legacy tables that CREATE TABLE IF NOT EXISTS cannot touch.
 
     SCHEMA uses ``CREATE TABLE IF NOT EXISTS`` everywhere, so an existing table
     created by an older schema keeps its old columns forever. These migrations
-    bring such tables into line with the canonical SCHEMA definition.
+    bring such tables into line with the canonical SCHEMA definition, then apply
+    the additive v0.2 columns and rebuild the quarantine-aware memory view.
     """
     _migrate_retrieval_uses(conn)
+    for column, decl in _V2_KNOWLEDGE_COLUMNS:
+        _ensure_column(conn, "knowledge", column, decl)
+    for column, decl in _V2_EVIDENCE_COLUMNS:
+        _ensure_column(conn, "evidence", column, decl)
+    _rebuild_memory_view(conn)
 
 
 def _canonical_retrieval_uses_ddl() -> str:
@@ -495,6 +649,33 @@ def upsert_evidence(
     return evidence_id
 
 
+def _record_clobber_refused(
+    conn: sqlite3.Connection, knowledge_id: str, *, actor: str
+) -> str:
+    """Persist a neutral ``clobber_refused`` signal breadcrumb (spec §5.1-2, §5.2).
+
+    Uses the same stable-id recipe as the autolabel lane's ``record_signal`` so a
+    repeated refusal from the same actor collapses to one row (INSERT OR IGNORE).
+    """
+    source = "events"
+    kind = "clobber_refused"
+    details = {"actor": actor, "reason": "human_origin_no_clobber"}
+    details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+    signal_id = stable_id("sig", source, knowledge_id, kind, content_hash(details_json))
+    timestamp = now_iso()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO signal_events (
+          id, kind, polarity, weight, source, source_ref, session_key,
+          knowledge_id, evidence_id, details, occurred_at, created_at
+        )
+        VALUES (?, ?, 'neutral', 0.1, ?, ?, NULL, ?, NULL, ?, ?, ?)
+        """,
+        (signal_id, kind, source, knowledge_id, knowledge_id, details_json, timestamp, timestamp),
+    )
+    return signal_id
+
+
 def upsert_knowledge(
     conn: sqlite3.Connection,
     *,
@@ -523,6 +704,8 @@ def upsert_knowledge(
     project: str | None = None,
     privacy_scope: str = "workspace",
     approved_by: str | None = None,
+    origin: str = "autopilot",
+    actor: str = "ocbrain",
 ) -> str:
     validate_knowledge_value(knowledge_type, value_numeric, value_text, value_bool)
     if knowledge_type == "value":
@@ -530,10 +713,34 @@ def upsert_knowledge(
     else:
         knowledge_id = stable_id("know", slug or title or "", knowledge_type, project or "")
     timestamp = now_iso()
-    if prescriptive or knowledge_type == "capability" or risk in {"high", "critical"}:
-        gate = "human"
-        if status == "current" and not approved_by:
-            status = "candidate"
+
+    # Human-provenance no-clobber guard (spec §5.1-2): a non-human writer may not
+    # overwrite a row an actual human authored. Record an audit breadcrumb and
+    # leave the existing row untouched.
+    existing = conn.execute(
+        "SELECT origin FROM knowledge WHERE id = ?", (knowledge_id,)
+    ).fetchone()
+    if (
+        existing is not None
+        and existing["origin"] == "human"
+        and not actor.startswith("human")
+    ):
+        _record_clobber_refused(conn, knowledge_id, actor=actor)
+        return knowledge_id
+
+    # Injectable guard (spec §5.1-2): scanning happens only when the caller asks
+    # for injection. A hit forces inject=0 and quarantines the new row so it can
+    # never reach the memory view. On conflict, quarantine is preserved (never
+    # cleared) by the ON CONFLICT clause below, so this stamp lands on inserts.
+    inject_flag = bool(inject)
+    quarantine_reason: str | None = None
+    if inject_flag:
+        scan_target = value_text or title or ""
+        hits = find_probable_injection(scan_target) + find_probable_secret_leaks(scan_target)
+        if hits:
+            inject_flag = False
+            quarantine_reason = "injection_scan:" + ",".join(hits)
+
     conn.execute(
         """
         INSERT INTO knowledge (
@@ -541,9 +748,10 @@ def upsert_knowledge(
           unit, target_value, slug, title, body_uri, doc_kind, status,
           superseded_by, invalidation_reason, gate, prescriptive, inject, risk,
           confidence, content_hash, loop_tags, project, privacy_scope, approved_by,
-          created_at, updated_at
+          origin, quarantine_reason, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           value_numeric = excluded.value_numeric,
           value_text = excluded.value_text,
@@ -565,6 +773,8 @@ def upsert_knowledge(
           loop_tags = excluded.loop_tags,
           privacy_scope = excluded.privacy_scope,
           approved_by = excluded.approved_by,
+          origin = COALESCE(knowledge.origin, excluded.origin),
+          quarantine_reason = knowledge.quarantine_reason,
           updated_at = excluded.updated_at
         """,
         (
@@ -586,7 +796,7 @@ def upsert_knowledge(
             invalidation_reason,
             gate,
             1 if prescriptive else 0,
-            1 if inject else 0,
+            1 if inject_flag else 0,
             risk,
             confidence,
             content_hash,
@@ -594,6 +804,8 @@ def upsert_knowledge(
             project,
             privacy_scope,
             approved_by,
+            origin,
+            quarantine_reason,
             timestamp,
             timestamp,
         ),
@@ -815,7 +1027,7 @@ def list_current_knowledge(
     doc_kind: str | None = None,
     inject_only: bool = False,
 ) -> list[sqlite3.Row]:
-    clauses = ["status = 'current'"]
+    clauses = ["status = 'current'", "quarantine_reason IS NULL"]
     params: list[Any] = []
     if scopes:
         placeholders = ",".join("?" for _ in scopes)
@@ -841,6 +1053,7 @@ def list_current_knowledge(
             WHERE {' AND '.join(clauses)}
             ORDER BY
               inject DESC,
+              COALESCE(promote_score, -1) DESC,
               COALESCE(confidence, 0) DESC,
               updated_at DESC,
               id ASC
@@ -1114,23 +1327,43 @@ def mark_knowledge_stale(
     return cursor.rowcount > 0
 
 
-def approve_knowledge(
+def admit_knowledge(
     conn: sqlite3.Connection,
     knowledge_id: str,
     *,
-    actor: str,
+    actor: str = "ocbrain-autopilot",
 ) -> bool:
+    """Promote a candidate to ``current`` iff it is not quarantined (spec §5.1-3).
+
+    The canonical admission path in v0.2 — the human gate is gone, so any actor
+    may admit, but a quarantined row (``quarantine_reason IS NOT NULL``) can never
+    be admitted. Stamps ``approved_by=actor``.
+    """
     cursor = conn.execute(
         """
         UPDATE knowledge
         SET status = 'current',
             approved_by = ?,
             updated_at = ?
-        WHERE id = ? AND gate = 'human' AND status = 'candidate'
+        WHERE id = ? AND status = 'candidate' AND quarantine_reason IS NULL
         """,
         (actor, now_iso(), knowledge_id),
     )
     return cursor.rowcount > 0
+
+
+def approve_knowledge(
+    conn: sqlite3.Connection,
+    knowledge_id: str,
+    *,
+    actor: str,
+) -> bool:
+    """Deprecated: thin wrapper over :func:`admit_knowledge` (spec §5.1-3).
+
+    The old ``gate = 'human'`` predicate is gone; admission now hinges only on
+    candidate status + no quarantine.
+    """
+    return admit_knowledge(conn, knowledge_id, actor=actor)
 
 
 def reject_knowledge(
@@ -1139,13 +1372,14 @@ def reject_knowledge(
     *,
     reason: str = "rejected",
 ) -> bool:
+    """Deprecated: archive a candidate (spec §5.1-3, ``gate='human'`` predicate dropped)."""
     cursor = conn.execute(
         """
         UPDATE knowledge
         SET status = 'archived',
             invalidation_reason = ?,
             updated_at = ?
-        WHERE id = ? AND gate = 'human' AND status = 'candidate'
+        WHERE id = ? AND status = 'candidate'
         """,
         (reason, now_iso(), knowledge_id),
     )

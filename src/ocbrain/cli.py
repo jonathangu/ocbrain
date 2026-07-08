@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
 
+from ocbrain.autolabel import Signal, record_signal
+from ocbrain.autopilot import run_autopilot
+from ocbrain.config import load_config
+from ocbrain.dataset import mine_all
+from ocbrain.dataset.export import export_all
+from ocbrain.dataset.stats import dataset_stats
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -17,6 +22,7 @@ from ocbrain.db import (
     link_knowledge_evidence,
     list_knowledge,
     mark_knowledge_stale,
+    now_iso,
     search,
     upsert_evidence,
     upsert_knowledge,
@@ -25,7 +31,6 @@ from ocbrain.db import (
 from ocbrain.dream import dream
 from ocbrain.egress import egress_preview
 from ocbrain.events import (
-    approval_packet,
     decide_compilation,
     event_core_digest,
     evidence_id_for,
@@ -36,12 +41,13 @@ from ocbrain.events import (
     record_evidence,
     record_tombstone,
 )
+from ocbrain.fsutil import file_fingerprint, history_runtime
 from ocbrain.ids import content_hash, stable_id
 from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
 from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
-from ocbrain.proposals import write_proposal
 from ocbrain.retrieve import retrieve
+from ocbrain.safeguards import release_quarantine
 from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
 from ocbrain.teacher import hosted_teacher_request
 from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
@@ -191,11 +197,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_context_args(proposals_parser)
     proposals_parser.add_argument("--include-decided", action="store_true")
     proposals_parser.add_argument("--limit", type=int, default=50)
-    proposals_parser.add_argument(
-        "--approval-packet",
-        action="store_true",
-        help="Include a Telegram-ready local approval packet without sending it",
-    )
     proposals_parser.set_defaults(func=cmd_event_proposals)
 
     decide_parser = subparsers.add_parser(
@@ -334,15 +335,6 @@ def build_parser() -> argparse.ArgumentParser:
     loop_ingest_parser.add_argument("--json", action="store_true", help="Emit JSON output")
     loop_ingest_parser.set_defaults(func=cmd_loop_ingest)
 
-    propose_parser = subparsers.add_parser(
-        "propose", help="Write proposal markdown for human-gated knowledge"
-    )
-    propose_parser.add_argument("knowledge_id")
-    propose_parser.add_argument("--output-dir", type=Path, default=Path("proposals"))
-    propose_parser.add_argument("--allow-unapproved", action="store_true")
-    propose_parser.add_argument("--actor", default="ocbrain")
-    propose_parser.set_defaults(func=cmd_propose)
-
     stale_parser = subparsers.add_parser("mark-stale", help="Mark knowledge stale")
     stale_parser.add_argument("knowledge_id")
     stale_parser.add_argument("--reason", default="user_request")
@@ -372,9 +364,67 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_parser.add_argument(
         "--allow-writes",
         action="store_true",
-        help="Expose write-capable MCP tools; off by default",
+        help="Deprecated no-op flag retained for back-compat (spec §5.1-7)",
     )
     mcp_parser.set_defaults(func=cmd_mcp)
+
+    # --- v0.2 autonomy + dataset factory (spec §8) --------------------------
+    autopilot_parser = subparsers.add_parser(
+        "autopilot", help="Run the autonomy pipeline (harvest→…→dataset-export)"
+    )
+    autopilot_parser.add_argument(
+        "--stage",
+        action="append",
+        dest="stages",
+        help="Run only this stage (repeatable); default runs all stages",
+    )
+    autopilot_parser.add_argument("--dry-run", action="store_true")
+    autopilot_parser.set_defaults(func=cmd_autopilot)
+
+    quarantine_parser = subparsers.add_parser(
+        "quarantine", help="List or release quarantined knowledge"
+    )
+    quarantine_sub = quarantine_parser.add_subparsers(dest="quarantine_command")
+    q_list = quarantine_sub.add_parser("list", help="List quarantined knowledge rows")
+    q_list.add_argument("--limit", type=int, default=100)
+    q_list.set_defaults(func=cmd_quarantine_list)
+    q_release = quarantine_sub.add_parser("release", help="Release a quarantined row")
+    q_release.add_argument("knowledge_id")
+    q_release.add_argument("--actor", required=True)
+    q_release.add_argument("--reason", required=True)
+    q_release.set_defaults(func=cmd_quarantine_release)
+    quarantine_parser.set_defaults(func=cmd_quarantine_list)
+
+    label_parser = subparsers.add_parser(
+        "label", help="Record a manual good/bad quality signal on a knowledge row"
+    )
+    label_parser.add_argument("knowledge_id")
+    label_parser.add_argument("--outcome", choices=["good", "bad"], required=True)
+    label_parser.add_argument("--note", default="")
+    label_parser.set_defaults(func=cmd_label)
+
+    dataset_mine_parser = subparsers.add_parser(
+        "dataset-mine", help="Mine SFT/DPO/persona examples from transcripts"
+    )
+    dataset_mine_parser.add_argument("--dataset", choices=["sft", "dpo", "persona"])
+    dataset_mine_parser.add_argument("--limit", type=int)
+    dataset_mine_parser.add_argument("--time-budget", type=float, dest="time_budget")
+    dataset_mine_parser.add_argument("--verified-only", action="store_true")
+    dataset_mine_parser.set_defaults(func=cmd_dataset_mine)
+
+    dataset_export_parser = subparsers.add_parser(
+        "dataset-export", help="Export deterministic JSONL datasets + manifest"
+    )
+    dataset_export_parser.add_argument("--dataset", choices=["sft", "dpo", "persona"])
+    dataset_export_parser.add_argument("--min-scope", dest="min_scope")
+    dataset_export_parser.add_argument("--min-label", dest="min_label")
+    dataset_export_parser.add_argument("--verified-only", action="store_true")
+    dataset_export_parser.set_defaults(func=cmd_dataset_export)
+
+    dataset_stats_parser = subparsers.add_parser(
+        "dataset-stats", help="Report dataset growth by label/scope/source/week"
+    )
+    dataset_stats_parser.set_defaults(func=cmd_dataset_stats)
 
     parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
     return parser
@@ -658,17 +708,7 @@ def cmd_event_proposals(args: argparse.Namespace) -> int:
         include_decided=args.include_decided,
         limit=args.limit,
     )
-    payload = {"proposals": proposals}
-    if args.approval_packet:
-        payload["approval_packet"] = approval_packet(
-            proposals,
-            context=context,
-            cli_prefix=["ocbrain", "--db", str(args.db)],
-        )
-    output(
-        args,
-        payload,
-    )
+    output(args, {"proposals": proposals})
     return 0
 
 
@@ -1260,17 +1300,6 @@ def imported_history_sources(conn) -> set[tuple[str, str]]:
     }
 
 
-def file_fingerprint(path: Path) -> str:
-    stat = path.stat()
-    digest = hashlib.sha256()
-    digest.update(str(path).encode("utf-8", errors="replace"))
-    digest.update(b"\0")
-    digest.update(str(stat.st_size).encode())
-    digest.update(b"\0")
-    digest.update(str(stat.st_mtime_ns).encode())
-    return digest.hexdigest()
-
-
 def history_text_window(path: Path, *, max_bytes: int) -> str:
     if max_bytes <= 0:
         return ""
@@ -1287,17 +1316,6 @@ def history_text_window(path: Path, *, max_bytes: int) -> str:
             marker = f"\n\n[... {size - max_bytes} bytes omitted from middle ...]\n\n".encode()
             data = head + marker + tail
     return data.decode("utf-8", errors="replace")
-
-
-def history_runtime(path: Path) -> str:
-    parts = set(path.parts)
-    if ".codex" in parts:
-        return "codex"
-    if ".claude" in parts:
-        return "claude"
-    if ".openclaw" in parts:
-        return "openclaw"
-    return "unknown"
 
 
 def history_title(path: Path, runtime: str) -> str:
@@ -1351,19 +1369,6 @@ def cmd_loop_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_propose(args: argparse.Namespace) -> int:
-    conn = open_db(args)
-    path = write_proposal(
-        conn,
-        args.knowledge_id,
-        args.output_dir,
-        allow_unapproved=args.allow_unapproved,
-        actor=args.actor,
-    )
-    output(args, {"knowledge_id": args.knowledge_id, "proposal": str(path)})
-    return 0
-
-
 def cmd_mark_stale(args: argparse.Namespace) -> int:
     conn = open_db(args)
     if not mark_knowledge_stale(conn, args.knowledge_id, reason=args.reason):
@@ -1405,6 +1410,146 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
 
 def cmd_mcp(args: argparse.Namespace) -> int:
     return serve(args.db, allow_writes=args.allow_writes)
+
+
+# --------------------------------------------------------------------------- #
+# v0.2 autonomy + dataset factory commands (spec §8)
+# --------------------------------------------------------------------------- #
+def cmd_autopilot(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    cfg = load_config()
+    result = run_autopilot(
+        conn,
+        cfg,
+        db_path=args.db,
+        stages=args.stages,
+        dry_run=args.dry_run,
+    )
+    output(args, result)
+    return 0
+
+
+def cmd_quarantine_list(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    limit = getattr(args, "limit", 100)
+    rows = conn.execute(
+        """
+        SELECT id, slug, title, quarantine_reason, quality_label, updated_at
+        FROM knowledge
+        WHERE quarantine_reason IS NOT NULL
+        ORDER BY updated_at DESC, id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    output(args, {"quarantined": [dict(row) for row in rows], "count": len(rows)})
+    return 0
+
+
+def cmd_quarantine_release(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    released = release_quarantine(
+        conn, args.knowledge_id, actor=args.actor, reason=args.reason
+    )
+    conn.commit()
+    row = get_knowledge(conn, args.knowledge_id)
+    output(
+        args,
+        {
+            "knowledge_id": args.knowledge_id,
+            "released": released,
+            "knowledge": dict(row) if row else None,
+        },
+    )
+    return 0
+
+
+def cmd_label(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    row = get_knowledge(conn, args.knowledge_id)
+    if row is None:
+        raise ValueError(f"knowledge not found: {args.knowledge_id}")
+    polarity = "good" if args.outcome == "good" else "bad"
+    signal = Signal(
+        kind="manual_label",
+        polarity=polarity,
+        weight=0.9,
+        source="session",
+        source_ref=f"manual:{args.knowledge_id}",
+        knowledge_id=args.knowledge_id,
+        details={"note": args.note} if args.note else {"manual": True},
+        occurred_at=now_iso(),
+    )
+    signal_id = record_signal(conn, signal)
+    conn.commit()
+    output(
+        args,
+        {"knowledge_id": args.knowledge_id, "signal_id": signal_id, "outcome": args.outcome},
+    )
+    return 0
+
+
+def cmd_dataset_mine(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    cfg = load_config()
+    roots = list(cfg.review.session_roots)
+    budget = getattr(args, "time_budget", None)
+    limit = getattr(args, "limit", None)
+    verified_only = getattr(args, "verified_only", False)
+    dataset = getattr(args, "dataset", None)
+    if dataset == "sft":
+        from ocbrain.dataset.mine_sft import mine_sft
+
+        result = mine_sft(conn, cfg=cfg, roots=roots, limit=limit, time_budget_seconds=budget)
+    elif dataset == "dpo":
+        from ocbrain.dataset.mine_dpo import mine_dpo
+
+        result = mine_dpo(conn, cfg=cfg, roots=roots, limit=limit, time_budget_seconds=budget)
+    elif dataset == "persona":
+        from ocbrain.dataset.mine_persona import mine_persona
+
+        result = mine_persona(
+            conn,
+            cfg=cfg,
+            roots=roots,
+            verified_only=verified_only,
+            limit=limit,
+            time_budget_seconds=budget,
+        )
+    else:
+        result = mine_all(
+            conn,
+            cfg=cfg,
+            roots=roots,
+            verified_only=verified_only,
+            time_budget_seconds=budget,
+        )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_export(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    cfg = load_config()
+    dataset = getattr(args, "dataset", None)
+    result = export_all(
+        conn,
+        cfg=cfg,
+        datasets=[dataset] if dataset else None,
+        min_scope=getattr(args, "min_scope", None),
+        min_label=getattr(args, "min_label", None),
+        verified_only=getattr(args, "verified_only", False),
+    )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_stats(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    output(args, dataset_stats(conn))
+    return 0
 
 
 if __name__ == "__main__":
