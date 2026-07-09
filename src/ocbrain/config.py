@@ -104,16 +104,17 @@ class DatasetConfig:
     dpo_side_chars: list[int] = field(default_factory=lambda: [40, 8000])
     include_tool_turns: bool = False
     tool_result_truncate: int = 500
-    persona_author_ids: list[str] = field(
-        default_factory=lambda: ["8518484672", "jongugu"]
-    )
+    # Identity-bearing persona selectors (telegram sender ids / usernames, git
+    # author name+email strings, and the persona system prompt) ship EMPTY /
+    # generic. This repo is public; no real ids, usernames, emails, or names may
+    # live in committed code. The operator supplies real values via the config
+    # JSON file or OCBRAIN_DATASET_* env overrides (never committed).
+    persona_author_ids: list[str] = field(default_factory=list)
     persona_direct_agents: list[str] = field(default_factory=lambda: ["main"])
     persona_git_repos: list[str] = field(default_factory=list)
-    persona_git_authors: list[str] = field(
-        default_factory=lambda: ["Jonathan Gu", "jonathangu@gmail.com"]
-    )
+    persona_git_authors: list[str] = field(default_factory=list)
     persona_authored_globs: list[str] = field(default_factory=list)
-    persona_system_prompt: str = "You are Jonathan Gu. Reply as Jonathan would."
+    persona_system_prompt: str = "You are the operator. Reply as they would."
     export_dir: str = "data/datasets"
     export_min_scope: str = "workspace"
     export_min_label: str = "good"

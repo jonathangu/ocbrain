@@ -85,9 +85,9 @@ def handle_request(
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": tool_list(allow_writes)}
+            result = {"tools": tool_list()}
         elif method == "tools/call":
-            result = call_tool(conn, request.get("params", {}), allow_writes=allow_writes)
+            result = call_tool(conn, request.get("params", {}))
         elif method == "resources/list":
             result = {"resources": resource_list(conn)}
         elif method == "resources/read":
@@ -105,7 +105,7 @@ def handle_request(
         return error_response(request_id, -32000, str(exc))
 
 
-def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, Any]:
+def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments", {})
     if name == "brain.search":
@@ -268,8 +268,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
             conn.commit()
             return text_result({"retrieval_use_id": retrieval_use_id, "outcome": outcome})
         if {"target", "layer", "op"} <= set(arguments):
-            if not allow_writes:
-                raise PermissionError("brain.feedback correction writes require --allow-writes")
             event_id = record_correction(
                 conn,
                 target_layer=require_string(arguments, "layer"),
@@ -282,8 +280,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
             conn.commit()
             return text_result({"event_id": event_id, "kind": "correction_recorded"})
         if "proposal_event_id" in arguments:
-            if not allow_writes:
-                raise PermissionError("compilation proposal decisions require --allow-writes")
             decision = require_string(arguments, "decision")
             event_id = decide_compilation(
                 conn,
@@ -301,8 +297,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
                     "decision": decision,
                 }
             )
-        if not allow_writes:
-            raise PermissionError("knowledge approval feedback requires --allow-writes")
         knowledge_id = require_string(arguments, "id")
         decision = require_string(arguments, "decision")
         actor = optional_string(arguments, "actor") or "human"
@@ -320,8 +314,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         conn.commit()
         return text_result({"id": knowledge_id, "decision": decision, "status": status})
     if name == "brain.ingest":
-        if not allow_writes:
-            raise PermissionError("brain.ingest requires --allow-writes")
         event_id = record_evidence(
             conn,
             body=require_string(arguments, "body"),
@@ -335,8 +327,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         conn.commit()
         return text_result({"event_id": event_id, "kind": "evidence_recorded"})
     if name == "brain.proposals":
-        if not allow_writes:
-            raise PermissionError("brain.proposals requires --allow-writes")
         limit = min(max(int(arguments.get("limit", 50)), 1), 100)
         context = context_from_arguments(arguments)
         proposals = list_compilation_proposals(
@@ -350,8 +340,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
             payload["approval_packet"] = approval_packet(proposals, context=context)
         return text_result(payload)
     if name == "brain.forget":
-        if not allow_writes:
-            raise PermissionError("brain.forget requires --allow-writes")
         event_id = record_tombstone(
             conn,
             target=require_string(arguments, "target"),
@@ -362,8 +350,6 @@ def call_tool(conn, params: dict[str, Any], *, allow_writes: bool) -> dict[str, 
         conn.commit()
         return text_result({"event_id": event_id, "kind": "tombstone_recorded"})
     if name == "brain.mark_stale":
-        if not allow_writes:
-            raise PermissionError("brain.mark_stale requires --allow-writes")
         knowledge_id = require_string(arguments, "id")
         reason = optional_string(arguments, "reason") or "user_request"
         updated = mark_knowledge_stale(conn, knowledge_id, reason=reason)
@@ -430,7 +416,7 @@ def read_resource(conn, uri: str | None) -> dict[str, Any]:
     return {"contents": [{"uri": uri, "mimeType": mime_type, "text": text}]}
 
 
-def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
+def tool_list() -> list[dict[str, Any]]:
     tools = [
         {
             "name": "brain.search",
@@ -610,87 +596,86 @@ def tool_list(allow_writes: bool) -> list[dict[str, Any]]:
             },
         },
     ]
-    if allow_writes:
-        tools.extend(
-            [
-                {
-                    "name": "brain.ingest",
-                    "description": "Append scoped evidence to the event ledger.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "body": {"type": "string"},
-                            "kind": {"type": "string"},
-                            "writer": {"type": "string"},
-                            "session": {"type": "string"},
-                            "artifact_ref": {"type": "string"},
-                            "scope": {"type": "object"},
-                            "context": {
-                                "type": "object",
-                                "properties": {
-                                    "project": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "client": {"type": "string"},
-                                    "task": {"type": "string"},
-                                    "session": {"type": "string"},
-                                    "runtime": {"type": "string"},
-                                },
-                            },
-                        },
-                        "required": ["body"],
-                    },
-                },
-                {
-                    "name": "brain.proposals",
-                    "description": "List event-core compilation proposals for gate review.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "include_decided": {"type": "boolean"},
-                            "approval_packet": {"type": "boolean"},
-                            "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                            "context": {
-                                "type": "object",
-                                "properties": {
-                                    "project": {"type": "string"},
-                                    "repo": {"type": "string"},
-                                    "client": {"type": "string"},
-                                    "task": {"type": "string"},
-                                    "session": {"type": "string"},
-                                    "runtime": {"type": "string"},
-                                },
+    tools.extend(
+        [
+            {
+                "name": "brain.ingest",
+                "description": "Append scoped evidence to the event ledger.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "writer": {"type": "string"},
+                        "session": {"type": "string"},
+                        "artifact_ref": {"type": "string"},
+                        "scope": {"type": "object"},
+                        "context": {
+                            "type": "object",
+                            "properties": {
+                                "project": {"type": "string"},
+                                "repo": {"type": "string"},
+                                "client": {"type": "string"},
+                                "task": {"type": "string"},
+                                "session": {"type": "string"},
+                                "runtime": {"type": "string"},
                             },
                         },
                     },
+                    "required": ["body"],
                 },
-                {
-                    "name": "brain.forget",
-                    "description": "Append a gated tombstone so a belief stops serving.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "target": {"type": "string"},
-                            "mode": {"type": "string", "enum": ["soft", "shred"]},
-                            "reason": {"type": "string"},
-                            "actor": {"type": "string"},
+            },
+            {
+                "name": "brain.proposals",
+                "description": "List event-core compilation proposals for gate review.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "include_decided": {"type": "boolean"},
+                        "approval_packet": {"type": "boolean"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "context": {
+                            "type": "object",
+                            "properties": {
+                                "project": {"type": "string"},
+                                "repo": {"type": "string"},
+                                "client": {"type": "string"},
+                                "task": {"type": "string"},
+                                "session": {"type": "string"},
+                                "runtime": {"type": "string"},
+                            },
                         },
-                        "required": ["target"],
                     },
                 },
-                {
-                    "name": "brain.mark_stale",
-                    "description": "Mark one knowledge row stale.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "id": {"type": "string"},
-                            "reason": {"type": "string"},
-                        },
-                        "required": ["id"],
+            },
+            {
+                "name": "brain.forget",
+                "description": "Append a gated tombstone so a belief stops serving.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string"},
+                        "mode": {"type": "string", "enum": ["soft", "shred"]},
+                        "reason": {"type": "string"},
+                        "actor": {"type": "string"},
                     },
+                    "required": ["target"],
                 },
-            ]
-        )
+            },
+            {
+                "name": "brain.mark_stale",
+                "description": "Mark one knowledge row stale.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["id"],
+                },
+            },
+        ]
+    )
     return tools
 
 

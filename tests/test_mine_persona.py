@@ -32,7 +32,7 @@ def _sess(*turns: Turn, agent="main") -> Session:
 
 def _verified(text: str) -> Turn:
     return Turn(role="user", text=text, kind="telegram_envelope",
-                sender_verified=True, authored_by="8518484672")
+                sender_verified=True, authored_by="1000000001")
 
 
 def _bare(text: str) -> Turn:
@@ -92,8 +92,8 @@ def test_style_inadmissible_skipped():
 def _init_repo(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.name", "Jonathan Gu"], cwd=path, check=True)
-    subprocess.run(["git", "config", "user.email", "jonathangu@gmail.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Persona Tester"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "persona@example.test"], cwd=path, check=True)
 
 
 def _commit(path: Path, filename: str, message: str) -> None:

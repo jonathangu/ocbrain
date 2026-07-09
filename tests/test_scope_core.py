@@ -704,9 +704,11 @@ def test_mcp_preview_uses_same_scoped_retrieval_payload(tmp_path: Path) -> None:
     assert payload["applied_global"] == expected["applied_global"]
 
 
-def test_mcp_connector_write_tools_are_gated_and_append_events(tmp_path: Path) -> None:
+def test_mcp_connector_write_tools_are_ungated_and_append_events(tmp_path: Path) -> None:
     conn = seeded_scoped_core(tmp_path)
 
+    # v0.2 §5.1-7: write tools are always listed, with or without the deprecated
+    # --allow-writes flag.
     listed = handle_request(
         conn,
         {
@@ -715,12 +717,12 @@ def test_mcp_connector_write_tools_are_gated_and_append_events(tmp_path: Path) -
             "method": "tools/list",
             "params": {},
         },
-        allow_writes=True,
     )
     names = {tool["name"] for tool in listed["result"]["tools"]}
     assert {"brain.ingest", "brain.forget"} <= names
 
-    blocked = handle_request(
+    # Ungated: brain.ingest now succeeds without allow_writes (was denied pre-v0.2).
+    ungated = handle_request(
         conn,
         {
             "jsonrpc": "2.0",
@@ -735,7 +737,8 @@ def test_mcp_connector_write_tools_are_gated_and_append_events(tmp_path: Path) -
             },
         },
     )
-    assert "error" in blocked
+    assert "error" not in ungated
+    assert json.loads(ungated["result"]["content"][0]["text"])["kind"] == "evidence_recorded"
 
     ingested = handle_request(
         conn,

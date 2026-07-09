@@ -17,7 +17,7 @@ from ocbrain.dataset.transcripts import (
 )
 from ocbrain.db import connect, init_db
 
-AUTHOR_IDS = ["8518484672", "jongugu"]
+AUTHOR_IDS = ["1000000001", "persona_user"]
 
 
 def _write_jsonl(path: Path, objs: list[dict]) -> Path:
@@ -135,13 +135,13 @@ def test_sidecar_and_junk_predicate(tmp_path: Path):
 
 
 def test_telegram_envelope_author_verification():
-    envelope = {"message_id": "1", "sender_id": "8518484672"}
+    envelope = {"message_id": "1", "sender_id": "1000000001"}
     text = ("Conversation info (untrusted metadata):\n```json\n"
             + json.dumps(envelope) + "\n```\nship the release please")
     cls = classify_user_text(text, author_ids=AUTHOR_IDS, agent="main", direct_agents=["main"])
     assert cls.kind == "telegram_envelope"
     assert cls.sender_verified is True
-    assert cls.authored_by == "8518484672"
+    assert cls.authored_by == "1000000001"
     assert cls.text == "ship the release please"
 
 
@@ -157,14 +157,14 @@ def test_telegram_envelope_unverified_sender():
 
 def test_username_verification_from_config():
     # Author verification reads the username from config, never a hardcoded value.
-    envelope = {"message_id": "3", "username": "jongugu"}
+    envelope = {"message_id": "3", "username": "persona_user"}
     text = ("Conversation info (untrusted metadata):\n```json\n"
             + json.dumps(envelope) + "\n```\nrun it")
-    cls = classify_user_text(text, author_ids=["8518484672", "jongugu"])
+    cls = classify_user_text(text, author_ids=["1000000001", "persona_user"])
     assert cls.sender_verified is True
-    assert cls.authored_by == "jongugu"
+    assert cls.authored_by == "persona_user"
     # With a different configured username the same envelope does NOT verify.
-    cls2 = classify_user_text(text, author_ids=["8518484672", "someoneelse"])
+    cls2 = classify_user_text(text, author_ids=["1000000001", "someoneelse"])
     assert cls2.sender_verified is False
 
 

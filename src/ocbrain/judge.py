@@ -30,6 +30,7 @@ import os
 import sqlite3
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -288,7 +289,7 @@ def judge_ambiguous(
     *,
     call: Any = call_openai,
     now: datetime | None = None,
-    env: dict[str, str] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Judge ambiguous rows within budget; fold verdicts as ``llm_judge`` signals.
 
@@ -296,14 +297,17 @@ def judge_ambiguous(
     disabled / no-key / budget / no-eligible paths.
     """
     now = now or datetime.now(UTC)
-    env = env if env is not None else os.environ
+    # ``os.environ`` is a ``Mapping[str, str]`` (not a plain ``dict``); resolve
+    # to a concrete, always-non-None mapping so the lookup below can never deref
+    # ``None``.
+    resolved_env: Mapping[str, str] = os.environ if env is None else env
     model = cfg.judge.model
 
     if not cfg.judge.enabled:
         _record_run(conn, status="skipped", model=model)
         return {"action": "judge", "changed": 0, "status": "skipped", "reason": "disabled"}
 
-    api_key = env.get(cfg.judge.api_key_env)
+    api_key = resolved_env.get(cfg.judge.api_key_env)
     if not api_key:
         _record_run(conn, status="skipped", model=model)
         return {"action": "judge", "changed": 0, "status": "skipped", "reason": "no_api_key"}
