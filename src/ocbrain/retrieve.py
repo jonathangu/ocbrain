@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from ocbrain.embed import decode_embedding, knowledge_text
 from ocbrain.events import projected_rows_as_of
 from ocbrain.scope import ScopeContext, ScopeTag, scope_match
+
+# Default lexical/semantic blend when a query vector is available (0.5/0.5).
+DEFAULT_SEMANTIC_WEIGHT = 0.5
 
 NEGATION_TERMS = {"no", "not", "never", "without", "cannot", "can't", "doesn't", "isn't"}
 STOP_TERMS = {
@@ -311,3 +316,178 @@ def confidence_band(confidence: float) -> str:
     if confidence >= 0.45:
         return "moderate"
     return "weak"
+
+
+# --------------------------------------------------------------------------- #
+# Semantic layer — vector scoring over embedded knowledge rows (v0.3)
+#
+# Embeddings live on the ``knowledge`` table (``knowledge.embedding``, written by
+# :mod:`ocbrain.embed`), parallel to the event-sourced belief store the lexical
+# ``retrieve`` above reads. These helpers score the query against stored vectors
+# and blend that with the existing lexical score, falling back to lexical-only
+# whenever a query vector or a row vector is absent.
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class NeighborItem:
+    knowledge_id: str
+    similarity: float
+    lexical: float
+    score: float
+    body: str
+    scope: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    """Cosine similarity of two vectors; ``0.0`` for empty, mismatched, or zero-norm."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for x, y in zip(a, b, strict=False):
+        dot += x * y
+        norm_a += x * x
+        norm_b += y * y
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return dot / (math.sqrt(norm_a) * math.sqrt(norm_b))
+
+
+def blend_scores(
+    lexical: float,
+    semantic: float | None,
+    *,
+    semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
+) -> float:
+    """Blend a lexical and semantic score.
+
+    ``semantic`` of ``None`` means no vector was available (query or row) — the
+    blend collapses to the lexical score so retrieval degrades gracefully to
+    lexical-only. Otherwise the two are combined as
+    ``(1 - w) * lexical + w * semantic``.
+    """
+    if semantic is None:
+        return lexical
+    weight = min(max(float(semantic_weight), 0.0), 1.0)
+    return (1.0 - weight) * lexical + weight * semantic
+
+
+def embedded_knowledge_rows(
+    conn: sqlite3.Connection,
+    *,
+    include_private: bool = False,
+    statuses: tuple[str, ...] = ("candidate", "current"),
+) -> list[sqlite3.Row]:
+    """Un-quarantined knowledge rows that carry a stored embedding vector."""
+    placeholders = ",".join("?" for _ in statuses)
+    clauses = [
+        "embedding IS NOT NULL",
+        "quarantine_reason IS NULL",
+        f"status IN ({placeholders})",
+    ]
+    params: list[Any] = list(statuses)
+    if not include_private:
+        clauses.append("privacy_scope != 'private'")
+    return list(
+        conn.execute(
+            f"SELECT * FROM knowledge WHERE {' AND '.join(clauses)}",  # noqa: S608 - fixed clause set
+            params,
+        )
+    )
+
+
+def semantic_neighbors(
+    conn: sqlite3.Connection,
+    query_vector: list[float],
+    *,
+    limit: int = 10,
+    min_similarity: float = 0.0,
+    include_private: bool = False,
+) -> list[dict[str, Any]]:
+    """Nearest embedded knowledge rows to ``query_vector`` by cosine similarity.
+
+    Exported for autolabel attribution as the vector analog of the FTS
+    ``search`` path: given a signal/query embedding, return the closest knowledge
+    rows so a signal can be attributed semantically rather than lexically. Returns
+    ``[]`` when the query vector is empty (caller falls back to lexical). Private
+    rows are excluded by default (attribution is internal, but private vectors are
+    never stored by :mod:`ocbrain.embed` anyway — this is defense in depth).
+    """
+    if not query_vector:
+        return []
+    scored: list[NeighborItem] = []
+    for row in embedded_knowledge_rows(conn, include_private=include_private):
+        vector = decode_embedding(row["embedding"])
+        similarity = cosine_similarity(query_vector, vector)
+        if similarity < min_similarity:
+            continue
+        scored.append(
+            NeighborItem(
+                knowledge_id=row["id"],
+                similarity=round(similarity, 6),
+                lexical=0.0,
+                score=round(similarity, 6),
+                body=knowledge_text(row),
+                scope=row["privacy_scope"],
+            )
+        )
+    ranked = sorted(scored, key=lambda item: (-item.similarity, item.knowledge_id))
+    return [item.to_dict() for item in ranked[:limit]]
+
+
+def hybrid_knowledge_search(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    query_vector: list[float] | None = None,
+    semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT,
+    limit: int = 12,
+    include_private: bool = False,
+    statuses: tuple[str, ...] = ("candidate", "current"),
+) -> list[dict[str, Any]]:
+    """Rank knowledge rows by a lexical + semantic blend over stored vectors.
+
+    For every candidate row the lexical relevance of ``query`` against the row
+    text is blended with the cosine similarity between ``query_vector`` and the
+    row's stored embedding. When ``query_vector`` is ``None`` (no query embedding)
+    or a row has no stored vector, that row is scored lexical-only — so the search
+    always works, embeddings just sharpen it. Rows with a zero blended score are
+    dropped.
+    """
+    placeholders = ",".join("?" for _ in statuses)
+    clauses = ["quarantine_reason IS NULL", f"status IN ({placeholders})"]
+    params: list[Any] = list(statuses)
+    if not include_private:
+        clauses.append("privacy_scope != 'private'")
+    rows = conn.execute(
+        f"SELECT * FROM knowledge WHERE {' AND '.join(clauses)}",  # noqa: S608 - fixed clause set
+        params,
+    ).fetchall()
+
+    scored: list[NeighborItem] = []
+    for row in rows:
+        text = knowledge_text(row)
+        lexical = lexical_relevance(query, text)
+        semantic: float | None = None
+        if query_vector:
+            vector = decode_embedding(row["embedding"])
+            if vector:
+                semantic = cosine_similarity(query_vector, vector)
+        score = blend_scores(lexical, semantic, semantic_weight=semantic_weight)
+        if score <= 0.0:
+            continue
+        scored.append(
+            NeighborItem(
+                knowledge_id=row["id"],
+                similarity=round(semantic if semantic is not None else 0.0, 6),
+                lexical=round(lexical, 6),
+                score=round(score, 6),
+                body=text,
+                scope=row["privacy_scope"],
+            )
+        )
+    ranked = sorted(scored, key=lambda item: (-item.score, item.knowledge_id))
+    return [item.to_dict() for item in ranked[:limit]]
