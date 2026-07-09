@@ -42,7 +42,7 @@ from typing import Any
 
 from ocbrain.autolabel import autolabel
 from ocbrain.config import OcbrainConfig, load_config
-from ocbrain.db import now_iso
+from ocbrain.db import DB_BUSY_TIMEOUT_MS, now_iso
 from ocbrain.events import canonical_json, rebuild_projection
 from ocbrain.fsutil import file_fingerprint, file_lock, snapshot_sqlite
 from ocbrain.ids import stable_id
@@ -740,6 +740,7 @@ def _write_run_ledger_resilient(
         if db_path is None or str(db_path) == ":memory:":
             raise
     fresh = sqlite3.connect(Path(db_path))
+    fresh.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     try:
         _write_run_ledger(fresh, run_id, started_at, finished_at, status, stage_results, error)
         fresh.commit()

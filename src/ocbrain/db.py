@@ -12,6 +12,11 @@ from ocbrain.ids import content_hash, stable_id
 from ocbrain.text import find_probable_injection, find_probable_secret_leaks
 
 DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")).expanduser()
+# The brain DB has heavy concurrent writers (light/heavy autopilot cycles,
+# stallcheck, MCP feedback). Wait on a lock rather than fail-fast so migrations
+# and ledger writes don't crash with "database is locked". Set in the core
+# connect() factory so ALL consumers inherit it. Config-overridable via env.
+DB_BUSY_TIMEOUT_MS = int(os.environ.get("OCBRAIN_BUSY_TIMEOUT_MS", "5000"))
 PUBLIC_SCOPES = ("workspace", "project", "public")
 SCOPE_RANK = {"private": 0, "workspace": 1, "project": 2, "public": 3}
 
@@ -344,6 +349,7 @@ def now_iso() -> str:
 def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     conn.row_factory = sqlite3.Row
     return conn
 

@@ -19,6 +19,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TypeVar
 
+from ocbrain.db import DB_BUSY_TIMEOUT_MS
+
 _T = TypeVar("_T")
 
 
@@ -94,6 +96,9 @@ def snapshot_sqlite(src: Path | str, dest: Path | str) -> Path:
             stale.unlink()
 
     src_conn = sqlite3.connect(src_path)
+    # Backup source is the live brain DB; wait on a concurrent writer/checkpoint
+    # lock rather than fail the snapshot with "database is locked".
+    src_conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     dst_conn = sqlite3.connect(dest_path)
     try:
         with dst_conn:
