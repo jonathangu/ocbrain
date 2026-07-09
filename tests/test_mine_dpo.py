@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from ocbrain.config import load_config
@@ -23,8 +24,11 @@ from ocbrain.events import decide_compilation, propose_compilation, record_corre
 from ocbrain.scope import ScopeTag, global_scope
 
 CFG = load_config()
+CFG_STRICT_ONLY = replace(CFG, dataset=replace(CFG.dataset, dpo_relaxed_gate=False))
 A1 = "The answer is forty-two according to my first and frankly hasty guess about this."
 CHOSEN = "Actually the deploy is driven by scripts/run.sh which you invoke before shipping."
+# A founder correction that states the fix, long enough to clear the DPO side floor.
+FIX_LASTWORD = "No, fix that: location lives on the garden, not the user; use the garden instead."
 
 
 def _sess(*turns: Turn) -> Session:
@@ -198,3 +202,110 @@ def test_supersession_pair(tmp_path: Path):
     pairs = [p for p in find_event_pairs(conn, CFG) if p.correction_kind == "supersedes"]
     assert len(pairs) == 1
     assert "losing value" in pairs[0].rejected and "winning value" in pairs[0].chosen
+
+
+# --- v0.3 relaxed gate (additive; every pair tagged gate='relaxed') ---
+
+
+def test_strict_pairs_tagged_strict():
+    session = _sess(
+        _u("please help with the deploy"),
+        _a(A1),
+        _u("no, that's wrong, not what I asked for"),
+        _a(CHOSEN),
+        _u("thanks, perfect"),
+    )
+    pairs = find_transcript_pairs(session, CFG)
+    assert len(pairs) == 1
+    assert pairs[0].gate == "strict"
+
+
+def test_relaxed_missing_acceptance_last_word():
+    # Case (a): the correction that states the fix is the thread's LAST word — no
+    # accepted assistant answer follows. Strict rejects (no chosen); relaxed uses
+    # the correction text as the preferred output.
+    session = _sess(
+        _u("where does the location truth live?"),
+        _a(A1),
+        _u(FIX_LASTWORD),
+    )
+    assert find_transcript_pairs(session, CFG_STRICT_ONLY) == []
+    pairs = find_transcript_pairs(session, CFG)
+    assert len(pairs) == 1
+    assert pairs[0].gate == "relaxed"
+    assert pairs[0].rejected == A1
+    assert pairs[0].chosen == FIX_LASTWORD
+    # prompt ends at the original request, correction excluded
+    assert pairs[0].prompt_messages[-1]["content"] == "where does the location truth live?"
+
+
+def test_relaxed_delayed_correction_searches_back():
+    # Case (b): the correction arrives multiple turns after the answer, past an
+    # intervening non-correction user turn. Strict's immediate-next-user check
+    # misses it; relaxed searches back for the antecedent answer.
+    session = _sess(
+        _u("what runs the deploy?"),
+        _a(A1),
+        _u("also, unrelated — what time is the standup?"),
+        _u("no wait, that's wrong, use the deploy script instead"),
+        _a(CHOSEN),
+        _u("thanks perfect"),
+    )
+    assert find_transcript_pairs(session, CFG_STRICT_ONLY) == []
+    pairs = find_transcript_pairs(session, CFG)
+    assert len(pairs) == 1
+    assert pairs[0].gate == "relaxed"
+    assert pairs[0].rejected == A1 and pairs[0].chosen == CHOSEN
+
+
+def test_relaxed_respects_lookback_horizon():
+    # An antecedent answer farther back than the N=4 lookback is not paired.
+    session = _sess(
+        _u("original ask"),
+        _a(A1),
+        _u("filler one two three"),
+        _u("filler four five six"),
+        _u("filler seven eight nine"),
+        _u("filler ten eleven twelve"),
+        _u("no, that's wrong, it should be the deploy script instead of that guess"),
+    )
+    assert find_transcript_pairs(session, CFG) == []
+
+
+def test_relaxed_does_not_restate_strict_pair():
+    # When strict already emits the pair (immediate correction + accepted answer),
+    # the relaxed pass must dedup it — exactly one pair, tagged strict.
+    session = _sess(
+        _u("please help with the deploy"),
+        _a(A1),
+        _u("no, that's wrong, not what I asked for"),
+        _a(CHOSEN),
+        _u("thanks, perfect"),
+    )
+    pairs = find_transcript_pairs(session, CFG)
+    assert len(pairs) == 1
+    assert pairs[0].gate == "strict"
+
+
+def test_relaxed_gate_off_suppresses_relaxed_pairs():
+    session = _sess(
+        _u("where does the location truth live?"),
+        _a(A1),
+        _u(FIX_LASTWORD),
+    )
+    assert find_transcript_pairs(session, CFG_STRICT_ONLY) == []
+
+
+def test_mine_dpo_stores_relaxed_gate_metadata(tmp_path: Path):
+    conn = _conn(tmp_path)
+    upsert_evidence(conn, source_type="openclaw_history_file", source_runtime="openclaw",
+                    source_uri="/x/s.jsonl", content_hash="fpR", claim="t",
+                    privacy_scope="workspace")
+    session = _sess(_u("where does location live?"), _a(A1), _u(FIX_LASTWORD))
+    result = mine_dpo(conn, cfg=CFG, sessions=[session], include_events=False)
+    assert result["stored"] == 1
+    row = conn.execute("SELECT example_json FROM dataset_examples").fetchone()
+    record = json.loads(row["example_json"])
+    assert record["metadata"]["gate"] == "relaxed"
+    assert record["preferred_output"][0]["content"] == FIX_LASTWORD
+    assert record["non_preferred_output"][0]["content"] == A1

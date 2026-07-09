@@ -74,6 +74,28 @@ def test_correction_score_neutral_statement_is_low() -> None:
     assert correction_score("Here is the summary of the results.") < 0.6
 
 
+def test_correction_score_implicit_quote_and_fix() -> None:
+    # v0.3 implicit-correction cues: a founder cites the wrong output and states
+    # the fix without the explicit "wrong" vocabulary. Accumulating soft cues must
+    # reach the 0.6 threshold.
+    assert correction_score("You wrote deploy.sh — it's actually driven by Fly CI.") >= 0.6
+    assert correction_score("It's actually the garden that owns location, not the user.") >= 0.6
+    assert correction_score("No, that line should say displayAddress, not streetAddress.") >= 0.6
+
+
+def test_correction_score_implicit_cue_alone_stays_below_threshold() -> None:
+    # A lone implicit cue must NOT cross the gate on its own — it only counts when
+    # it accumulates with another cue (guards against false positives on planning
+    # chatter like a neutral "you said" reference).
+    assert correction_score("Earlier you said you'd push after the tests pass.") < 0.6
+
+
+def test_correction_score_implicit_cue_inside_praise_stays_zero() -> None:
+    # The pure-affirmation zeroing still neutralizes an implicit cue buried in
+    # praise, because every implicit cue carries weight < 0.5.
+    assert correction_score("Thanks, it's actually perfect — ship it!") == 0.0
+
+
 def test_existing_secret_scanners_still_work() -> None:
     leaky = "api_key=sk-abcdefghijklmnopqrstuvwxyz012345"
     assert "openai_key" in find_probable_secret_leaks(leaky)
