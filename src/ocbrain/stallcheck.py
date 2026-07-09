@@ -12,10 +12,16 @@ Three readers feed it:
 
   READER A (filesystem) — the money reader. Scans subagent workflow dirs for
     ``agent-*.jsonl`` transcripts whose LAST record is an assistant ``end_turn``
-    whose text matches a passive-wait lexicon, and task ``.output`` files that
-    are zero-byte or opened (``start:``) but never closed (``exit:``). A
-    workflow whose journal shows *recent* result activity, or whose files were
-    *recently* appended, is alive and is never flagged.
+    and flags a parked-and-forgotten turn via two independent signals:
+      (1) PRIMARY, lexicon-free — a monitor / background-task ``tool_use`` appears
+          in the trailing N records with no later ``tool_result`` / user event,
+          i.e. the turn closed while a monitor was still pending. This catches
+          every passive-wait paraphrase with zero text matching.
+      (2) SECONDARY, regex lexicon — the end_turn text matches a case-insensitive
+          passive-wait regex family (generalizer + high-precision seeds).
+    It also flags task ``.output`` files that are zero-byte or opened (``start:``)
+    but never closed (``exit:``). A workflow whose journal shows *recent* result
+    activity, or whose files were *recently* appended, is alive and never flagged.
 
   READER B (sqlite, read-only) — runner ``task_runs`` that are ``lost`` or have
     been ``running``/``pending`` with no event past the stale threshold.
@@ -39,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 import urllib.error
@@ -80,14 +87,29 @@ DEFAULT_TASK_OUTPUT_GLOBS: tuple[str, ...] = (
 )
 DEFAULT_RUNNER_DB = "/Users/guclaw/.openclaw/state/openclaw.sqlite"
 
+# Secondary signal. Case-insensitive REGEX families (not exact substrings), so
+# paraphrases like "waiting for the clean live run to land via the monitor" match
+# without an exact seed. The leading family pattern is the generalizer; the
+# remaining entries preserve the original high-precision seeds. Any operator-
+# supplied ``passive_wait_lexicon`` entries are likewise treated as regex.
 DEFAULT_PASSIVE_WAIT_LEXICON: tuple[str, ...] = (
-    "waiting on the monitor",
-    "standing by",
-    "i'll hold here",
-    "no further action is useful until",
-    "let the monitor notify me",
-    "waiting for the monitor",
+    # <wait/hold/standing-by verb> … within 80 chars … <arrival/callback noun>
+    r"\b(wait|waiting|waits|hold|holding|holds|stand(?:ing)? by|park(?:ed|ing)?"
+    r"|block(?:ed|ing)?|pause[ds]?)\b.{0,80}\b(monitor|notif(?:y|ication|ies)"
+    r"|callback|ping|land(?:s|ed|ing)?|complete[sd]?|completion|arriv(?:e|es|al)"
+    r"|resolve[sd]?|finish(?:es|ed)?|come[s]? back|return[s]?)\b",
+    r"\bwaiting on the monitor\b",
+    r"\bstanding by\b",
+    r"\bi'?ll hold here\b",
+    r"\bno further action is useful until\b",
+    r"\blet the monitor notify me\b",
+    r"\bwaiting for the monitor\b",
 )
+
+# Primary signal. Tool-use names (or a truthy ``run_in_background`` input) that
+# denote a background/monitor call whose result the turn is waiting on. Matched
+# case-insensitively against the tool_use ``name``.
+DEFAULT_MONITOR_TOOL_PATTERN = r"monitor|background|spawn_task|remote_?trigger|push_?notification"
 
 # Cap the byte count read for the start:/exit: text probe so a giant transcript
 # masquerading as a .output file never blows up memory. Zero-byte detection is a
@@ -101,6 +123,14 @@ class StallCheckConfig:
     task_output_globs: tuple[str, ...] = DEFAULT_TASK_OUTPUT_GLOBS
     runner_db: str = DEFAULT_RUNNER_DB
     passive_wait_lexicon: tuple[str, ...] = DEFAULT_PASSIVE_WAIT_LEXICON
+    # Primary (lexicon-free) signal: flag a turn that closed while a monitor /
+    # background-task tool_use was still pending (no later tool_result / user
+    # event). Config-gated, default on. ``monitor_tool_pattern`` is the regex
+    # that identifies a monitor-ish tool_use name; ``trailing_record_window`` is
+    # how many tail records of the transcript the scan inspects.
+    pending_monitor_signal: bool = True
+    monitor_tool_pattern: str = DEFAULT_MONITOR_TOOL_PATTERN
+    trailing_record_window: int = 12
     stale_threshold_minutes: int = DEFAULT_STALE_MINUTES
     terminal_backlog_hours: int = DEFAULT_TERMINAL_BACKLOG_HOURS
     ingress_window_hours: int = DEFAULT_INGRESS_WINDOW_HOURS
@@ -153,6 +183,9 @@ def load_config(config_path: Path | str | None = None) -> StallCheckConfig:
         task_output_globs=_tuple("task_output_globs", DEFAULT_TASK_OUTPUT_GLOBS),
         runner_db=str(sc.get("runner_db", DEFAULT_RUNNER_DB)),
         passive_wait_lexicon=_tuple("passive_wait_lexicon", DEFAULT_PASSIVE_WAIT_LEXICON),
+        pending_monitor_signal=bool(sc.get("pending_monitor_signal", True)),
+        monitor_tool_pattern=str(sc.get("monitor_tool_pattern", DEFAULT_MONITOR_TOOL_PATTERN)),
+        trailing_record_window=int(sc.get("trailing_record_window", 12)),
         stale_threshold_minutes=int(sc.get("stale_threshold_minutes", DEFAULT_STALE_MINUTES)),
         terminal_backlog_hours=int(
             sc.get("terminal_backlog_hours", DEFAULT_TERMINAL_BACKLOG_HOURS)
@@ -213,9 +246,9 @@ def _mtime(path: Path) -> float:
 
 
 # --- Reader A: filesystem ------------------------------------------------------
-def _last_jsonl_record(path: Path) -> dict[str, Any] | None:
-    """Return the last non-blank JSON record of a .jsonl file, or None."""
-    last: dict[str, Any] | None = None
+def _tail_jsonl_records(path: Path, n: int) -> list[dict[str, Any]]:
+    """Return the last ``n`` non-blank JSON dict records of a .jsonl file."""
+    records: list[dict[str, Any]] = []
     try:
         with path.open("r", errors="replace") as handle:
             for line in handle:
@@ -227,10 +260,93 @@ def _last_jsonl_record(path: Path) -> dict[str, Any] | None:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(obj, dict):
-                    last = obj
+                    records.append(obj)
+                    if n > 0 and len(records) > n:
+                        records.pop(0)
     except OSError:
-        return None
-    return last
+        return []
+    return records
+
+
+def _content_blocks(record: dict[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, list):
+        return [block for block in content if isinstance(block, dict)]
+    return []
+
+
+def _is_user_record(record: dict[str, Any]) -> bool:
+    if record.get("type") == "user":
+        return True
+    message = record.get("message")
+    return isinstance(message, dict) and message.get("role") == "user"
+
+
+def _has_tool_result(record: dict[str, Any]) -> bool:
+    return any(block.get("type") == "tool_result" for block in _content_blocks(record))
+
+
+def _is_assistant_end_turn(record: dict[str, Any]) -> bool:
+    message = record.get("message")
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("stop_reason") == "end_turn"
+    )
+
+
+def _tool_use_is_monitor(block: dict[str, Any], monitor_re: re.Pattern[str]) -> bool:
+    if block.get("type") != "tool_use":
+        return False
+    if monitor_re.search(str(block.get("name", ""))):
+        return True
+    inp = block.get("input")
+    return isinstance(inp, dict) and bool(inp.get("run_in_background"))
+
+
+def detect_pending_monitor(
+    records: list[dict[str, Any]], monitor_re: re.Pattern[str]
+) -> str | None:
+    """LEXICON-FREE primary signal. Return the name of a monitor / background-task
+    ``tool_use`` in ``records`` whose result never lands — i.e. no later record is
+    a user event or carries a ``tool_result`` — else ``None``. Catches every
+    passive-wait paraphrase with zero text matching."""
+    total = len(records)
+    for i, record in enumerate(records):
+        for block in _content_blocks(record):
+            if not _tool_use_is_monitor(block, monitor_re):
+                continue
+            resolved_later = any(
+                _is_user_record(records[j]) or _has_tool_result(records[j])
+                for j in range(i + 1, total)
+            )
+            if not resolved_later:
+                return str(block.get("name") or "monitor")
+    return None
+
+
+def _compile_lexicon(patterns: tuple[str, ...]) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pat in patterns:
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error:
+            continue
+    return compiled
+
+
+def match_passive_wait(text: str, compiled: list[re.Pattern[str]]) -> str | None:
+    """SECONDARY signal. Return the matched (normalized) span if any passive-wait
+    regex family matches ``text``, else ``None``."""
+    flat = " ".join(text.split())
+    for pat in compiled:
+        found = pat.search(flat)
+        if found:
+            return _snip(found.group(0), 80).lower()
+    return None
 
 
 def _assistant_end_turn_text(record: dict[str, Any]) -> str | None:
@@ -296,7 +412,9 @@ def _dir_recently_active(directory: Path, cutoff_epoch: float) -> bool:
 def scan_workflow_stalls(cfg: StallCheckConfig, now: datetime) -> list[Finding]:
     now_epoch = now.timestamp()
     cutoff = now_epoch - cfg.stale_threshold_seconds
-    lexicon = [kw.lower() for kw in cfg.passive_wait_lexicon]
+    compiled = _compile_lexicon(cfg.passive_wait_lexicon)
+    monitor_re = re.compile(cfg.monitor_tool_pattern, re.IGNORECASE)
+    window = cfg.trailing_record_window
     findings: list[Finding] = []
     seen_dirs: dict[Path, bool] = {}
     for pattern in cfg.workflow_globs:
@@ -307,16 +425,28 @@ def scan_workflow_stalls(cfg: StallCheckConfig, now: datetime) -> list[Finding]:
                 mtime = _mtime(agent_file)
                 if mtime == 0.0 or mtime >= cutoff:
                     continue  # fresh / still being appended
-                record = _last_jsonl_record(agent_file)
-                if record is None:
+                records = _tail_jsonl_records(agent_file, window)
+                # Both signals require the turn to have CLOSED on an assistant
+                # end_turn (a parked-and-forgotten turn), not a still-running one.
+                if not records or not _is_assistant_end_turn(records[-1]):
                     continue
-                text = _assistant_end_turn_text(record)
-                if not text:
+                text = _assistant_end_turn_text(records[-1]) or ""
+
+                signature: str | None = None
+                # PRIMARY (lexicon-free): turn closed with a monitor pending.
+                if cfg.pending_monitor_signal:
+                    monitor = detect_pending_monitor(records, monitor_re)
+                    if monitor:
+                        signature = f"pending_monitor:{monitor}"
+                # SECONDARY (regex lexicon): passive-wait phrasing in the text.
+                if signature is None:
+                    matched = match_passive_wait(text, compiled)
+                    if matched is not None:
+                        signature = f"passive_wait:{matched}"
+                if signature is None:
                     continue
-                low = text.lower()
-                matched = next((kw for kw in lexicon if kw in low), None)
-                if matched is None:
-                    continue
+
+                snippet = _snip(text) or "turn closed while a background monitor was pending"
                 # False-positive guards, evaluated once per workflow dir.
                 if match not in seen_dirs:
                     seen_dirs[match] = _dir_recently_active(
@@ -328,8 +458,8 @@ def scan_workflow_stalls(cfg: StallCheckConfig, now: datetime) -> list[Finding]:
                     Finding(
                         stall_class="workflow_passive_wait",
                         unit_id=agent_file.stem.removeprefix("agent-") or agent_file.stem,
-                        terminal_signature=f"passive_wait:{matched}",
-                        snippet=_snip(text),
+                        terminal_signature=signature,
+                        snippet=snippet,
                         artifact_path=str(agent_file),
                         age_seconds=now_epoch - mtime,
                         occurred_at=datetime.fromtimestamp(mtime, tz=UTC).isoformat(),

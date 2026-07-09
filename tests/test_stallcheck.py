@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -18,6 +19,50 @@ import pytest
 
 from ocbrain import stallcheck
 from ocbrain.db import connect, init_db
+
+# Verbatim terminal text of the third lane that died passive-waiting tonight and
+# EVADED the exact-substring seed lexicon. Regression fixture: it MUST be flagged
+# by both the primary (pending-monitor) and secondary (regex lexicon) signals.
+MAX_LANE_EVASION_TEXT = (
+    "Committed diff confirmed (6 files, +380). Now waiting for the clean live "
+    "run to land via the monitor."
+)
+
+
+def _write_agent_records(path, records) -> None:
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+
+def _monitor_tool_use(tool_id: str = "tu_mon", name: str = "Monitor") -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {}}],
+        },
+    }
+
+
+def _tool_result_record(tool_id: str = "tu_mon") -> dict:
+    return {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+        },
+    }
+
+
+def _end_turn_record(text: str) -> dict:
+    return {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": text}],
+        },
+    }
 
 
 # --- fixture builders ----------------------------------------------------------
@@ -148,6 +193,133 @@ def test_reader_a_journal_recent_result_suppresses(tmp_path):
 
     cfg = _cfg(workflow_globs=(f"{tmp_path}/wf_*/",))
     assert stallcheck.scan_workflow_stalls(cfg, datetime.now(UTC)) == []
+
+
+# --- Reader A: lexicon-free pending-monitor signal + regex lexicon ------------
+def test_evasion_text_flagged_by_both_signals_directly():
+    """The verbatim corpse text evaded the exact seeds; both new signals catch it."""
+    records = [
+        {"type": "user", "message": {"role": "user", "content": "ship it"}},
+        _monitor_tool_use(),  # background monitor invoked...
+        _end_turn_record(MAX_LANE_EVASION_TEXT),  # ...turn closed with it pending
+    ]
+    monitor_re = re.compile(stallcheck.DEFAULT_MONITOR_TOOL_PATTERN, re.IGNORECASE)
+    # PRIMARY: monitor tool_use with no later tool_result/user event.
+    assert stallcheck.detect_pending_monitor(records, monitor_re) == "Monitor"
+    # SECONDARY: regex lexicon matches the paraphrase (exact seeds did NOT).
+    compiled = stallcheck._compile_lexicon(stallcheck.DEFAULT_PASSIVE_WAIT_LEXICON)
+    assert stallcheck.match_passive_wait(MAX_LANE_EVASION_TEXT, compiled) is not None
+    # Sanity: the OLD exact-substring approach genuinely missed this text.
+    low = MAX_LANE_EVASION_TEXT.lower()
+    assert not any(
+        seed in low
+        for seed in ("waiting on the monitor", "standing by", "waiting for the monitor")
+    )
+
+
+def test_reader_a_scan_flags_evasion_via_pending_monitor(tmp_path):
+    wf = tmp_path / "wf_evade"
+    wf.mkdir()
+    agent = wf / "agent-maxlane01.jsonl"
+    _write_agent_records(
+        agent,
+        [
+            {"type": "user", "message": {"role": "user", "content": "ship it"}},
+            _monitor_tool_use(),
+            _end_turn_record(MAX_LANE_EVASION_TEXT),
+        ],
+    )
+    _age(agent, minutes=90)
+
+    cfg = _cfg(workflow_globs=(f"{tmp_path}/wf_*/",))
+    findings = stallcheck.scan_workflow_stalls(cfg, datetime.now(UTC))
+    assert len(findings) == 1
+    assert findings[0].stall_class == "workflow_passive_wait"
+    # Primary signal wins the signature when a monitor is pending.
+    assert findings[0].terminal_signature == "pending_monitor:Monitor"
+
+
+def test_reader_a_pending_monitor_flags_even_without_lexicon_text(tmp_path):
+    """A totally paraphrase-free closing line is still caught by the primary signal."""
+    wf = tmp_path / "wf_silent"
+    wf.mkdir()
+    agent = wf / "agent-silent01.jsonl"
+    _write_agent_records(
+        agent,
+        [
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            _monitor_tool_use(name="mcp__ocbrain__Monitor"),
+            _end_turn_record("All set. I'll pick this back up once the callback fires."),
+        ],
+    )
+    _age(agent, minutes=90)
+    cfg = _cfg(workflow_globs=(f"{tmp_path}/wf_*/",))
+    findings = stallcheck.scan_workflow_stalls(cfg, datetime.now(UTC))
+    assert len(findings) == 1
+    assert findings[0].terminal_signature.startswith("pending_monitor:")
+
+
+def test_reader_a_healthy_monitor_with_tool_result_not_flagged(tmp_path):
+    """A monitor whose result LANDED (tool_result after it) is alive -> no flag."""
+    wf = tmp_path / "wf_healthy"
+    wf.mkdir()
+    agent = wf / "agent-healthy01.jsonl"
+    _write_agent_records(
+        agent,
+        [
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            _monitor_tool_use(),
+            _tool_result_record(),  # the monitor result came back
+            _end_turn_record("Monitor reported success; all done and verified."),
+        ],
+    )
+    _age(agent, minutes=90)
+    cfg = _cfg(workflow_globs=(f"{tmp_path}/wf_*/",))
+    assert stallcheck.scan_workflow_stalls(cfg, datetime.now(UTC)) == []
+
+
+def test_pending_monitor_signal_gate_off_falls_back_to_lexicon(tmp_path):
+    """With the primary signal disabled, a pending monitor alone does NOT flag,
+    but the regex lexicon still catches the corpse text."""
+    wf = tmp_path / "wf_gate"
+    wf.mkdir()
+    # Pending monitor, but closing line has NO passive-wait phrasing.
+    silent = wf / "agent-gate01.jsonl"
+    _write_agent_records(
+        silent,
+        [
+            {"type": "user", "message": {"role": "user", "content": "go"}},
+            _monitor_tool_use(),
+            _end_turn_record("Everything is committed and green."),
+        ],
+    )
+    _age(silent, minutes=90)
+    cfg_off = _cfg(workflow_globs=(f"{tmp_path}/wf_*/",), pending_monitor_signal=False)
+    assert stallcheck.scan_workflow_stalls(cfg_off, datetime.now(UTC)) == []
+
+    # Same gate off, but corpse text present -> secondary regex still fires.
+    corpse = wf / "agent-gate02.jsonl"
+    _write_agent_records(corpse, [_end_turn_record(MAX_LANE_EVASION_TEXT)])
+    _age(corpse, minutes=90)
+    findings = stallcheck.scan_workflow_stalls(cfg_off, datetime.now(UTC))
+    assert {f.unit_id for f in findings} == {"gate02"}
+    assert findings[0].terminal_signature.startswith("passive_wait:")
+
+
+def test_regex_lexicon_matches_paraphrases_and_seeds():
+    compiled = stallcheck._compile_lexicon(stallcheck.DEFAULT_PASSIVE_WAIT_LEXICON)
+    # Paraphrases the old exact seeds would have missed:
+    for text in (
+        MAX_LANE_EVASION_TEXT,
+        "Holding here until the deploy completes.",
+        "Parked; will resume when the notification arrives.",
+        "Blocked waiting for the run to finish.",
+    ):
+        assert stallcheck.match_passive_wait(text, compiled) is not None, text
+    # Original seed phrasing still matches:
+    assert stallcheck.match_passive_wait("Standing by.", compiled) is not None
+    # A genuinely-done line does NOT match:
+    assert stallcheck.match_passive_wait("All tests pass. Done.", compiled) is None
 
 
 # --- Reader A: task .output ----------------------------------------------------
