@@ -29,6 +29,7 @@ from ocbrain.dataset.transcripts import (
     record_source,
     resolve_transcript_evidence,
 )
+from ocbrain.fsutil import ParseCache, parse_cache_key
 from ocbrain.text import AFFIRMATION_RE, correction_score
 
 _GOOD_RETRIEVAL = {"improved", "helpful", "used"}
@@ -205,6 +206,7 @@ def mine_sft(
     retrieval_by_session: dict[str, list[str]] | None = None,
     limit: int | None = None,
     time_budget_seconds: float | None = None,
+    parse_cache: ParseCache | None = None,
 ) -> dict[str, Any]:
     """Mine SFT examples from ``sessions`` (or discovered transcripts).
 
@@ -270,15 +272,32 @@ def mine_sft(
                 break
             _emit(session)
     elif roots is not None:
+        ds = cfg.dataset
+        # founder_ids=() here mirrors the SFT parse below; the tuple lets the
+        # run-shared memo reuse a persona/DPO parse of the same file when no
+        # founder is configured (identical Session), and stay distinct otherwise.
+        params = (
+            tuple(ds.persona_author_ids),
+            tuple(ds.persona_direct_agents),
+            ds.tool_result_truncate,
+            (),
+        )
         for path, fingerprint in iter_unmined_transcripts(conn, roots, "sft"):
             if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
                 break
-            session = parse_transcript(
-                path,
-                author_ids=cfg.dataset.persona_author_ids,
-                direct_agents=cfg.dataset.persona_direct_agents,
-                tool_result_truncate=cfg.dataset.tool_result_truncate,
-            )
+
+            def _load(p: object = path) -> Session | None:
+                return parse_transcript(
+                    p,  # type: ignore[arg-type]
+                    author_ids=ds.persona_author_ids,
+                    direct_agents=ds.persona_direct_agents,
+                    tool_result_truncate=ds.tool_result_truncate,
+                )
+
+            if parse_cache is not None:
+                session = parse_cache.get(parse_cache_key(fingerprint, params), _load)
+            else:
+                session = _load()
             emitted = 0 if session is None else _emit(session)
             record_source(conn, str(path), "sft", fingerprint, emitted)
             files_mined += 1
