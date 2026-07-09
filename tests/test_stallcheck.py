@@ -711,3 +711,54 @@ def test_feed_deadman_and_heartbeat_wait_out_a_concurrent_writer_lock(tmp_path, 
         "AND run_id='heartbeat'"
     ).fetchone()
     assert hb is not None and hb["last_heartbeat_at"] is not None
+
+
+def test_main_skips_clean_when_lock_survives_the_retry_budget(tmp_path, monkeypatch, capsys):
+    """If a competing writer holds the brain lock beyond the whole bound-retry
+    budget (observed live: autopilot's multi-minute review/tripwires stage),
+    main() must exit 0 with a clear SKIPPED line instead of crashing — a crash
+    is what actually took the watchman down. Nothing is lost: the next
+    15-minute cycle re-scans and re-feeds every finding (idempotent)."""
+    brain_path = tmp_path / "brain.sqlite"
+    seed = connect(brain_path)
+    init_db(seed)
+    seed.commit()
+    seed.close()
+
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text("{}")
+
+    def always_locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(stallcheck, "run", always_locked)
+    monkeypatch.setattr(
+        stallcheck, "open_runner_ro", lambda path: (_ for _ in ()).throw(sqlite3.Error())
+    )
+
+    rc = stallcheck.main(["--config", str(cfg_path), "--brain-db", str(brain_path)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "SKIPPED" in out
+    assert "brain database busy" in out
+
+
+def test_main_reraises_non_lock_operational_error(tmp_path, monkeypatch):
+    brain_path = tmp_path / "brain.sqlite"
+    seed = connect(brain_path)
+    init_db(seed)
+    seed.commit()
+    seed.close()
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text("{}")
+
+    def other_error(*args, **kwargs):
+        raise sqlite3.OperationalError("no such table: widgets")
+
+    monkeypatch.setattr(stallcheck, "run", other_error)
+    monkeypatch.setattr(
+        stallcheck, "open_runner_ro", lambda path: (_ for _ in ()).throw(sqlite3.Error())
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        stallcheck.main(["--config", str(cfg_path), "--brain-db", str(brain_path)])

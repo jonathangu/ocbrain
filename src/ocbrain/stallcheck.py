@@ -1054,23 +1054,45 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     brain = open_brain(brain_path)
     runner = None
+    report = None
+    lock_skip = False
     try:
         try:
             runner = open_runner_ro(cfg.runner_db)
         except sqlite3.Error:
             runner = None
-        report = run(
-            cfg,
-            brain,
-            runner=runner,
-            now=now,
-            message_prefix=args.message_prefix,
-            send=not args.no_send,
-        )
+        try:
+            report = run(
+                cfg,
+                brain,
+                runner=runner,
+                now=now,
+                message_prefix=args.message_prefix,
+                send=not args.no_send,
+            )
+        except sqlite3.OperationalError as exc:
+            # _write_with_lock_retry already bound-retried every brain write.
+            # If the brain is STILL busy after that budget (a competing
+            # writer — e.g. autopilot's multi-minute review/tripwires stage —
+            # held the lock the whole window), don't crash the watchman: every
+            # write here is an idempotent upsert over freshly re-scanned
+            # findings, so skipping this cycle loses nothing — the next
+            # 15-minute run re-feeds it. A crash is what actually took the
+            # launchd job down; a clean skip keeps it alive and scheduled.
+            if "database is locked" not in str(exc).lower():
+                raise
+            lock_skip = True
     finally:
         if runner is not None:
             runner.close()
         brain.close()
+
+    if lock_skip:
+        print(
+            f"[stallcheck] {now.isoformat()} SKIPPED: brain database busy after "
+            f"bound retries, will retry next cycle"
+        )
+        return 0
 
     status = "-" if report.page_status is None else str(report.page_status)
     print(
