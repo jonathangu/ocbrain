@@ -72,6 +72,7 @@ STAGE_NAMES: tuple[str, ...] = (
     "embed",
     "tripwires",
     "promote",
+    "excerpt_render",
     "maintain",
     "dataset_mine",
     "dataset_export",
@@ -389,6 +390,51 @@ def stage_promote(ctx: AutopilotContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Stage 9b — excerpt_render (render the injectable memory view into runtime files)
+# --------------------------------------------------------------------------- #
+def stage_excerpt_render(ctx: AutopilotContext) -> dict[str, Any]:
+    """Render the promoted, injectable memory view into runtime files (v0.3).
+
+    Runs after ``promote`` so the just-settled injectable set is what lands in
+    each target file's managed block. For every path in
+    ``cfg.excerpt_render.targets`` it writes/updates ONLY the
+    ``BEGIN/END OCBRAIN MANAGED BLOCK`` region — content outside the markers is
+    preserved (these are agent-owned memory files). The char budget is
+    ``promote.max_chars``. Rendering is idempotent: an unchanged block is not
+    rewritten (mtime preserved) and logs no ``served`` retrieval, so a quiet
+    cycle touches nothing. Quarantined / unscanned / non-injected rows never
+    reach the block (``build_excerpt`` filters them). A dry run skips it entirely
+    (the stage writes files and logs served retrievals). Each target is isolated:
+    a bad path records an error without failing the others.
+    """
+    if ctx.dry_run:
+        return {"action": "excerpt_render", "changed": 0, "skipped": "dry_run"}
+    targets = list(ctx.cfg.excerpt_render.targets)
+    if not targets:
+        return {"action": "excerpt_render", "changed": 0, "skipped": "no_targets"}
+    from ocbrain.excerpt import render_excerpt_file
+
+    results: list[dict[str, Any]] = []
+    changed = 0
+    for raw in targets:
+        path = Path(raw).expanduser()
+        try:
+            res = render_excerpt_file(
+                ctx.conn,
+                path,
+                runtime="autopilot",
+                scope=ctx.cfg.excerpt_render.scope,
+                limit=ctx.cfg.excerpt_render.limit,
+                max_chars=ctx.cfg.promote.max_chars,
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            res = {"path": str(path), "changed": 0, "error": str(exc)}
+        results.append(res)
+        changed += int(res.get("changed", 0))
+    return {"action": "excerpt_render", "changed": changed, "targets": results}
+
+
+# --------------------------------------------------------------------------- #
 # Stage 10 — maintain (prune + heal)
 # --------------------------------------------------------------------------- #
 def stage_maintain(ctx: AutopilotContext) -> dict[str, Any]:
@@ -455,6 +501,7 @@ STAGES: dict[str, Callable[[AutopilotContext], dict[str, Any]]] = {
     "embed": stage_embed,
     "tripwires": stage_tripwires,
     "promote": stage_promote,
+    "excerpt_render": stage_excerpt_render,
     "maintain": stage_maintain,
     "dataset_mine": stage_dataset_mine,
     "dataset_export": stage_dataset_export,

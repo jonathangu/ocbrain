@@ -44,7 +44,15 @@ class AutopilotConfig:
     # fold+mine+export cycle. The driver picks a profile per run (v0.3).
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
-            "light": ["migrate", "review", "autolabel", "tripwires", "promote", "maintain"],
+            "light": [
+                "migrate",
+                "review",
+                "autolabel",
+                "tripwires",
+                "promote",
+                "excerpt_render",
+                "maintain",
+            ],
             "heavy": [
                 "snapshot",
                 "migrate",
@@ -55,6 +63,7 @@ class AutopilotConfig:
                 "autolabel",
                 "tripwires",
                 "promote",
+                "excerpt_render",
                 "maintain",
                 "dataset_mine",
                 "dataset_export",
@@ -217,6 +226,21 @@ class EmbedConfig:
 
 
 @dataclass(frozen=True)
+class ExcerptRenderConfig:
+    # Autopilot ``excerpt_render`` stage (v0.3): render the injectable memory view
+    # into the managed block of runtime files after ``promote``. ``targets`` is a
+    # list of file paths whose ``BEGIN/END OCBRAIN MANAGED BLOCK`` is written or
+    # updated each cycle; content OUTSIDE the markers is never touched, and an
+    # unchanged block is not rewritten (mtime preserved). Ships EMPTY (public
+    # repo) — the operator points ``targets`` at real runtime files (e.g.
+    # per-workspace ``MEMORY.md``) via the LOCAL config JSON. ``scope`` / ``limit``
+    # bound what is rendered; the char budget comes from ``promote.max_chars``.
+    targets: list[str] = field(default_factory=list)
+    scope: str | None = None
+    limit: int = 40
+
+
+@dataclass(frozen=True)
 class OcbrainConfig:
     autopilot: AutopilotConfig = field(default_factory=AutopilotConfig)
     review: ReviewConfig = field(default_factory=ReviewConfig)
@@ -228,6 +252,7 @@ class OcbrainConfig:
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     embed: EmbedConfig = field(default_factory=EmbedConfig)
+    excerpt_render: ExcerptRenderConfig = field(default_factory=ExcerptRenderConfig)
 
 
 def _coerce(current: Any, incoming: Any) -> Any:

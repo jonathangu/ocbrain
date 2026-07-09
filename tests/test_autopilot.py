@@ -28,6 +28,9 @@ def _cfg(tmp_path: Path):
         ),
         review=dataclasses.replace(cfg.review, session_roots=[str(roots)]),
         judge=dataclasses.replace(cfg.judge, enabled=False),
+        # Keep excerpt_render hermetic: the operator's real config points targets
+        # at live workspace MEMORY.md files; a test must never write to those.
+        excerpt_render=dataclasses.replace(cfg.excerpt_render, targets=[]),
         # Keep the embed stage hermetic: disabled means embed_pending self-skips
         # with no network egress even if OPENAI_API_KEY is present in the env.
         embed=dataclasses.replace(cfg.embed, enabled=False),
@@ -303,8 +306,9 @@ def test_profile_light_runs_fast_subset_with_embed(tmp_path):
 
     assert result["status"] == "ok"
     ran = list(result["stages"].keys())
-    # light = migrate → review → autolabel → embed → tripwires → promote → maintain,
-    # ordered by STAGE_NAMES; embed injected after autolabel.
+    # light = migrate → review → autolabel → embed → tripwires → promote →
+    # excerpt_render → maintain, ordered by STAGE_NAMES; embed injected after
+    # autolabel, excerpt_render after promote.
     assert ran == [
         "migrate",
         "review",
@@ -312,6 +316,7 @@ def test_profile_light_runs_fast_subset_with_embed(tmp_path):
         "embed",
         "tripwires",
         "promote",
+        "excerpt_render",
         "maintain",
     ]
     # The fast profile skips the expensive stages.
@@ -449,3 +454,82 @@ def test_harvest_memory_globs_imports_doctrine(tmp_path):
         "SELECT COUNT(*) FROM evidence WHERE source_type = 'memory_file'"
     ).fetchone()[0]
     assert count == 1
+
+
+def _inject_row(conn, subject: str, value_text: str) -> str:
+    from ocbrain.db import upsert_knowledge
+
+    return upsert_knowledge(
+        conn,
+        knowledge_type="value",
+        gate="auto",
+        origin="loop",
+        subject=subject,
+        predicate="note",
+        value_text=value_text,
+        status="current",
+        inject=True,
+        confidence=0.9,
+    )
+
+
+def test_stage_names_include_excerpt_render_after_promote():
+    names = list(autopilot.STAGE_NAMES)
+    assert "excerpt_render" in names
+    assert names.index("excerpt_render") == names.index("promote") + 1
+    assert "excerpt_render" in autopilot.STAGES
+
+
+def test_excerpt_render_stage_skips_with_no_targets(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)  # excerpt_render.targets defaults empty
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+    result = autopilot.stage_excerpt_render(ctx)
+    assert result == {"action": "excerpt_render", "changed": 0, "skipped": "no_targets"}
+
+
+def test_excerpt_render_stage_skipped_on_dry_run(tmp_path):
+    conn, path = _db(tmp_path)
+    base = _cfg(tmp_path)
+    target = tmp_path / "AGENTS.md"
+    cfg = dataclasses.replace(
+        base,
+        excerpt_render=dataclasses.replace(
+            base.excerpt_render, targets=[str(target)]
+        ),
+    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path, dry_run=True)
+    result = autopilot.stage_excerpt_render(ctx)
+    assert result == {"action": "excerpt_render", "changed": 0, "skipped": "dry_run"}
+    assert not target.exists()  # dry run wrote nothing
+
+
+def test_excerpt_render_stage_writes_targets_and_is_idempotent(tmp_path):
+    conn, path = _db(tmp_path)
+    _inject_row(conn, "cache-policy", "cache TTL is thirty seconds")
+    conn.commit()
+    base = _cfg(tmp_path)
+    target = tmp_path / "workspace" / "MEMORY.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("# Memory\n\nExisting doctrine line.\n", encoding="utf-8")
+    cfg = dataclasses.replace(
+        base,
+        excerpt_render=dataclasses.replace(
+            base.excerpt_render, targets=[str(target)]
+        ),
+    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+
+    first = autopilot.stage_excerpt_render(ctx)
+    assert first["changed"] == 1
+    text = target.read_text(encoding="utf-8")
+    assert "BEGIN OCBRAIN MANAGED BLOCK" in text
+    assert "Existing doctrine line." in text  # content outside markers preserved
+    assert "cache-policy" in text
+
+    # Second render with unchanged knowledge writes nothing (mtime preserved).
+    mtime_before = target.stat().st_mtime_ns
+    second = autopilot.stage_excerpt_render(ctx)
+    assert second["changed"] == 0
+    assert second["targets"][0]["skipped"] == "unchanged"
+    assert target.stat().st_mtime_ns == mtime_before

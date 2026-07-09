@@ -76,6 +76,7 @@ def test_autopilot_profiles_defaults(tmp_path: Path) -> None:
         "autolabel",
         "tripwires",
         "promote",
+        "excerpt_render",
         "maintain",
     ]
     assert cfg.autopilot.profiles["heavy"] == [
@@ -88,6 +89,7 @@ def test_autopilot_profiles_defaults(tmp_path: Path) -> None:
         "autolabel",
         "tripwires",
         "promote",
+        "excerpt_render",
         "maintain",
         "dataset_mine",
         "dataset_export",
