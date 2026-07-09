@@ -372,11 +372,20 @@ def build_parser() -> argparse.ArgumentParser:
     autopilot_parser = subparsers.add_parser(
         "autopilot", help="Run the autonomy pipeline (harvest→…→dataset-export)"
     )
-    autopilot_parser.add_argument(
+    autopilot_select = autopilot_parser.add_mutually_exclusive_group()
+    autopilot_select.add_argument(
         "--stage",
         action="append",
         dest="stages",
         help="Run only this stage (repeatable); default runs all stages",
+    )
+    autopilot_select.add_argument(
+        "--profile",
+        dest="profile",
+        help=(
+            "Run a named stage profile from cfg.autopilot.profiles "
+            "(e.g. 'light' every 15 min, 'heavy' hourly); embed runs after autolabel"
+        ),
     )
     autopilot_parser.add_argument("--dry-run", action="store_true")
     autopilot_parser.set_defaults(func=cmd_autopilot)
@@ -1446,6 +1455,7 @@ def cmd_autopilot(args: argparse.Namespace) -> int:
         cfg,
         db_path=args.db,
         stages=args.stages,
+        profile=getattr(args, "profile", None),
         dry_run=args.dry_run,
     )
     output(args, result)

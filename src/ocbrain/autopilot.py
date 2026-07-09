@@ -1,10 +1,21 @@
-"""Autopilot pipeline — the v0.2 autonomy loop (spec §4, lane 5).
+"""Autopilot pipeline — the autonomy loop (spec §4, lane 5; v0.3 profiles).
 
-``run_autopilot`` is the 14-stage state machine launchd runs every 30 minutes
-(spec §9). It is single-instance (``fcntl.flock`` via :func:`fsutil.file_lock`),
-takes a daily rotated SQLite snapshot before touching anything, and drives every
-downstream stage the other lanes built — harvest, injection-scan, post-turn
-review, compile, autolabel, tripwires, promote, maintain, dataset mine/export.
+``run_autopilot`` is the stage state machine launchd runs on a timer. It is
+single-instance (``fcntl.flock`` via :func:`fsutil.file_lock`), takes a daily
+rotated SQLite snapshot before touching anything, and drives every downstream
+stage the other lanes built — harvest, injection-scan, post-turn review,
+compile, autolabel, embed, tripwires, promote, maintain (prune + heal +
+catalog archival), dataset mine/export.
+
+**Profiles (v0.3).** The old single 30-minute full cycle (34–45 min) overran its
+own timer, so the driver now runs one of two named stage sequences from
+``cfg.autopilot.profiles``: a fast ``light`` cycle (every 15 min) and a full
+``heavy`` cycle (hourly). Both contend for the *same* autopilot lock
+(``cfg.autopilot.profile_locks == "shared"``) so an overlapping fire finds the
+lock held and skips cleanly (``{"status": "locked"}``). The ``embed`` stage runs
+after ``autolabel`` in every profile — injected here, mirroring the migrate-first
+guarantee in :func:`_resolve_stages`, so ``cfg.autopilot.profiles`` stays the
+literal operator-facing sequence.
 
 Failure semantics (spec §4.2): each independent stage runs in its own
 try/except and records its :class:`~ocbrain.maintenance.MaintenanceResult`-shaped
@@ -35,7 +46,11 @@ from ocbrain.db import now_iso
 from ocbrain.events import canonical_json, rebuild_projection
 from ocbrain.fsutil import file_fingerprint, file_lock, snapshot_sqlite
 from ocbrain.ids import stable_id
-from ocbrain.maintenance import heal_conflicts, prune_knowledge
+from ocbrain.maintenance import (
+    archive_unreferenced_catalog,
+    heal_conflicts,
+    prune_knowledge,
+)
 from ocbrain.promote import demote_and_decay, promote_to_memory
 from ocbrain.review import review_sessions
 from ocbrain.safeguards import (
@@ -54,6 +69,7 @@ STAGE_NAMES: tuple[str, ...] = (
     "review",
     "compile",
     "autolabel",
+    "embed",
     "tripwires",
     "promote",
     "maintain",
@@ -332,6 +348,25 @@ def stage_autolabel(ctx: AutopilotContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Stage 7b — embed (semantic vectors for attribution; v0.3)
+# --------------------------------------------------------------------------- #
+def stage_embed(ctx: AutopilotContext) -> dict[str, Any]:
+    """Embed pending knowledge rows for vector attribution (v0.3).
+
+    Runs after ``autolabel`` in every profile so freshly-labelled rows are
+    embeddable in the same cycle. ``embed_pending`` is self-limiting: it
+    early-returns a ``skipped`` summary when embedding is disabled, no API key is
+    present, or the daily USD cap is spent — so no network egress happens on
+    those paths. A dry run skips it entirely (the stage makes real egress calls).
+    """
+    if ctx.dry_run:
+        return {"action": "embed", "changed": 0, "skipped": "dry_run"}
+    from ocbrain.embed import embed_pending
+
+    return embed_pending(ctx.conn, ctx.cfg, now=ctx.now)
+
+
+# --------------------------------------------------------------------------- #
 # Stage 8 — tripwires
 # --------------------------------------------------------------------------- #
 def stage_tripwires(ctx: AutopilotContext) -> dict[str, Any]:
@@ -360,7 +395,26 @@ def stage_maintain(ctx: AutopilotContext) -> dict[str, Any]:
     pruned = prune_knowledge(ctx.conn, now=ctx.now).as_dict()
     healed = heal_conflicts(ctx.conn, now=ctx.now).as_dict()
     changed = int(pruned["changed"]) + int(healed["changed"])
-    return {"action": "maintain", "changed": changed, "prune": pruned, "heal": healed}
+    result: dict[str, Any] = {
+        "action": "maintain",
+        "changed": changed,
+        "prune": pruned,
+        "heal": healed,
+    }
+    # v0.3: sweep never-referenced stale catalog docs out of the working set so
+    # the judge + rebuild stop paying for the 101k-file backlog. Reversible
+    # (status flip only) and idempotent — already-archived rows are never
+    # re-selected. Off when cfg.archive.enabled is false.
+    if ctx.cfg.archive.enabled:
+        archived = archive_unreferenced_catalog(
+            ctx.conn,
+            older_than_days=ctx.cfg.archive.catalog_never_referenced_days,
+            batch_cap=ctx.cfg.archive.batch_cap,
+            now=ctx.now,
+        ).as_dict()
+        result["archive"] = archived
+        result["changed"] = changed + int(archived["changed"])
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -398,6 +452,7 @@ STAGES: dict[str, Callable[[AutopilotContext], dict[str, Any]]] = {
     "review": stage_review,
     "compile": stage_compile,
     "autolabel": stage_autolabel,
+    "embed": stage_embed,
     "tripwires": stage_tripwires,
     "promote": stage_promote,
     "maintain": stage_maintain,
@@ -452,6 +507,7 @@ def run_autopilot(
     db_path: Path | str | None = None,
     now: datetime | None = None,
     stages: list[str] | None = None,
+    profile: str | None = None,
     dry_run: bool = False,
     roots: list[str] | None = None,
     repos: list[str] | None = None,
@@ -459,10 +515,21 @@ def run_autopilot(
     """Run the autopilot pipeline under a single-instance lock (spec §4).
 
     ``stages`` restricts the run to a subset (``migrate`` is always run first so
-    the schema is present). Returns a summary dict; when the lock is held by
-    another instance, returns ``{"status": "locked"}`` immediately (spec §4.1).
+    the schema is present). ``profile`` selects a named stage sequence from
+    ``cfg.autopilot.profiles`` (v0.3) — ``light`` (fast, 15-min timer) or
+    ``heavy`` (full, hourly); the two are mutually exclusive with ``stages``.
+    Every profile gets the ``embed`` stage injected after ``autolabel``.
+
+    All profiles share one lock (``cfg.autopilot.profile_locks == "shared"``), so
+    when the lock is held by another instance this returns ``{"status":
+    "locked"}`` immediately (spec §4.1) and an overlapping light/heavy fire skips
+    cleanly. Returns a summary dict.
     """
     cfg = cfg or load_config()
+    if profile is not None:
+        if stages:
+            raise ValueError("pass either 'profile' or 'stages', not both")
+        stages = _resolve_profile_stages(cfg, profile)
     lock_path = _anchor_side_path(cfg.autopilot.lock_path, db_path)
     with file_lock(lock_path) as acquired:
         if not acquired:
@@ -557,6 +624,31 @@ def _run_locked(
         "error": run_error,
         "dry_run": dry_run,
     }
+
+
+def _resolve_profile_stages(cfg: OcbrainConfig, profile: str) -> list[str]:
+    """Resolve a named profile to its stage list, guaranteeing ``embed`` (v0.3).
+
+    ``cfg.autopilot.profiles`` carries the literal operator-facing sequences
+    (``light`` / ``heavy``). The ``embed`` stage runs after ``autolabel`` in every
+    profile, but is injected *here* rather than baked into the config literal so
+    the config stays the clean source of truth — the exact same discipline
+    :func:`_resolve_stages` uses to guarantee ``migrate`` runs first. Injection is
+    idempotent (a profile that already lists ``embed`` is left untouched) and only
+    applies to profiles that actually label (``autolabel`` present).
+
+    Final stage ordering is imposed by :func:`_resolve_stages` from
+    ``STAGE_NAMES``, so ``embed`` lands in its canonical slot (after ``autolabel``)
+    regardless of where it is inserted in the set here.
+    """
+    profiles = cfg.autopilot.profiles
+    if profile not in profiles:
+        known = ", ".join(sorted(profiles)) or "(none configured)"
+        raise ValueError(f"unknown profile {profile!r}; known profiles: {known}")
+    stages = list(profiles[profile])
+    if "embed" not in stages and "autolabel" in stages:
+        stages.insert(stages.index("autolabel") + 1, "embed")
+    return stages
 
 
 def _resolve_stages(stages: list[str] | None) -> list[str]:

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jonathangu.ocbrain.autopilot.heavy</string>
+  <!--
+    v0.3 HEAVY profile — the full cycle, hourly (StartInterval 3600).
+    Runs cfg.autopilot.profiles["heavy"]: snapshot → migrate → harvest →
+    injection_scan → review → compile → autolabel → embed → tripwires → promote →
+    maintain → dataset_mine → dataset_export. This is the expensive fold/mine/
+    export pass, moved off the fast timer so it never starves the light cycle.
+
+    Runs the SHARED env wrapper (not uv directly), passing the profile as an
+    argument the wrapper forwards via "$@". The wrapper sources the judge/embed
+    API key from a chmod 600 file outside the repo and sets OCBRAIN_DB +
+    OCBRAIN_CONFIG. The API key never appears in this plist. Light and heavy
+    contend for the SAME autopilot lock (cfg.autopilot.profile_locks == "shared"),
+    so if a heavy run is still going when either timer fires, that fire finds the
+    lock held and exits cleanly.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Users/guclaw/.openclaw/service-env/ocbrain-autopilot-env-wrapper.sh</string>
+    <string>--profile</string>
+    <string>heavy</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityBackgroundIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.heavy.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.heavy.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jonathangu.ocbrain.autopilot.light</string>
+  <!--
+    v0.3 LIGHT profile — the fast cycle, every 15 minutes (StartInterval 900).
+    Runs cfg.autopilot.profiles["light"]: migrate → review → autolabel → embed →
+    tripwires → promote → maintain. Skips snapshot/harvest/compile/dataset so it
+    finishes well inside its own timer (the old single full cycle ran 34–45 min
+    and overran a 30-min timer).
+
+    Runs the SHARED env wrapper (not uv directly), passing the profile as an
+    argument the wrapper forwards via "$@". The wrapper sources the judge/embed
+    API key from a chmod 600 file outside the repo and sets OCBRAIN_DB +
+    OCBRAIN_CONFIG. The API key never appears in this plist. Light and heavy
+    contend for the SAME autopilot lock (cfg.autopilot.profile_locks == "shared"),
+    so an overlapping fire finds the lock held and exits cleanly.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Users/guclaw/.openclaw/service-env/ocbrain-autopilot-env-wrapper.sh</string>
+    <string>--profile</string>
+    <string>light</string>
+  </array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityBackgroundIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.light.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.light.err.log</string>
+</dict>
+</plist>
