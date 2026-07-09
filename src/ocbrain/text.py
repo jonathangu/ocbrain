@@ -146,6 +146,16 @@ AFFIRMATION_RE = re.compile(
 )
 
 # (pattern, weight) correction cues. Weights accumulate and cap at 1.0.
+#
+# The trailing block of *implicit-correction* cues (v0.3) catches quote-and-fix
+# and soft-negation founder corrections that state the fix without the explicit
+# "wrong"/"incorrect" vocabulary the strong cues require — e.g. "it's actually
+# driven by Fly CI", "you wrote X, it should say Y". Each carries weight < 0.5 so
+# a lone implicit cue never crosses ``threshold`` on its own AND the pure-
+# affirmation zeroing below (which fires only when the strongest cue is < 0.5)
+# still neutralizes an incidental match inside praise ("it's really perfect").
+# They only reach a correction score by *accumulating* with another cue, which is
+# exactly the quote-and-fix shape.
 _CORRECTION_CUES: list[tuple[re.Pattern[str], float]] = [
     (re.compile(r"(?i)\b(that'?s |it'?s )?(wrong|incorrect|not right|not correct)\b"), 0.6),
     (re.compile(r"(?i)\b(that'?s not|not what i|didn'?t (ask|want)|that isn'?t)\b"), 0.5),
@@ -156,6 +166,15 @@ _CORRECTION_CUES: list[tuple[re.Pattern[str], float]] = [
     (re.compile(r"(?i)\b(don'?t|do not|stop|never|no longer)\b"), 0.3),
     (re.compile(r"(?i)\b(fix|redo|try again|correct(ion)?)\b"), 0.3),
     (re.compile(r"(?i)^\s*(no,|nope\b|no\b)"), 0.3),
+    # --- implicit-correction cues (v0.3, accumulate-only) ---
+    # "it's actually X" / "it's not X" / "it's supposed to be" — soft assertion of
+    # the fix without "wrong".
+    (re.compile(r"(?i)\bit'?s (actually|not|really|supposed|meant to be)\b"), 0.3),
+    # Quote-and-fix antecedent: the corrector cites what the assistant produced.
+    (re.compile(r"(?i)\byou (said|wrote|put|typed|had|called it|listed|meant)\b"), 0.3),
+    # "should say/read/use/return/point to X" — the fix stated as an imperative
+    # about content, which the "should be" cue above misses.
+    (re.compile(r"(?i)\bshould (say|read|use|return|point|have|go|include|match|show)\b"), 0.4),
 ]
 
 
