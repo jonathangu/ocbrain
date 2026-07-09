@@ -9,6 +9,11 @@ compiled current knowledge comes out. It is a librarian/compiler, not an
 autopilot. It never runs loops, enqueues work, applies policy, installs skills,
 or pushes irreversible change.
 
+For a full architecture walkthrough — the two-plane store, the five-movement
+pipeline, the 14-stage autopilot, the signal taxonomy, the safeguards, the
+privacy model, and the dataset factory — read
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## Core Model
 
 - `evidence`: immutable, append-only, hash-pinned claims about what happened.
