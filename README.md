@@ -46,16 +46,18 @@ Current surfaces:
 - SQLite ledger: `evidence`, `knowledge`, `knowledge_evidence`, `retrieval_uses`,
   `loop_liveness`, `family_scores`, `brain_events`, `current_beliefs`,
   `egress_audits`, and `memory`.
-- CLI: `evidence`, `value`, `knowledge`, `import-memory`, `import-history`,
-  `search`, `preview`, `event-ingest`, `event-compile`, `egress-preview`,
-  `event-correct`, `event-forget`, `event-dream`, `event-proposals`,
-  `event-decide`, `event-digest`, `event-teacher-request`, `event-backfill`,
-  `digest`, `loop-ingest`, `propose`, `mark-stale`, `prune`, `heal`,
-  `liveness-check`, and `mcp`.
+- CLI: `init`, `evidence`, `value`, `knowledge`, `import-memory`,
+  `import-history`, `search`, `preview`, `event-ingest`, `event-compile`,
+  `egress-preview`, `event-correct`, `event-forget`, `event-dream`,
+  `event-proposals`, `event-decide`, `event-digest`, `event-teacher-request`,
+  `event-backfill`, `digest`, `loop-ingest`, `mark-stale`, `prune`, `heal`,
+  `liveness-check`, `mcp`, `autopilot`, `quarantine`, `label`, `dataset-mine`,
+  `dataset-export`, `dataset-stats`, `public-safety-check`, and
+  `install-hooks`.
 - MCP: `brain.search`, `brain.preview`, `brain.egress_preview`, `brain.get`,
   `brain.teacher_request`, `brain.digest`, `brain.feedback`, write-gated
   `brain.ingest`, write-gated `brain.proposals`, write-gated `brain.forget`,
-  write-gated `brain.propose`, and write-gated `brain.mark_stale`.
+  and write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
   `brain://loop/families`.
 
@@ -296,6 +298,17 @@ deleting the audit trail. `heal` supersedes conflicting current values and
 writes correction evidence. `liveness-check` reads runner deadman rows and
 writes loop tripwire evidence such as `heartbeat_starved` or
 `no_ledger_writes`; it does not claim lanes or enqueue loop work.
+
+`ocbrain.stallcheck` is a separate, passive companion process on its own
+15-minute launchd timer, independent of the autopilot lock. It reads agent
+transcripts and runner tables (read-only) for a parked-and-forgotten turn — an
+`end_turn` left with a still-pending monitor, or a task output file opened but
+never closed — writes the finding as `loop_liveness` + tripwire evidence in
+the same ledger the liveness sweep reads, and can send a single deduplicated
+Telegram digest of new stalls when a local pager config is present. It also
+writes its own heartbeat row so a weekly review would notice if the watchdog
+itself stopped running. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for detail.
 
 ## Public safety
 

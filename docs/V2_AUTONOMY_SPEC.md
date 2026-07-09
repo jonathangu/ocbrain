@@ -1,5 +1,11 @@
 # ocbrain v0.2 — Autonomy + Dataset Factory Implementation Spec
 
+> **Historical design doc.** This is the approved v0.2 build spec, preserved as
+> a record of that implementation contract. The shipped system has since moved
+> to v0.3 (targeted judge, embeddings, the light/heavy autopilot split,
+> `excerpt_render`, the human-bootstrap pin, the stallcheck watchdog); for
+> current behavior read [`docs/ARCHITECTURE.md`](ARCHITECTURE.md).
+
 **Status:** APPROVED FOR BUILD (synthesized 2026-07-08 from Design A "autonomy+labeling" and Design B "dataset factory")
 **Owner mandate (Jonathan Gu, 2026-07-08, overrides prior human-gated doctrine):** ocbrain is dramatically upgraded, NOT human gated. It automatically compiles knowledge, labels good/bad, and over time builds the ultimate dataset for a fine-tuned "Jonathan Gu agent" LLM.
 

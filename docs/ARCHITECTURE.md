@@ -12,8 +12,12 @@ This document is the engineering companion to the public explainers:
 - **Safe & inspectable** — <https://openclawbrain.ai/proof/>
 
 and to the in-repo build spec [`docs/V2_AUTONOMY_SPEC.md`](V2_AUTONOMY_SPEC.md)
-(the approved implementation contract) and the top-level [`README.md`](../README.md).
-Where this doc summarizes, the spec is authoritative.
+(the approved v0.2 implementation contract, kept as a historical design
+record) and the top-level [`README.md`](../README.md). For v0.2-era detail —
+exact schema migration, module inventory, signal-fold math — the spec is
+authoritative. Everything the shipped system has added since v0.2 (targeted
+judge, embeddings, the light/heavy split, `excerpt_render`, the
+human-bootstrap pin, the stallcheck watchdog) is documented only here.
 
 ---
 
@@ -51,6 +55,7 @@ The durable, queryable spine:
 | `signal_events` | dated, weighted good/bad/neutral votes attached to knowledge (v0.2) |
 | `dataset_examples` / `dataset_sources` / `dataset_exports` | the dataset factory ledger (v0.2) |
 | `autopilot_runs` / `judge_runs` / `harvest_watermarks` | run telemetry + incremental cursors (v0.2) |
+| `embed_runs` | vector-embedding run telemetry + budget tracking (v0.3) |
 
 Knowledge has three types, split on one bright line — **readable vs. executable/prescriptive**:
 
@@ -267,6 +272,16 @@ lowest-score-first on overflow). A label flip to bad, a confidence drop below
 threshold, or a quarantine demotes immediately. `origin='human'` injected rows
 are pinned and never auto-demoted by score.
 
+**Human-bootstrap pin (v0.3).** A row admitted through the sparse-signal
+bootstrap path is stamped `origin='human_bootstrap'` and inherits the same
+exemption from *score* and *label-decay* demotion (a soft judge-bad label, low
+confidence, or use-rate decay). The pin is narrower than full `origin='human'`
+immunity, though: quarantine, a hard-bad fold (a hard human or founder
+correction), or an injection/secret-scan failure still eject a bootstrap row
+immediately — the pin never resurrects an ejected row. Each held exemption
+records a neutral `pin_demotion_exempt` breadcrumb, so the audit trail shows
+when the judge disagreed but the pin held.
+
 ---
 
 ## 7. The dataset factory
@@ -282,7 +297,14 @@ idempotent and carrying full provenance:
 - **DPO** (`format: openai-preference`) — preference pairs mined from
   corrections: a corrected first attempt (rejected) vs. the later accepted
   attempt (chosen), plus event-core pairs (edit decisions, corrections, heal
-  supersessions). Your corrections are the training signal.
+  supersessions). Your corrections are the training signal. A relaxed
+  structural pair gate (`dpo_relaxed_gate`, on by default in v0.3) admits a
+  pair on softer structural evidence where the strict gate would otherwise
+  reject a real correction. A separate, narrow `--founder-rescan` mode
+  bypasses — without ever clearing — the normal DPO watermark to re-mine
+  sessions containing a configured founder id under that relaxed gate;
+  content-hash and dedup-key dedup keep repeated rescans from producing
+  duplicate pairs.
 - **Persona** (`format: chat`) — voice examples where the single operator's own
   verified messages and authored commits are the assistant *target*, so a
   fine-tuned model learns your style, not a generic one. Founders and other
@@ -336,7 +358,7 @@ Four scopes, least to most restrictive: `private` → `workspace` → `project` 
   `egress_audits` row. Its verdict is just one more signal and can never override
   a hard human correction. **Targeted (v0.3):** the judge no longer grades the
   whole backlog. `judge.targeting` whitelists the knowledge origins it looks at
-  (retrieval-touched, lessons, session-derived) and excludes the 101k-file
+  (retrieval-touched, lessons, session-derived) and excludes the large
   catalog-doc backlog, so spend lands on rows a decision actually depends on
   rather than on inert file-catalog rows that no retrieval ever touches.
 - **Public-safety pre-push gate.** This is a public repo; runtime data is not.
@@ -365,8 +387,9 @@ into two named sequences in `cfg.autopilot.profiles`, each on its own launchd
 timer:
 
 - **`light` — every 15 min** (`StartInterval 900`): migrate → review → autolabel
-  → embed → tripwires → promote → maintain. The fast keep-current loop; skips
-  snapshot, harvest, compile, and the dataset mine/export.
+  → embed → tripwires → promote → excerpt_render → maintain. The fast
+  keep-current loop; skips snapshot, harvest, compile, and the dataset
+  mine/export.
 - **`heavy` — hourly** (`StartInterval 3600`): the full sequence below, including
   snapshot, harvest, compile, and the expensive fold/mine/export pass.
 
@@ -389,13 +412,15 @@ fire finds the lock held and exits cleanly instead of double-running.
 | 7b | **embed** (v0.3) | embed pending knowledge rows into vectors for semantic attribution (was FTS-only); self-skips when disabled / keyless / over the daily USD cap; audited egress | `embed_runs` + stored vectors |
 | 8 | **tripwires** | run the tripwire registry and auto-quarantine anything that fires | knowledge watermark |
 | 9 | **promote** | re-score, promote trustworthy rows into memory, demote what slipped, enforce the budget | deterministic re-rank |
+| 9b | **excerpt_render** (v0.3) | render the just-promoted injectable set into the `BEGIN/END OCBRAIN MANAGED BLOCK` of each configured runtime memory file — content outside the markers is untouched, and an unchanged block is not rewritten | idempotent block write; unchanged block skipped |
 | 10 | **maintain** | prune stale knowledge, heal conflicts (emitting supersession signals), and **archive never-referenced stale catalog docs** (v0.3) out of the working set | existing TTL logic + reversible status flip |
 | 11 | **dataset-mine** | mine SFT/DPO/persona from newly-settled history, time-budgeted | `dataset_sources` fingerprints + `UNIQUE` |
 | 12 | **dataset-export** | deterministically write the JSONL corpora + manifest, skipping if unchanged | `payload_hash` |
 | 13 | **finalize** | record the run in `autopilot_runs` (per-stage results or errors), release the lock | — |
 
-The `light` profile runs stages 2, 5, 7, 7b, 8, 9, 10; the `heavy` profile runs
-the full table. The `embed` stage always runs immediately after `autolabel` in
+The `light` profile runs stages 2, 5, 7, 7b, 8, 9, 9b, 10; the `heavy` profile
+runs the full table. The `embed` stage always runs immediately after
+`autolabel`, and `excerpt_render` always runs immediately after `promote`, in
 every profile.
 
 ### 9.1 Abort vs. partial
@@ -424,6 +449,22 @@ later stage assumes a snapshotted, migrated DB.
 - **Watermarks in-transaction.** Each watermark is written in the same
   transaction as the work it covers, so a kill mid-run loses no committed
   progress and re-runs resume cleanly.
+
+### 9.3 The stall watchdog (companion process, v0.3)
+
+`ocbrain.stallcheck` is a separate, passive process on its own launchd timer
+(every 15 minutes) — it does not share the autopilot lock or its cadence, and
+it never writes knowledge or evidence rows. Each pass reads, read-only:
+agent-workflow transcripts, for an `end_turn` left with a still-pending
+monitor/background-task call, or a task output file opened but never closed;
+and the runner ledger, for lost or stalled task runs and failed inbound
+message handling. A finding upserts a `loop_liveness` row and a
+`loop_tripwire` evidence row into the same brain DB the liveness sweep and
+weekly review already read, and — if a local pager configuration is present —
+sends a single, deduplicated Telegram digest of any *new* stalls so a
+persistent stall pages once, not repeatedly. The checker also writes its own
+heartbeat row (`loop_id='stallcheck'`) so the weekly review notices if the
+watchdog itself stops running.
 
 ---
 
