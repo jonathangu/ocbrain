@@ -240,9 +240,200 @@ def record_tombstone(
     return event_id
 
 
-def rebuild_projection(conn: sqlite3.Connection, *, at_ts: str | None = None) -> None:
-    projected = fold_projection(conn, at_ts=at_ts)
-    replace_projection(conn, projected)
+def rebuild_projection(
+    conn: sqlite3.Connection, *, full: bool = False, at_ts: str | None = None
+) -> None:
+    """Refresh ``current_beliefs`` from the event log.
+
+    The default path is incremental: fold only events with ``rowid`` greater than
+    the stored ``projection_cursor`` and update the touched beliefs in place,
+    advancing the cursor atomically in the same transaction as the belief writes.
+    It transparently falls back to a full rebuild whenever the cursor is missing,
+    ahead of the log, or the hash chain over the consumed range fails verification.
+
+    ``full=True`` forces the full DELETE/INSERT fold over every event. ``at_ts``
+    requests a point-in-time fold; it is always a full time-travel rebuild and does
+    not touch the head cursor (the cursor tracks the live head, not a snapshot).
+    """
+    if at_ts is not None:
+        replace_projection(conn, fold_projection(conn, at_ts=at_ts))
+        return
+    if full or not _incremental_projection(conn):
+        _full_rebuild(conn)
+
+
+def _full_rebuild(conn: sqlite3.Connection) -> None:
+    replace_projection(conn, fold_projection(conn))
+    _set_projection_cursor(conn, _max_event_rowid(conn))
+
+
+def _incremental_projection(conn: sqlite3.Connection) -> bool:
+    """Fold events after the cursor into ``current_beliefs`` in place.
+
+    Returns ``True`` when the incremental fold ran to completion (cursor advanced),
+    ``False`` when it declined and the caller must fall back to a full rebuild.
+    """
+    cursor = _read_projection_cursor(conn)
+    if cursor is None:
+        return False
+    max_rowid = _max_event_rowid(conn)
+    if cursor > max_rowid:
+        return False
+    consumed = conn.execute(
+        "SELECT rowid AS rid, * FROM brain_events WHERE rowid > ? ORDER BY rowid ASC",
+        (cursor,),
+    ).fetchall()
+    if not consumed:
+        return True
+    if not _verify_chain_range(conn, cursor, consumed):
+        return False
+    projected = _load_projection(conn)
+    proposals: dict[str, dict[str, Any]] = {}
+    touched: set[str] = set()
+    for event in consumed:
+        body = json.loads(event["body_json"])
+        kind = event["kind"]
+        if kind == "compilation_proposed":
+            proposals[event["id"]] = {"event": event, "body": body}
+        elif kind == "compilation_decided":
+            _ensure_proposal_loaded(conn, body.get("proposal_event_id"), proposals)
+            _track(apply_decision(event, body, proposals, projected), touched)
+        elif kind == "correction_recorded":
+            _track(apply_correction(event, body, projected), touched)
+        elif kind == "tombstone_recorded":
+            _track(apply_tombstone(event, body, projected), touched)
+        elif kind == "scope_promoted":
+            _track(apply_scope_promotion(event, body, projected), touched)
+    for belief_id in touched:
+        _write_belief_row(conn, belief_id, projected[belief_id])
+    _set_projection_cursor(conn, consumed[-1]["rid"])
+    return True
+
+
+def _track(belief_id: str | None, touched: set[str]) -> None:
+    if belief_id is not None:
+        touched.add(belief_id)
+
+
+def _ensure_proposal_loaded(
+    conn: sqlite3.Connection,
+    proposal_event_id: str | None,
+    proposals: dict[str, dict[str, Any]],
+) -> None:
+    """Hydrate a proposal that predates the consumed range from the event log.
+
+    In a full fold every proposal is already in the in-memory ``proposals`` map;
+    incrementally a decision may reference a proposal recorded before the cursor,
+    so fetch its body by event id. ``event`` is left ``None`` because
+    :func:`apply_decision` only ever reads the proposal body.
+    """
+    if not proposal_event_id or proposal_event_id in proposals:
+        return
+    row = conn.execute(
+        "SELECT body_json FROM brain_events WHERE id = ?", (proposal_event_id,)
+    ).fetchone()
+    if row is not None:
+        proposals[proposal_event_id] = {
+            "event": None,
+            "body": json.loads(row["body_json"]),
+        }
+
+
+def _read_projection_cursor(conn: sqlite3.Connection) -> int | None:
+    row = conn.execute(
+        "SELECT last_event_rowid FROM projection_cursor WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return row["last_event_rowid"]
+
+
+def _set_projection_cursor(conn: sqlite3.Connection, rowid: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO projection_cursor (id, last_event_rowid, updated_at)
+        VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          last_event_rowid = excluded.last_event_rowid,
+          updated_at = excluded.updated_at
+        """,
+        (rowid, now_iso()),
+    )
+
+
+def _max_event_rowid(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT MAX(rowid) AS m FROM brain_events").fetchone()
+    return row["m"] or 0
+
+
+def _verify_chain_range(
+    conn: sqlite3.Connection, since_rowid: int, consumed: list[sqlite3.Row]
+) -> bool:
+    """Opportunistically verify the hash chain over the consumed event range.
+
+    Recomputes each event hash from its stored fields, checks body_hash integrity,
+    and confirms prev_hash links back — including the boundary link to the event at
+    ``since_rowid``. Any mismatch returns ``False`` so the caller full-rebuilds.
+    """
+    if since_rowid > 0:
+        anchor = conn.execute(
+            "SELECT event_hash FROM brain_events WHERE rowid = ?", (since_rowid,)
+        ).fetchone()
+        if anchor is None:
+            return False
+        prev = anchor["event_hash"]
+    else:
+        prev = None
+    for event in consumed:
+        if event["prev_hash"] != prev:
+            return False
+        if event["body_hash"] != sha256_text(event["body_json"]):
+            return False
+        recomputed = sha256_text(
+            canonical_json(
+                {
+                    "ts": event["ts"],
+                    "kind": event["kind"],
+                    "writer": event["writer"],
+                    "session_id": event["session_id"],
+                    "body_hash": event["body_hash"],
+                    "prev_hash": event["prev_hash"],
+                }
+            )
+        )
+        if event["event_hash"] != recomputed:
+            return False
+        prev = event["event_hash"]
+    return True
+
+
+def _load_projection(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """Deserialize ``current_beliefs`` back into the in-memory fold structure.
+
+    This is the exact inverse of :func:`_write_belief_row` for every field that
+    replace/write persist; ``confidence_band`` is derived on write so it is not
+    reloaded, and the scope ``provenance`` field is never persisted so it is not
+    reconstructed (neither is read by the fold or the writer).
+    """
+    projected: dict[str, dict[str, Any]] = {}
+    for row in conn.execute("SELECT * FROM current_beliefs"):
+        projected[row["belief_id"]] = {
+            "body": row["body"],
+            "scope": {
+                "scope_type": row["scope_type"],
+                "scope_id": row["scope_id"],
+                "visibility": row["visibility"],
+                "egress_policy": row["egress_policy"],
+            },
+            "confidence": row["confidence"],
+            "evidence_ids": json.loads(row["evidence_ids"]),
+            "status": row["status"],
+            "pinned": bool(row["pinned"]),
+            "approved_event_id": row["approved_event_id"],
+            "last_event_id": row["last_event_id"],
+            "last_compiled_at": row["last_compiled_at"],
+        }
+    return projected
 
 
 def fold_projection(
@@ -251,7 +442,6 @@ def fold_projection(
     events = list(iter_events(conn, at_ts=at_ts))
     proposals: dict[str, dict[str, Any]] = {}
     projected: dict[str, dict[str, Any]] = {}
-    tombstoned_targets: set[str] = set()
 
     for event in events:
         body = json.loads(event["body_json"])
@@ -263,14 +453,7 @@ def fold_projection(
         elif kind == "correction_recorded":
             apply_correction(event, body, projected)
         elif kind == "tombstone_recorded":
-            target = body["target"]
-            tombstoned_targets.add(target)
-            if target in projected:
-                projected[target]["status"] = "tombstoned"
-                if body.get("mode") == "shred":
-                    projected[target]["body"] = "[shredded by tombstone]"
-                    projected[target]["evidence_ids"] = []
-                projected[target]["last_event_id"] = event["id"]
+            apply_tombstone(event, body, projected)
         elif kind == "scope_promoted":
             apply_scope_promotion(event, body, projected)
 
@@ -280,32 +463,44 @@ def fold_projection(
 def replace_projection(conn: sqlite3.Connection, projected: dict[str, dict[str, Any]]) -> None:
     conn.execute("DELETE FROM current_beliefs")
     for belief_id, row in projected.items():
-        conn.execute(
-            """
-            INSERT INTO current_beliefs (
-              belief_id, body, scope_type, scope_id, visibility, egress_policy,
-              confidence, confidence_band, evidence_ids, status, pinned,
-              approved_event_id, last_event_id, last_compiled_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                belief_id,
-                row["body"],
-                row["scope"]["scope_type"],
-                row["scope"]["scope_id"],
-                row["scope"]["visibility"],
-                row["scope"]["egress_policy"],
-                row["confidence"],
-                confidence_band(row["confidence"]),
-                canonical_json(row["evidence_ids"]),
-                row["status"],
-                1 if row["pinned"] else 0,
-                row["approved_event_id"],
-                row["last_event_id"],
-                row["last_compiled_at"],
-            ),
+        _write_belief_row(conn, belief_id, row)
+
+
+def _write_belief_row(
+    conn: sqlite3.Connection, belief_id: str, row: dict[str, Any]
+) -> None:
+    """Serialize one folded belief into ``current_beliefs``.
+
+    Single source of truth for the row encoding so the full rebuild and the
+    incremental upsert produce byte-identical rows. ``INSERT OR REPLACE`` lets the
+    incremental path update a belief already present from an earlier fold.
+    """
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO current_beliefs (
+          belief_id, body, scope_type, scope_id, visibility, egress_policy,
+          confidence, confidence_band, evidence_ids, status, pinned,
+          approved_event_id, last_event_id, last_compiled_at
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            belief_id,
+            row["body"],
+            row["scope"]["scope_type"],
+            row["scope"]["scope_id"],
+            row["scope"]["visibility"],
+            row["scope"]["egress_policy"],
+            row["confidence"],
+            confidence_band(row["confidence"]),
+            canonical_json(row["evidence_ids"]),
+            row["status"],
+            1 if row["pinned"] else 0,
+            row["approved_event_id"],
+            row["last_event_id"],
+            row["last_compiled_at"],
+        ),
+    )
 
 
 def projected_rows_as_of(conn: sqlite3.Connection, *, at_ts: str) -> list[dict[str, Any]]:
@@ -811,13 +1006,14 @@ def apply_decision(
     decision_body: dict[str, Any],
     proposals: dict[str, dict[str, Any]],
     projected: dict[str, dict[str, Any]],
-) -> None:
+) -> str | None:
+    """Apply a compilation decision. Returns the touched belief_id, or None."""
     proposal = proposals.get(decision_body["proposal_event_id"])
     if proposal is None:
-        return
+        return None
     decision = decision_body["decision"]
     if decision not in {"approve", "edit"}:
-        return
+        return None
     proposal_body = proposal["body"]
     belief_id = proposal_body["belief_id"]
     body = decision_body.get("edited_body") or proposal_body["body"]
@@ -832,18 +1028,20 @@ def apply_decision(
         "last_event_id": event["id"],
         "last_compiled_at": event["ts"],
     }
+    return belief_id
 
 
 def apply_correction(
     event: sqlite3.Row,
     correction: dict[str, Any],
     projected: dict[str, dict[str, Any]],
-) -> None:
+) -> str | None:
+    """Apply a correction to an existing belief. Returns the touched belief_id, or None."""
     if correction["target_layer"] not in {"knowledge", "belief"}:
-        return
+        return None
     belief = projected.get(correction["target_id"])
     if belief is None:
-        return
+        return None
     op = correction["op"]
     if op in {"edit", "reframe"} and correction.get("body"):
         belief["body"] = correction["body"]
@@ -855,19 +1053,41 @@ def apply_correction(
     elif op in {"mark_wrong", "retract"}:
         belief["status"] = "retracted"
     belief["last_event_id"] = event["id"]
+    return correction["target_id"]
+
+
+def apply_tombstone(
+    event: sqlite3.Row,
+    body: dict[str, Any],
+    projected: dict[str, dict[str, Any]],
+) -> str | None:
+    """Apply a tombstone to an existing belief. Returns the touched belief_id, or None."""
+    target = body["target"]
+    belief = projected.get(target)
+    if belief is None:
+        return None
+    belief["status"] = "tombstoned"
+    if body.get("mode") == "shred":
+        belief["body"] = "[shredded by tombstone]"
+        belief["evidence_ids"] = []
+    belief["last_event_id"] = event["id"]
+    return target
 
 
 def apply_scope_promotion(
     event: sqlite3.Row,
     body: dict[str, Any],
     projected: dict[str, dict[str, Any]],
-) -> None:
+) -> str | None:
+    """Apply a scope promotion to an existing belief. Returns the touched belief_id, or None."""
     belief = projected.get(body.get("belief_id"))
     if belief is None:
-        return
+        return None
     if body.get("approved_by"):
         belief["scope"] = ScopeTag.from_dict(body["scope"]).to_dict()
         belief["last_event_id"] = event["id"]
+        return body.get("belief_id")
+    return None
 
 
 def confidence_band(confidence: float | None) -> str:
