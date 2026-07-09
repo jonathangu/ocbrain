@@ -372,16 +372,34 @@ def judge_ambiguous(
     }
 
 
+def _supports_custom_temperature(model: str) -> bool:
+    """Whether ``model`` accepts a non-default ``temperature``.
+
+    GPT-5 and the o-series reasoning models only support the default
+    ``temperature`` (1); sending ``temperature: 0`` returns HTTP 400
+    ``unsupported_value``. For those we omit the field entirely.
+    """
+    name = model.lower()
+    return not (
+        name.startswith("gpt-5")
+        or name.startswith("o1")
+        or name.startswith("o3")
+        or name.startswith("o4")
+    )
+
+
 def _build_payload(cfg: Any, model: str, included: list[dict[str, Any]]) -> dict[str, Any]:
     items = [{"id": item["id"], "text": item["text"]} for item in included]
-    return {
+    payload: dict[str, Any] = {
         "model": model,
-        "temperature": 0,
         "messages": [
             {"role": "system", "content": _JUDGE_SYSTEM},
             {"role": "user", "content": json.dumps(items)},
         ],
     }
+    if _supports_custom_temperature(model):
+        payload["temperature"] = 0
+    return payload
 
 
 def _write_egress_audit(

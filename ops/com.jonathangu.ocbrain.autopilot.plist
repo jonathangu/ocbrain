@@ -4,28 +4,24 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.jonathangu.ocbrain.autopilot</string>
+  <!--
+    Runs the env wrapper, NOT uv directly. The wrapper sources the judge API key
+    from a chmod 600 file outside the repo, sets OCBRAIN_DB + OCBRAIN_CONFIG, and
+    execs `uv run ocbrain autopilot`. The API key never appears in this plist.
+  -->
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/uv</string>
-    <string>run</string>
-    <string>--directory</string>
-    <string>/Users/guclaw/.openclaw/workspace/ocbrain</string>
-    <string>ocbrain</string>
-    <string>autopilot</string>
+    <string>/bin/sh</string>
+    <string>/Users/guclaw/.openclaw/service-env/ocbrain-autopilot-env-wrapper.sh</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>OCBRAIN_DB</key>
-    <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/ocbrain.sqlite</string>
-  </dict>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><false/>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityBackgroundIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/logs/autopilot.log</string>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/logs/autopilot.err.log</string>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.err.log</string>
 </dict>
 </plist>
