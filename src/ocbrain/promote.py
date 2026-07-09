@@ -11,6 +11,15 @@ approval signal. Eligible rows are ranked by ``promote_score``; the top
 by score. Decay halves the score of memory served-but-never-useful within the
 decay window; demotion drops inject on rows that turn bad/low-confidence or get
 quarantined.
+
+Human-memory bootstrap rows (v0.3) are stamped ``origin='human_bootstrap'`` when
+injected and share the human-origin pin against score / label-decay demotion
+(low quality_confidence, bad-ish judge labels, use_rate decay). They are NOT
+immune to eviction: quarantine (any tripwire), a hard-bad fold (hard human /
+founder correction), or an injection/secret-scan failure still eject them
+immediately. Every held exemption is counted in the stage result and recorded as
+a neutral ``pin_demotion_exempt`` breadcrumb so the audit trail shows the judge
+disagreed but the pin held.
 """
 
 from __future__ import annotations
@@ -19,13 +28,21 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ocbrain.autolabel import USEFUL_OUTCOMES
+from ocbrain.autolabel import USEFUL_OUTCOMES, Signal, record_signal
 from ocbrain.db import SCOPE_RANK, knowledge_evidence, now_iso
 from ocbrain.excerpt import build_excerpt
 from ocbrain.text import find_probable_injection, find_probable_secret_leaks
 
 APPROVAL_KINDS = ("user_approval", "user_thanks")
 RUNTIME = "ocbrain-autopilot"
+
+# Pin origins exempt from *score* and *label-decay* demotion (§5.7). ``human`` is
+# fully pinned; ``human_bootstrap`` is stamped on rows the human-memory bootstrap
+# injects (v0.3) so they inherit the same score/label-decay exemption WITHOUT the
+# blanket quarantine immunity — a bootstrap pin still yields to quarantine, a
+# hard-bad fold, or an injection/secret-scan failure (see ``demote_and_decay``).
+BOOTSTRAP_ORIGIN = "human_bootstrap"
+PINNED_ORIGINS = ("human", BOOTSTRAP_ORIGIN)
 
 
 # --------------------------------------------------------------------------- #
@@ -185,13 +202,57 @@ def _has_bootstrap_source(
     return row is not None
 
 
+def _has_hard_bad_signal(
+    conn: sqlite3.Connection, knowledge_id: str, cfg: Any
+) -> bool:
+    """True if a hard-bad signal targets this row (§5.3 hard-bad precedence).
+
+    Mirrors the fold's rule exactly: any ``bad`` signal whose weight reaches
+    ``labels.hard_bad_weight`` — a hard human correction, or a founder correction
+    heavy enough to fold hard-bad. The judge's ordinary weight-0.4 ``llm_judge``
+    votes never reach this bar, so a soft judge ``bad`` does NOT trip it.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM signal_events "
+        "WHERE knowledge_id = ? AND polarity = 'bad' AND weight >= ? LIMIT 1",
+        (knowledge_id, float(cfg.labels.hard_bad_weight)),
+    ).fetchone()
+    return row is not None
+
+
+def _record_pin_exemption(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    """Breadcrumb: a bootstrap pin held against a soft demotion this cycle.
+
+    A neutral, weight-0 ``pin_demotion_exempt`` signal — inert to the label fold,
+    idempotent per (row, overridden label) via ``record_signal``'s stable id — so
+    the audit trail shows the judge disagreed but the pin held.
+    """
+    record_signal(
+        conn,
+        Signal(
+            kind="pin_demotion_exempt",
+            polarity="neutral",
+            weight=0.0,
+            source="ocbrain-promote",
+            source_ref=f"pin/{row['id']}",
+            knowledge_id=row["id"],
+            details={
+                "origin": BOOTSTRAP_ORIGIN,
+                "overridden_label": row["quality_label"],
+            },
+        ),
+    )
+
+
 def human_bootstrap_eligible(
     conn: sqlite3.Connection, row: sqlite3.Row, cfg: Any, sources: set[str]
 ) -> bool:
     """A curated human-memory row may earn ``inject=1`` WITHOUT a judge label.
 
     Still gated by the injection/secret scan and the risky-class rule (§5.7); the
-    char budget is enforced afterwards by :func:`_enforce_char_budget`.
+    char budget is enforced afterwards by :func:`_enforce_char_budget`. A
+    hard-bad fold (hard human / founder correction) revokes eligibility so the
+    bootstrap re-promotion can never resurrect an ejected row.
     """
     if row["status"] != "current" or row["quarantine_reason"] is not None:
         return False
@@ -200,6 +261,8 @@ def human_bootstrap_eligible(
     if not injection_clean(conn, row):
         return False
     if _risky_row(conn, row):
+        return False
+    if _has_hard_bad_signal(conn, row["id"], cfg):
         return False
     return True
 
@@ -249,6 +312,13 @@ def promote_to_memory(
         for row in bootstrap[:hb_cap]:
             selected.append(row)
             selected_ids.add(row["id"])
+            # Stamp the bootstrap pin so later demotion passes recognise it. Never
+            # clobber a stronger ``human`` origin (or a pin already stamped).
+            if row["origin"] not in PINNED_ORIGINS:
+                conn.execute(
+                    "UPDATE knowledge SET origin = ? WHERE id = ?",
+                    (BOOTSTRAP_ORIGIN, row["id"]),
+                )
 
     promoted = 0
     demoted = 0
@@ -263,7 +333,7 @@ def promote_to_memory(
         if (
             row["inject"] == 1
             and row["id"] not in selected_ids
-            and row["origin"] != "human"
+            and row["origin"] not in PINNED_ORIGINS
         ):
             conn.execute(
                 "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
@@ -290,7 +360,8 @@ def _enforce_char_budget(conn: sqlite3.Connection, cfg: Any, runtime: str) -> in
         victim = conn.execute(
             """
             SELECT id FROM knowledge
-            WHERE status = 'current' AND inject = 1 AND origin != 'human'
+            WHERE status = 'current' AND inject = 1
+              AND origin NOT IN ('human', 'human_bootstrap')
             ORDER BY COALESCE(promote_score, -1) ASC, id ASC
             LIMIT 1
             """
@@ -313,12 +384,33 @@ def demote_and_decay(
     """Drop inject on turned-bad rows; halve score of stale-served memory (§5.7)."""
     now = now or datetime.now(UTC)
     demoted = 0
+    exempted = 0
     for row in conn.execute(
         "SELECT * FROM knowledge WHERE inject = 1 AND origin != 'human'"
     ).fetchall():
+        quarantined = row["quarantine_reason"] is not None
+        if row["origin"] == BOOTSTRAP_ORIGIN:
+            # Bootstrap pin (§5.7): exempt from soft score/label-decay demotion,
+            # but never from quarantine, a hard-bad fold, or a scan failure.
+            hard = _has_hard_bad_signal(conn, row["id"], cfg)
+            scan_fail = not injection_clean(conn, row)
+            if quarantined or hard or scan_fail:
+                conn.execute(
+                    "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
+                    (now_iso(), row["id"]),
+                )
+                demoted += 1
+                continue
+            soft_bad = row["quality_label"] in ("bad", "neutral") or (
+                row["quality_confidence"] is not None
+                and row["quality_confidence"] < 0.4
+            )
+            if soft_bad:
+                _record_pin_exemption(conn, row)
+                exempted += 1
+            continue
         bad_label = row["quality_label"] in ("bad", "neutral")
         low_conf = row["quality_confidence"] is not None and row["quality_confidence"] < 0.4
-        quarantined = row["quarantine_reason"] is not None
         if bad_label or low_conf or quarantined:
             conn.execute(
                 "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
@@ -330,7 +422,9 @@ def demote_and_decay(
     cutoff = (now - timedelta(days=cfg.promote.decay_days)).isoformat()
     for row in conn.execute(
         "SELECT id, promote_score FROM knowledge "
-        "WHERE status = 'current' AND promote_score IS NOT NULL"
+        "WHERE status = 'current' AND promote_score IS NOT NULL "
+        "AND origin != ?",
+        (BOOTSTRAP_ORIGIN,),
     ).fetchall():
         served = conn.execute(
             "SELECT COUNT(*) FROM retrieval_uses WHERE knowledge_id = ? AND served_at >= ?",
@@ -356,6 +450,7 @@ def demote_and_decay(
         "changed": demoted + decayed,
         "demoted": demoted,
         "decayed": decayed,
+        "exempted": exempted,
     }
 
 
