@@ -24,6 +24,7 @@ from ocbrain.dataset.transcripts import (
     iter_unmined_transcripts,
     parse_transcript,
 )
+from ocbrain.fsutil import ParseCache, db_side_dir
 
 __all__ = [
     "DpoPair",
@@ -67,7 +68,16 @@ def mine_all(
     cfg = cfg or load_config()
     roots = roots if roots is not None else list(cfg.review.session_roots)
     budget = None if time_budget_seconds is None else time_budget_seconds / 3.0
-    sft = mine_sft(conn, cfg=cfg, roots=roots, time_budget_seconds=budget)
+    # One run-shared parse memo so the three miners don't independently read +
+    # normalize the same new/changed transcript (up to 3x → 1x when they parse
+    # with identical options, e.g. no founder configured). Anchored beside the
+    # live SQLite DB so tmp-DB tests keep it out of the live data/ tree.
+    cache = ParseCache(db_side_dir(conn, "parse_cache"))
+    sft = mine_sft(conn, cfg=cfg, roots=roots, time_budget_seconds=budget, parse_cache=cache)
+    # NOTE: mine_dpo (owned by the v3/dpo lane) does not yet accept parse_cache,
+    # so its parse of each new/changed file is not shared. Reported as a
+    # cross-lane follow-up: adding a ``parse_cache`` param to mine_dpo mirroring
+    # this call closes the last third of the within-run re-parse.
     dpo = mine_dpo(conn, cfg=cfg, roots=roots, time_budget_seconds=budget)
     persona = mine_persona(
         conn,
@@ -76,5 +86,6 @@ def mine_all(
         repos=repos,
         verified_only=verified_only,
         time_budget_seconds=budget,
+        parse_cache=cache,
     )
     return {"ok": True, "sft": sft, "dpo": dpo, "persona": persona}

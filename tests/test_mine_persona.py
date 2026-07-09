@@ -145,3 +145,75 @@ def test_mine_persona_end_to_end(tmp_path: Path):
         )
     ]
     assert "git_commit" in labels and "openclaw_session" in labels
+
+
+def _write_openclaw_session(root: Path, sid: str, *messages: dict) -> Path:
+    import json
+
+    path = root / "agents" / "main" / "sessions" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [{"type": "session", "id": sid, "version": 1, "cwd": "/w",
+              "timestamp": "2026-07-01T00:00:00Z"}]
+    for msg in messages:
+        lines.append({"type": "message", "message": msg})
+    path.write_text("\n".join(json.dumps(o) for o in lines), encoding="utf-8")
+    return path
+
+
+def _persona_corpus(root: Path, n: int) -> None:
+    for i in range(n):
+        _write_openclaw_session(
+            root, f"p{i}",
+            {"role": "assistant", "content": AGENT_PROMPT},
+            # unique per file so each stores (identical text would near-dup dedup)
+            {"role": "user", "content": f"{JON_MSG} Round {i} is a go on our side."},
+        )
+
+
+def test_mine_persona_roots_incremental_second_pass_zero_parses(tmp_path: Path):
+    """Spec proof: persona is now watermark-gated — the re-scan every run is gone.
+
+    Before v0.3 mine_persona used iter_transcript_files and re-parsed EVERY
+    transcript on every run; here the second unchanged pass parses zero files.
+    """
+    from ocbrain.fsutil import ParseCache
+
+    conn = _conn(tmp_path)
+    root = tmp_path / "corpus"
+    _persona_corpus(root, 3)
+
+    first = ParseCache()
+    r1 = mine_persona(conn, cfg=CFG, roots=[str(root)], repos=[], parse_cache=first)
+    assert r1["files_mined"] == 3
+    assert first.parses == 3
+    assert r1["stored"] == 3  # one bare persona target per file (agent 'main')
+
+    second = ParseCache()
+    r2 = mine_persona(conn, cfg=CFG, roots=[str(root)], repos=[], parse_cache=second)
+    assert r2["files_mined"] == 0  # nothing re-scanned
+    assert second.parses == 0  # ZERO re-parses of unchanged transcripts
+
+
+def test_mine_persona_and_sft_share_one_parse_per_file(tmp_path: Path):
+    """Run-shared memo: with no founder configured, SFT + persona parse each
+    new file ONCE total, not once per miner."""
+    from ocbrain.dataset.mine_sft import mine_sft
+    from ocbrain.fsutil import ParseCache
+
+    conn = _conn(tmp_path)
+    root = tmp_path / "corpus"
+    # Files that yield BOTH an SFT exchange and a persona target.
+    for i in range(3):
+        _write_openclaw_session(
+            root, f"m{i}",
+            {"role": "user", "content": f"please run release checklist {i} for tonight"},
+            {"role": "assistant", "content":
+                "This is a sufficiently long assistant answer that clears the SFT floor cleanly."},
+            {"role": "user", "content": JON_MSG},
+        )
+    cache = ParseCache()
+    mine_sft(conn, cfg=CFG, roots=[str(root)], parse_cache=cache)
+    mine_persona(conn, cfg=CFG, roots=[str(root)], repos=[], parse_cache=cache)
+    # SFT parsed 3 (cold); persona reused all 3 from the shared memo → still 3.
+    assert cache.parses == 3
+    assert cache.hits == 3

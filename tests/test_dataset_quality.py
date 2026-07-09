@@ -103,3 +103,67 @@ def test_store_near_dup_keeps_first(tmp_path: Path):
     second = _store(conn, CLEAN_TARGET + " !!!")
     assert second["quality_label"] == "excluded"
     assert "near_dup" in second["quality_reasons"]
+
+
+# --- ParseCache / DB-anchored side dir (v0.3 incremental mining) --------------
+
+
+def test_parse_cache_memoizes_and_counts():
+    from ocbrain.fsutil import ParseCache
+
+    cache = ParseCache()  # memory-only
+    calls = {"n": 0}
+
+    def loader():
+        calls["n"] += 1
+        return {"parsed": calls["n"]}
+
+    a = cache.get("k1", loader)
+    b = cache.get("k1", loader)  # hit — loader not called again
+    assert a is b
+    assert calls["n"] == 1
+    assert cache.parses == 1 and cache.hits == 1
+    cache.get("k2", loader)  # distinct key → second parse
+    assert cache.parses == 2
+
+
+def test_parse_cache_lru_evicts_over_cap():
+    from ocbrain.fsutil import ParseCache
+
+    cache = ParseCache(max_entries=2)
+    for k in ("a", "b", "c"):  # inserting 'c' evicts LRU 'a'
+        cache.get(k, lambda k=k: k)
+    assert cache.parses == 3
+    cache.get("a", lambda: "a")  # 'a' was evicted → re-parses
+    assert cache.parses == 4
+
+
+def test_parse_cache_disk_survives_new_instance(tmp_path: Path):
+    from ocbrain.fsutil import ParseCache
+
+    side = tmp_path / "parse_cache"
+    first = ParseCache(side)
+    first.get("k", lambda: {"v": 42})
+    assert first.parses == 1
+
+    # A fresh instance (e.g. a separate miner process) reuses the on-disk entry.
+    second = ParseCache(side)
+    got = second.get("k", lambda: {"v": -1})
+    assert got == {"v": 42}
+    assert second.parses == 0 and second.hits == 1
+
+
+def test_db_side_dir_anchors_to_db_file_and_is_none_for_memory(tmp_path: Path):
+    import sqlite3
+
+    from ocbrain.fsutil import db_side_dir
+
+    conn = connect(tmp_path / "db.sqlite")
+    side = db_side_dir(conn, "parse_cache")
+    assert side is not None
+    # Anchored beside the DB file, inside the tmp tree (never the live data/ tree).
+    assert side == tmp_path / "db.sqlite.cache" / "parse_cache"
+    assert str(side).startswith(str(tmp_path))
+
+    mem = sqlite3.connect(":memory:")  # a true in-memory DB has no file anchor
+    assert db_side_dir(mem, "parse_cache") is None
