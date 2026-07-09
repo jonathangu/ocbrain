@@ -13,6 +13,8 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -601,3 +603,111 @@ def test_mcp_non_lock_error_not_retried(monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         mcp._call_tool_with_lock_retry(_FakeConn(), {"name": "brain.ingest"})
     assert calls["n"] == 1  # not retried
+
+
+# --- stallcheck brain-write lock-retry patch (mirrors mcp.py exactly) ----------
+def test_stallcheck_retries_on_database_locked(monkeypatch):
+    calls = {"n": 0}
+
+    def flaky_write(x):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return x + 1
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(stallcheck.time, "sleep", lambda s: sleeps.append(s))
+
+    conn = _FakeConn()
+    result = stallcheck._write_with_lock_retry(conn, flaky_write, 41)
+    assert result == 42
+    assert calls["n"] == 3
+    assert sleeps == [0.25, 0.25]
+    assert conn.rollbacks == 2  # rolled back before each retry
+
+
+def test_stallcheck_reraises_after_exhausting_retries(monkeypatch):
+    def always_locked():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(stallcheck.time, "sleep", lambda s: None)
+    with pytest.raises(sqlite3.OperationalError):
+        stallcheck._write_with_lock_retry(_FakeConn(), always_locked)
+
+
+def test_stallcheck_non_lock_error_not_retried():
+    calls = {"n": 0}
+
+    def other_error():
+        calls["n"] += 1
+        raise sqlite3.OperationalError("no such table: widgets")
+
+    with pytest.raises(sqlite3.OperationalError):
+        stallcheck._write_with_lock_retry(_FakeConn(), other_error)
+    assert calls["n"] == 1  # not retried
+
+
+def test_feed_deadman_and_heartbeat_wait_out_a_concurrent_writer_lock(tmp_path, monkeypatch):
+    """Reproduces the live crash: another connection holds a BEGIN IMMEDIATE
+    write lock (standing in for the autopilot light cycle) for longer than a
+    single busy_timeout window. Both the deadman write (feed_deadman) and the
+    self-heartbeat write (upsert_self_heartbeat) must wait it out via the
+    bound retry and succeed instead of raising 'database is locked'."""
+    db_path = tmp_path / "brain.sqlite"
+    brain = connect(db_path)
+    init_db(brain)
+    brain.commit()
+
+    # Shrink the busy_timeout so the first attempt exhausts fast (deterministic,
+    # fast test) instead of relying on the real 5s window.
+    monkeypatch.setattr(stallcheck, "BRAIN_BUSY_TIMEOUT_MS", 50)
+    brain.execute(f"PRAGMA busy_timeout={stallcheck.BRAIN_BUSY_TIMEOUT_MS}")
+
+    lock_acquired = threading.Event()
+    release_after = 0.2  # longer than the 50ms busy_timeout window
+
+    def hold_writer_lock():
+        writer = sqlite3.connect(str(db_path), timeout=0)
+        writer.execute("BEGIN IMMEDIATE")
+        lock_acquired.set()
+        time.sleep(release_after)
+        writer.commit()
+        writer.close()
+
+    thread = threading.Thread(target=hold_writer_lock)
+    thread.start()
+    assert lock_acquired.wait(timeout=2)
+    time.sleep(0.02)  # let the writer's BEGIN IMMEDIATE actually land
+
+    now = datetime.now(UTC)
+    finding = stallcheck.Finding(
+        stall_class="workflow_passive_wait",
+        unit_id="lock-contend",
+        terminal_signature="passive_wait:standing by",
+        snippet="standing by",
+        artifact_path="/tmp/agent-lock.jsonl",
+        age_seconds=5400.0,
+        occurred_at=now.isoformat(),
+    )
+    cfg = _cfg(workflow_globs=(), task_output_globs=(), runner_db="/nonexistent")
+
+    # Both writes must succeed (retry survives the lock) rather than raising.
+    evidence_id = stallcheck._write_with_lock_retry(
+        brain, stallcheck.feed_deadman, brain, finding, now
+    )
+    stallcheck._write_with_lock_retry(brain, stallcheck.upsert_self_heartbeat, brain, cfg, now)
+    brain.commit()
+    thread.join(timeout=2)
+
+    assert evidence_id
+    live = brain.execute(
+        "SELECT deadman_due_at FROM loop_liveness WHERE loop_id=? AND run_id=?",
+        (finding.loop_id, "lock-contend"),
+    ).fetchone()
+    assert live is not None and live["deadman_due_at"] is not None
+
+    hb = brain.execute(
+        "SELECT last_heartbeat_at FROM loop_liveness WHERE loop_id='stallcheck' "
+        "AND run_id='heartbeat'"
+    ).fetchone()
+    assert hb is not None and hb["last_heartbeat_at"] is not None

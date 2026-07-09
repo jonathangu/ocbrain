@@ -48,6 +48,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -619,6 +620,34 @@ def open_brain(path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+# The live brain DB has heavy concurrent writers (autopilot's 15-min light
+# cycle, mcp). busy_timeout makes a single statement wait out a lock, but if
+# the competing writer holds its transaction longer than one busy_timeout
+# window, that statement still raises OperationalError. Mirrors mcp.py's
+# _call_tool_with_lock_retry: bound-retry on 'database is locked', rolling
+# back the (aborted, never-partially-applied) transaction between attempts.
+# Every brain write in this module is an idempotent upsert (ON CONFLICT DO
+# UPDATE), so re-running a call that aborted mid-write is safe.
+WRITE_LOCK_RETRIES = 3
+WRITE_LOCK_BACKOFF_SECONDS = 0.25
+
+
+def _write_with_lock_retry(conn: sqlite3.Connection, fn, *args: Any, **kwargs: Any) -> Any:
+    """Call fn(*args, **kwargs), bound-retrying on 'database is locked'."""
+    for attempt in range(WRITE_LOCK_RETRIES):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt == WRITE_LOCK_RETRIES - 1:
+                raise
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            time.sleep(WRITE_LOCK_BACKOFF_SECONDS)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 STALL_PAGES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS stall_pages (
   fingerprint TEXT PRIMARY KEY,
@@ -919,7 +948,9 @@ def run(
 
     # Feed the deadman engine for EVERY finding (idempotent), every run.
     for finding in findings:
-        report.evidence_ids.append(feed_deadman(brain, finding, now))
+        report.evidence_ids.append(
+            _write_with_lock_retry(brain, feed_deadman, brain, finding, now)
+        )
 
     backlog_cutoff = cfg.terminal_backlog_seconds
     new_findings = [f for f in findings if not already_paged(brain, f.fingerprint)]
@@ -954,16 +985,18 @@ def run(
     # Ledger every new finding so run_count/last_seen advance; stamp paged_at ONLY
     # on genuine delivery, so an undelivered stall stays eligible for the next run.
     for finding in new_findings:
-        record_page(brain, finding, now, paged=finding.fingerprint in delivered_fps)
+        _write_with_lock_retry(
+            brain, record_page, brain, finding, now, paged=finding.fingerprint in delivered_fps
+        )
 
-    upsert_self_heartbeat(brain, cfg, now)
+    _write_with_lock_retry(brain, upsert_self_heartbeat, brain, cfg, now)
     # Retire the first-run backlog window only once the backlog has actually been
     # delivered (or there was nothing to deliver / the pager is inert). A failed
     # send leaves first_run set so the whole backlog — including >48h items — retries.
     send_failed = bool(to_page) and send_attempted and not delivered_fps
     if not send_failed:
-        mark_first_run_done(brain, now)
-    brain.commit()
+        _write_with_lock_retry(brain, mark_first_run_done, brain, now)
+    _write_with_lock_retry(brain, brain.commit)
     return report
 
 
