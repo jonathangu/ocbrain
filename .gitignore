@@ -10,3 +10,5 @@ build/
 *.egg-info/
 data/*.sqlite
 data/*.sqlite-*
+# Never commit anything under data/ (live DB, snapshots, local config, exported datasets)
+data/
