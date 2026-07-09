@@ -141,6 +141,70 @@ def promotion_eligible(conn: sqlite3.Connection, row: sqlite3.Row, cfg: Any) -> 
 
 
 # --------------------------------------------------------------------------- #
+# Human-memory bootstrap (v0.3)
+# --------------------------------------------------------------------------- #
+def _risky_row(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """Risky class per §5.7: prescriptive / capability / high-risk."""
+    risky = (
+        row["prescriptive"] == 1
+        or row["type"] == "capability"
+        or row["risk"] in ("high", "critical")
+    )
+    if not risky:
+        return False
+    return not (
+        _has_passed_verifier(conn, row["id"]) or _has_approval_signal(conn, row["id"])
+    )
+
+
+def _human_bootstrap_cfg(cfg: Any) -> tuple[bool, set[str], int]:
+    hb = getattr(cfg.promote, "human_bootstrap", None) or {}
+    enabled = bool(hb.get("enabled"))
+    sources = {str(s) for s in (hb.get("sources") or [])}
+    try:
+        cap = int(hb.get("cap") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    return enabled, sources, cap
+
+
+def _has_bootstrap_source(
+    conn: sqlite3.Connection, knowledge_id: str, sources: set[str]
+) -> bool:
+    """True if any linked evidence carries a human-vetted bootstrap source_type."""
+    if not sources:
+        return False
+    ordered = sorted(sources)
+    placeholders = ",".join("?" for _ in ordered)
+    row = conn.execute(
+        f"SELECT 1 FROM knowledge_evidence ke "  # noqa: S608 - fixed placeholder count
+        f"JOIN evidence e ON e.id = ke.evidence_id "
+        f"WHERE ke.knowledge_id = ? AND e.source_type IN ({placeholders}) LIMIT 1",
+        (knowledge_id, *ordered),
+    ).fetchone()
+    return row is not None
+
+
+def human_bootstrap_eligible(
+    conn: sqlite3.Connection, row: sqlite3.Row, cfg: Any, sources: set[str]
+) -> bool:
+    """A curated human-memory row may earn ``inject=1`` WITHOUT a judge label.
+
+    Still gated by the injection/secret scan and the risky-class rule (§5.7); the
+    char budget is enforced afterwards by :func:`_enforce_char_budget`.
+    """
+    if row["status"] != "current" or row["quarantine_reason"] is not None:
+        return False
+    if not _has_bootstrap_source(conn, row["id"], sources):
+        return False
+    if not injection_clean(conn, row):
+        return False
+    if _risky_row(conn, row):
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Promotion / demotion
 # --------------------------------------------------------------------------- #
 def promote_to_memory(
@@ -168,6 +232,23 @@ def promote_to_memory(
     eligible.sort(key=lambda r: (scored[r["id"]], r["id"]), reverse=True)
     selected = eligible[: cfg.promote.max_injected]
     selected_ids = {row["id"] for row in selected}
+
+    # Human-memory bootstrap (v0.3): curated, human-vetted rows may be injected
+    # WITHOUT a judge label, capped at ``human_bootstrap.cap``, on top of the
+    # score-ranked winners. Injection/secret scan + risky-class rules still hold;
+    # the char budget below is the final arbiter.
+    hb_enabled, hb_sources, hb_cap = _human_bootstrap_cfg(cfg)
+    if hb_enabled and hb_cap > 0 and hb_sources:
+        bootstrap = [
+            row
+            for row in rows
+            if row["id"] not in selected_ids
+            and human_bootstrap_eligible(conn, row, cfg, hb_sources)
+        ]
+        bootstrap.sort(key=lambda r: (scored[r["id"]], r["id"]), reverse=True)
+        for row in bootstrap[:hb_cap]:
+            selected.append(row)
+            selected_ids.add(row["id"])
 
     promoted = 0
     demoted = 0

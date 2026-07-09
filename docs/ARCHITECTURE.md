@@ -1,9 +1,10 @@
 # ocbrain Architecture
 
-A repo-native map of how ocbrain v0.2 turns the history your agents already
+A repo-native map of how ocbrain turns the history your agents already
 produce into source-backed memory — and, as a byproduct, a fine-tuning dataset
-built from your own decisions. It runs unattended every 30 minutes, and nothing
-leaves the machine.
+built from your own decisions. It runs unattended on two cadences — a fast
+`light` cycle every 15 minutes and a full `heavy` cycle hourly (v0.3) — and
+nothing leaves the machine.
 
 This document is the engineering companion to the public explainers:
 
@@ -23,7 +24,8 @@ Immutable **evidence** goes in; a compiler distills it into current
 good/bad/neutral; only the trustworthy, scanned, corroborated rows are promoted
 into an injectable **memory** view; and the same evidence compiles into
 local-only fine-tuning **datasets** — all driven by a single idempotent
-14-stage autopilot loop, guarded by six always-on safeguards that replaced the
+autopilot loop that runs as two profiles (a fast `light` cycle and a full
+`heavy` cycle, v0.3), guarded by six always-on safeguards that replaced the
 old human approval queue.
 
 One direction. Nothing overwritten. Every step skippable-and-safe.
@@ -332,7 +334,11 @@ Four scopes, least to most restrictive: `private` → `workspace` → `project` 
   (never raw data or datasets); private rows are dropped before it runs; every
   body is secret-scrubbed; it is daily-budget-capped; and every batch writes an
   `egress_audits` row. Its verdict is just one more signal and can never override
-  a hard human correction.
+  a hard human correction. **Targeted (v0.3):** the judge no longer grades the
+  whole backlog. `judge.targeting` whitelists the knowledge origins it looks at
+  (retrieval-touched, lessons, session-derived) and excludes the 101k-file
+  catalog-doc backlog, so spend lands on rows a decision actually depends on
+  rather than on inert file-catalog rows that no retrieval ever touches.
 - **Public-safety pre-push gate.** This is a public repo; runtime data is not.
   A tracked-tree scanner (`ocbrain public-safety-check`) reads git only — never
   the runtime DB — and blocks four violation classes on the outgoing commit
@@ -345,14 +351,30 @@ Four scopes, least to most restrictive: `private` → `workspace` → `project` 
 
 ---
 
-## 9. The 14-stage autopilot
+## 9. The autopilot state machine
 
-Everything above runs as one idempotent, single-instance state machine —
-14 stages, every 30 minutes, scheduled locally (launchd). Any stage can be
-killed and safely re-run: watermarks, stable ids, and uniqueness constraints
-mean nothing is double-counted and no committed progress is lost. State lives in
-the stages themselves; `run_autopilot` only *sequences* them and commits after
-each success.
+Everything above runs as one idempotent, single-instance state machine,
+scheduled locally (launchd). Any stage can be killed and safely re-run:
+watermarks, stable ids, and uniqueness constraints mean nothing is
+double-counted and no committed progress is lost. State lives in the stages
+themselves; `run_autopilot` only *sequences* them and commits after each success.
+
+**Two profiles (v0.3).** The old single full cycle ran every 30 minutes but took
+34–45 minutes end-to-end — it overran its own timer. The stages are now split
+into two named sequences in `cfg.autopilot.profiles`, each on its own launchd
+timer:
+
+- **`light` — every 15 min** (`StartInterval 900`): migrate → review → autolabel
+  → embed → tripwires → promote → maintain. The fast keep-current loop; skips
+  snapshot, harvest, compile, and the dataset mine/export.
+- **`heavy` — hourly** (`StartInterval 3600`): the full sequence below, including
+  snapshot, harvest, compile, and the expensive fold/mine/export pass.
+
+Both plists run through one shared env wrapper that sources the API key from a
+`chmod 600` file outside the repo and passes the profile as an argument; the key
+never appears in a plist. Because `cfg.autopilot.profile_locks == "shared"`, both
+profiles contend for the *same* autopilot lock, so an overlapping light/heavy
+fire finds the lock held and exits cleanly instead of double-running.
 
 | # | Stage | What it does | Idempotency |
 |---|---|---|---|
@@ -364,12 +386,17 @@ each success.
 | 5 | **review** | post-turn review of *settled* sessions — task successes, error recoveries, corrections, novel workflows become candidate knowledge + signals | path watermark + stable ids |
 | 6 | **compile** | turn undecided proposals into knowledge; **one** `rebuild_projection` at the end (never per-item) | decision check |
 | 7 | **autolabel** | mine signals → attribute to knowledge → fold → optionally consult the judge → fold again | stable signal ids + watermarks |
+| 7b | **embed** (v0.3) | embed pending knowledge rows into vectors for semantic attribution (was FTS-only); self-skips when disabled / keyless / over the daily USD cap; audited egress | `embed_runs` + stored vectors |
 | 8 | **tripwires** | run the tripwire registry and auto-quarantine anything that fires | knowledge watermark |
 | 9 | **promote** | re-score, promote trustworthy rows into memory, demote what slipped, enforce the budget | deterministic re-rank |
-| 10 | **maintain** | prune stale knowledge and heal conflicts, emitting supersession signals | existing TTL logic |
+| 10 | **maintain** | prune stale knowledge, heal conflicts (emitting supersession signals), and **archive never-referenced stale catalog docs** (v0.3) out of the working set | existing TTL logic + reversible status flip |
 | 11 | **dataset-mine** | mine SFT/DPO/persona from newly-settled history, time-budgeted | `dataset_sources` fingerprints + `UNIQUE` |
 | 12 | **dataset-export** | deterministically write the JSONL corpora + manifest, skipping if unchanged | `payload_hash` |
 | 13 | **finalize** | record the run in `autopilot_runs` (per-stage results or errors), release the lock | — |
+
+The `light` profile runs stages 2, 5, 7, 7b, 8, 9, 10; the `heavy` profile runs
+the full table. The `embed` stage always runs immediately after `autolabel` in
+every profile.
 
 ### 9.1 Abort vs. partial
 
@@ -386,10 +413,14 @@ later stage assumes a snapshotted, migrated DB.
   keep a small number. If snapshot or migrate fails, nothing downstream runs.
 - **Per-stage time budgets.** Each stage carries a wall-clock budget; miners
   accept a `time_budget_seconds` and return early with their watermark advanced
-  only past *fully-processed* items, so the whole loop fits the 30-minute cadence.
+  only past *fully-processed* items, so a cycle fits its timer. The `light`/`heavy`
+  split (v0.3) is the coarse-grained version of the same discipline: the fast loop
+  stays inside its 15-minute tick by leaving the expensive fold/mine/export to the
+  hourly `heavy` cycle.
 - **Flock overlap safety.** The stage-0 file lock makes the launchd interval +
   a slow run safe: a second invocation exits 0 immediately rather than
-  double-processing.
+  double-processing. Because `light` and `heavy` share one lock, a still-running
+  `heavy` cycle also makes the next `light`/`heavy` fire exit cleanly.
 - **Watermarks in-transaction.** Each watermark is written in the same
   transaction as the work it covers, so a kill mid-run loses no committed
   progress and re-runs resume cleanly.

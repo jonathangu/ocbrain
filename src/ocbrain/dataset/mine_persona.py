@@ -30,7 +30,12 @@ from typing import Any
 
 from ocbrain.config import OcbrainConfig, founder_ids, load_config
 from ocbrain.dataset.quality import store_example
-from ocbrain.dataset.transcripts import Session, iter_transcript_files, parse_transcript
+from ocbrain.dataset.transcripts import (
+    Session,
+    iter_unmined_transcripts,
+    parse_transcript,
+)
+from ocbrain.fsutil import ParseCache, parse_cache_key
 from ocbrain.ids import content_hash as _content_hash
 from ocbrain.text import redact_secrets
 
@@ -281,6 +286,7 @@ def mine_persona(
     verified_only: bool = False,
     limit: int | None = None,
     time_budget_seconds: float | None = None,
+    parse_cache: ParseCache | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or load_config()
     from ocbrain.dataset.transcripts import record_source, resolve_transcript_evidence
@@ -289,6 +295,7 @@ def mine_persona(
     stored = 0
     excluded = 0
     examined = 0
+    files_mined = 0
 
     def _store(candidate: dict[str, Any], *, evidence_ids: list[str], scope: str,
                source_kind: str, source_uri: str | None, session_id: str | None) -> None:
@@ -340,21 +347,45 @@ def mine_persona(
         for session in sessions:
             _emit_session(session)
     elif roots is not None:
-        for path in iter_transcript_files(roots):
+        # STRICTLY INCREMENTAL: iter_unmined_transcripts skips files whose
+        # fingerprint already matches the persona watermark, so an unchanged
+        # corpus re-parses nothing (was a full re-scan of every transcript every
+        # run — the dominant dataset_mine cost). Changed/new files re-parse and
+        # re-advance the watermark; store_example still dedups by content_hash.
+        ds = cfg.dataset
+        fids = tuple(founder_ids(cfg))
+        params = (
+            tuple(ds.persona_author_ids),
+            tuple(ds.persona_direct_agents),
+            ds.tool_result_truncate,
+            fids,
+        )
+        for path, fingerprint in iter_unmined_transcripts(conn, roots, "persona"):
             if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
                 break
-            session = parse_transcript(
-                path,
-                author_ids=cfg.dataset.persona_author_ids,
-                direct_agents=cfg.dataset.persona_direct_agents,
-                tool_result_truncate=cfg.dataset.tool_result_truncate,
-                founder_ids=founder_ids(cfg),
-            )
-            if session is None:
-                continue
-            before = examined
-            _emit_session(session)
-            record_source(conn, str(path), "persona", _fingerprint(path), examined - before)
+
+            def _load(p: object = path) -> Session | None:
+                return parse_transcript(
+                    p,  # type: ignore[arg-type]
+                    author_ids=ds.persona_author_ids,
+                    direct_agents=ds.persona_direct_agents,
+                    tool_result_truncate=ds.tool_result_truncate,
+                    founder_ids=fids,
+                )
+
+            if parse_cache is not None:
+                session = parse_cache.get(parse_cache_key(fingerprint, params), _load)
+            else:
+                session = _load()
+            emitted = 0
+            if session is not None:
+                before = examined
+                _emit_session(session)
+                emitted = examined - before
+            record_source(conn, str(path), "persona", fingerprint, emitted)
+            files_mined += 1
+            if limit is not None and files_mined >= limit:
+                break
 
     # Git commits.
     repo_list: list[Path] = []
@@ -392,13 +423,5 @@ def mine_persona(
         "examined": examined,
         "stored": stored,
         "excluded": excluded,
+        "files_mined": files_mined,
     }
-
-
-def _fingerprint(path: Path) -> str:
-    from ocbrain.fsutil import file_fingerprint
-
-    try:
-        return file_fingerprint(path)
-    except OSError:
-        return ""

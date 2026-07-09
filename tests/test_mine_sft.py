@@ -137,3 +137,64 @@ def test_provenance_and_composed_scope(tmp_path: Path):
     ).fetchone()
     assert json.loads(row["evidence_ids"]) == [evidence_id]
     assert row["privacy_scope"] == "project"
+
+
+def _write_openclaw_session(root: Path, sid: str, *messages: dict) -> Path:
+    """Write a minimal on-disk openclaw session transcript under agents/main."""
+    path = root / "agents" / "main" / "sessions" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [{"type": "session", "id": sid, "version": 1, "cwd": "/w",
+              "timestamp": "2026-07-01T00:00:00Z"}]
+    for msg in messages:
+        lines.append({"type": "message", "message": msg})
+    path.write_text("\n".join(json.dumps(o) for o in lines), encoding="utf-8")
+    return path
+
+
+def _corpus(root: Path, n: int) -> None:
+    for i in range(n):
+        _write_openclaw_session(
+            root,
+            f"s{i}",
+            {"role": "user", "content": f"please run release checklist number {i}"},
+            {"role": "assistant", "content": TARGET},
+        )
+
+
+def test_mine_sft_roots_incremental_second_pass_zero_parses(tmp_path: Path):
+    """Spec proof: mine twice; the second unchanged pass parses zero files."""
+    from ocbrain.fsutil import ParseCache
+
+    conn = _conn(tmp_path)
+    root = tmp_path / "corpus"
+    _corpus(root, 3)
+
+    first = ParseCache()
+    r1 = mine_sft(conn, cfg=CFG, roots=[str(root)], parse_cache=first)
+    assert r1["files_mined"] == 3
+    assert first.parses == 3  # every file parsed once on the cold pass
+
+    second = ParseCache()
+    r2 = mine_sft(conn, cfg=CFG, roots=[str(root)], parse_cache=second)
+    assert r2["files_mined"] == 0  # watermark skipped every unchanged file
+    assert second.parses == 0  # ZERO re-parses of unchanged transcripts
+
+
+def test_mine_sft_roots_reparses_only_changed_file(tmp_path: Path):
+    from ocbrain.fsutil import ParseCache
+
+    conn = _conn(tmp_path)
+    root = tmp_path / "corpus"
+    _corpus(root, 3)
+    mine_sft(conn, cfg=CFG, roots=[str(root)])
+
+    # Mutate exactly one transcript so its fingerprint (size/mtime) advances.
+    _write_openclaw_session(
+        root, "s1",
+        {"role": "user", "content": "please run the updated release checklist now"},
+        {"role": "assistant", "content": TARGET + " Extra."},
+    )
+    cache = ParseCache()
+    r = mine_sft(conn, cfg=CFG, roots=[str(root)], parse_cache=cache)
+    assert r["files_mined"] == 1  # only the changed file is revisited
+    assert cache.parses == 1

@@ -39,6 +39,31 @@ class AutopilotConfig:
     # e.g. {"dataset_mine": 900}. Set via config JSON / OCBRAIN_AUTOPILOT_STAGE_BUDGETS.
     stage_budgets: dict[str, int] = field(default_factory=dict)
     runtimes_excerpt: list[str] = field(default_factory=list)
+    # Named stage sequences the autopilot driver can run instead of a hard-coded
+    # list. ``light`` is the fast 30-min-timer-safe cycle; ``heavy`` is the full
+    # fold+mine+export cycle. The driver picks a profile per run (v0.3).
+    profiles: dict[str, list[str]] = field(
+        default_factory=lambda: {
+            "light": ["migrate", "review", "autolabel", "tripwires", "promote", "maintain"],
+            "heavy": [
+                "snapshot",
+                "migrate",
+                "harvest",
+                "injection_scan",
+                "review",
+                "compile",
+                "autolabel",
+                "tripwires",
+                "promote",
+                "maintain",
+                "dataset_mine",
+                "dataset_export",
+            ],
+        }
+    )
+    # Locking discipline across profiles. ``shared`` == light and heavy runs
+    # contend for the same autopilot lock so they never overlap.
+    profile_locks: str = "shared"
 
 
 @dataclass(frozen=True)
@@ -84,6 +109,16 @@ class PromoteConfig:
     max_chars: int = 6000
     decay_days: int = 30
     bootstrap_min_confidence: float = 0.85
+    # One-time human-authored seeding of the injectable memory set. ``sources``
+    # names the harvest origins (e.g. curated ``memory_file`` doctrine) whose
+    # high-confidence rows may be bootstrapped into memory up to ``cap`` (v0.3).
+    human_bootstrap: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": True,
+            "sources": ["memory_file"],
+            "cap": 15,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -98,6 +133,15 @@ class JudgeConfig:
     # {model: {"prompt": usd_per_mtok, "completion": usd_per_mtok}}; supplied via
     # config JSON so no price is baked into source.
     price_per_mtok: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Candidate-filtering knobs (v0.3). ``sources`` whitelists which knowledge
+    # origins the judge grades; ``exclude_catalog_docs`` keeps the 101k-file
+    # catalog backlog out of the graded set so spend is not wasted on it.
+    targeting: dict[str, Any] = field(
+        default_factory=lambda: {
+            "sources": ["retrieval_touched", "lesson", "session_derived"],
+            "exclude_catalog_docs": True,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -140,6 +184,36 @@ class DatasetConfig:
     # doctrine outside the session roots — e.g. per-workspace MEMORY.md / IDENTITY
     # files that the transcript harvest never reaches.
     memory_globs: list[str] = field(default_factory=list)
+    # Relax the DPO structural pair gate (v0.3). The strict gate rejected both
+    # real founder corrections in the overnight run; when true, mining admits a
+    # pair on softer structural evidence. Defaults on for v0.3.
+    dpo_relaxed_gate: bool = True
+
+
+@dataclass(frozen=True)
+class ArchiveConfig:
+    # Maintenance-lane archival of never-referenced catalog docs (v0.3). A catalog
+    # doc untouched by any retrieval for ``catalog_never_referenced_days`` is
+    # eligible for archival, up to ``batch_cap`` rows per pass.
+    enabled: bool = True
+    catalog_never_referenced_days: int = 14
+    batch_cap: int = 5000
+
+
+@dataclass(frozen=True)
+class EmbedConfig:
+    # Semantic embedding of knowledge rows for vector attribution (v0.3),
+    # replacing FTS-only attribution. Secrets are never stored: ``api_key_env``
+    # holds the NAME of an env var, never its value. ``daily_usd_cap`` bounds spend.
+    enabled: bool = True
+    provider: str = "openai"
+    model: str = "text-embedding-3-small"
+    daily_usd_cap: float = 0.25
+    batch_size: int = 128
+    api_key_env: str = "OPENAI_API_KEY"  # variable NAME only; value never persisted
+    price_per_mtok: dict[str, float] = field(
+        default_factory=lambda: {"text-embedding-3-small": 0.02}
+    )
 
 
 @dataclass(frozen=True)
@@ -152,6 +226,8 @@ class OcbrainConfig:
     promote: PromoteConfig = field(default_factory=PromoteConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    archive: ArchiveConfig = field(default_factory=ArchiveConfig)
+    embed: EmbedConfig = field(default_factory=EmbedConfig)
 
 
 def _coerce(current: Any, incoming: Any) -> Any:

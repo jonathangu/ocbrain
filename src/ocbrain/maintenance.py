@@ -134,6 +134,83 @@ def prune_knowledge(
     return MaintenanceResult("prune", len(details), details)
 
 
+# Raw imported catalog documents (memory / history / file catalog) carry a
+# non-distilled ``origin``. Review-/loop-distilled docs (wiki/procedure) carry
+# ``harvest``/``loop`` and human docs carry ``human`` — those are never archived
+# by the backlog sweep.
+_CATALOG_ARCHIVE_REASON = "catalog_never_referenced"
+
+
+def archive_unreferenced_catalog(
+    conn: sqlite3.Connection,
+    *,
+    older_than_days: int,
+    batch_cap: int = 5000,
+    now: datetime | None = None,
+) -> MaintenanceResult:
+    """Archive never-referenced, stale catalog *doc* rows (v0.3 backlog sweep).
+
+    The judge and rebuild both pay for a 101k file-catalog doc backlog that no
+    retrieval has ever touched. This sweep moves such rows to
+    ``status='archived'`` so they leave the working set.
+
+    Guarantees:
+
+    * **Reversible.** Only ``status`` (+ an ``invalidation_reason`` marker)
+      changes — the row, its evidence links, body, and embeddings are preserved,
+      so un-archiving is a pure status flip.
+    * **Idempotent.** Already-``archived`` rows are never re-selected, so a re-run
+      over an unchanged DB archives nothing.
+    * **Scoped.** Only raw ``doc`` imports (``origin`` not in harvest/loop/human),
+      idle longer than ``older_than_days``, with zero ``retrieval_uses`` rows, and
+      not currently injected, are eligible. Batch-capped at ``batch_cap``.
+    """
+    timestamp = now or datetime.now(UTC)
+    if batch_cap <= 0:
+        return MaintenanceResult("archive-catalog", 0, [])
+    cutoff = (timestamp - timedelta(days=older_than_days)).isoformat()
+    rows = list(
+        conn.execute(
+            """
+            SELECT k.id, k.status
+            FROM knowledge AS k
+            WHERE k.type = 'doc'
+              AND k.status IN ('candidate', 'current', 'stale')
+              AND COALESCE(k.inject, 0) = 0
+              AND (k.origin IS NULL OR k.origin NOT IN ('harvest', 'loop', 'human'))
+              AND k.updated_at < ?
+              AND NOT EXISTS (
+                SELECT 1 FROM retrieval_uses ru WHERE ru.knowledge_id = k.id
+              )
+            ORDER BY k.updated_at ASC, k.id ASC
+            LIMIT ?
+            """,
+            (cutoff, batch_cap),
+        )
+    )
+    details: list[dict[str, Any]] = []
+    for row in rows:
+        conn.execute(
+            """
+            UPDATE knowledge
+            SET status = 'archived',
+                invalidation_reason = COALESCE(invalidation_reason, ?),
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (_CATALOG_ARCHIVE_REASON, timestamp.isoformat(), row["id"]),
+        )
+        details.append(
+            {
+                "id": row["id"],
+                "from_status": row["status"],
+                "to_status": "archived",
+                "reason": _CATALOG_ARCHIVE_REASON,
+            }
+        )
+    return MaintenanceResult("archive-catalog", len(details), details)
+
+
 def _emit_heal_signal(
     conn: sqlite3.Connection,
     *,

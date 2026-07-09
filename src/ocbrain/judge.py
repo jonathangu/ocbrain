@@ -59,6 +59,66 @@ _JUDGE_SYSTEM = (
 
 _VERDICT_POLARITY = {"good": "good", "bad": "bad", "neutral": "neutral"}
 
+# --------------------------------------------------------------------------- #
+# Candidate targeting (v0.3)
+# --------------------------------------------------------------------------- #
+# The overnight run drained hosted-judge spend grading a 101k never-referenced
+# file-catalog doc backlog. Targeting restricts the graded set to rows with real
+# provenance: each ``judge.targeting['sources']`` token maps to a SQL predicate
+# over the ``knowledge`` alias ``k``; a row is a candidate if it satisfies ANY
+# enabled predicate. Unknown tokens are ignored. With no known token the filter
+# is inert (matches everything) so the judge never silently grades nothing.
+#
+# * ``retrieval_touched`` — the row has been served at least once (any
+#   ``retrieval_uses`` row). Worth judging regardless of how it was minted.
+# * ``lesson`` — review-/loop-distilled knowledge (``origin`` in ``harvest`` or
+#   ``loop``), i.e. lessons extracted from work, not raw file imports.
+# * ``session_derived`` — distilled (non-``doc``) knowledge (values / capabilities
+#   surfaced from working sessions), as opposed to raw catalog documents.
+_TARGETING_PREDICATES: dict[str, str] = {
+    "retrieval_touched": (
+        "EXISTS (SELECT 1 FROM retrieval_uses ru WHERE ru.knowledge_id = k.id)"
+    ),
+    "lesson": "k.origin IN ('harvest', 'loop')",
+    "session_derived": "k.type <> 'doc'",
+}
+
+# A "catalog doc" is a raw imported document (memory / history / file catalog),
+# NOT a distilled wiki/procedure — those carry ``origin`` harvest/loop. When
+# ``exclude_catalog_docs`` is set, catalog docs that no retrieval has ever
+# touched are dropped from the graded set. Human-authored docs are never
+# excluded here.
+_CATALOG_DOC_PREDICATE = (
+    "k.type = 'doc' "
+    "AND (k.origin IS NULL OR k.origin NOT IN ('harvest', 'loop', 'human')) "
+    "AND NOT EXISTS (SELECT 1 FROM retrieval_uses ru2 WHERE ru2.knowledge_id = k.id)"
+)
+
+
+def _targeting_clause(cfg: Any) -> str:
+    """SQL fragment (may be empty) restricting judge candidates per targeting cfg.
+
+    Returned text is composed only of trusted config-keyed literals, never user
+    input, so it is safe to inline into the candidate query.
+    """
+    targeting = getattr(cfg.judge, "targeting", None) or {}
+    sources = targeting.get("sources") or []
+    exclude_catalog = bool(targeting.get("exclude_catalog_docs"))
+
+    clauses: list[str] = []
+    predicates = [
+        _TARGETING_PREDICATES[token]
+        for token in sources
+        if token in _TARGETING_PREDICATES
+    ]
+    if predicates:
+        clauses.append("(" + " OR ".join(predicates) + ")")
+    if exclude_catalog:
+        clauses.append("NOT (" + _CATALOG_DOC_PREDICATE + ")")
+    if not clauses:
+        return ""
+    return " AND " + " AND ".join(clauses)
+
 
 def spent_today(conn: sqlite3.Connection, *, now: datetime | None = None) -> float:
     """Sum ``judge_runs.cost_usd`` for the current UTC day."""
@@ -120,20 +180,23 @@ def eligible_rows(
 ) -> list[sqlite3.Row]:
     """Rows worth judging: ambiguous-with-mass neutrals + zero-signal candidates.
 
-    Ordered by ``promote_score`` desc, capped at ``judge.per_run_item_cap``.
+    Restricted to provenance-bearing rows per ``judge.targeting`` so hosted spend
+    is never wasted grading the never-referenced file-catalog doc backlog. Ordered
+    by ``promote_score`` desc, capped at ``judge.per_run_item_cap``.
     """
     now = now or datetime.now(UTC)
     candidates = conn.execute(
-        """
-        SELECT *
-        FROM knowledge
-        WHERE quarantine_reason IS NULL
-          AND status IN ('candidate', 'current')
-          AND (quality_label = 'neutral' OR quality_label IS NULL)
-        ORDER BY COALESCE(promote_score, -1) DESC,
-                 COALESCE(confidence, 0) DESC,
-                 id ASC
-        """
+        f"""
+        SELECT k.*
+        FROM knowledge AS k
+        WHERE k.quarantine_reason IS NULL
+          AND k.status IN ('candidate', 'current')
+          AND (k.quality_label = 'neutral' OR k.quality_label IS NULL)
+          {_targeting_clause(cfg)}
+        ORDER BY COALESCE(k.promote_score, -1) DESC,
+                 COALESCE(k.confidence, 0) DESC,
+                 k.id ASC
+        """  # noqa: S608 - fragment is composed only of trusted config-keyed literals
     ).fetchall()
 
     chosen: list[sqlite3.Row] = []

@@ -8,7 +8,14 @@ from pathlib import Path
 
 from ocbrain.autolabel import Signal, record_signal
 from ocbrain.config import load_config
-from ocbrain.db import connect, get_knowledge, init_db, now_iso, upsert_knowledge
+from ocbrain.db import (
+    connect,
+    get_knowledge,
+    init_db,
+    log_retrieval_use,
+    now_iso,
+    upsert_knowledge,
+)
 from ocbrain.judge import (
     build_judge_batch,
     eligible_rows,
@@ -106,6 +113,56 @@ def test_eligibility_neutral_mass_and_zero_signal(tmp_path: Path) -> None:
     assert ambiguous in ids
     assert zero in ids
     assert weak not in ids
+
+
+def _catalog_doc(conn: sqlite3.Connection, slug: str, *, origin: str = "autopilot") -> str:
+    """A raw imported doc-kind catalog row, zero-signal, no retrieval."""
+    return upsert_knowledge(
+        conn, knowledge_type="doc", gate="auto", slug=slug,
+        title=f"catalog {slug}", doc_kind="memory", status="current", origin=origin,
+    )
+
+
+def test_targeting_excludes_never_referenced_catalog_docs(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)  # default targeting: exclude_catalog_docs=True
+    catalog = _catalog_doc(conn, "catalog-1")
+    lesson = upsert_knowledge(
+        conn, knowledge_type="value", gate="auto", subject="runtime",
+        predicate="lesson", value_text="a distilled lesson", status="current",
+        origin="harvest",
+    )
+    ids = {row["id"] for row in eligible_rows(conn, cfg)}
+    assert catalog not in ids  # never-referenced catalog doc is drained no more
+    assert lesson in ids  # review/lesson-derived value survives
+
+
+def test_targeting_keeps_retrieval_touched_catalog_doc(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    touched = _catalog_doc(conn, "catalog-hot")
+    log_retrieval_use(conn, touched, outcome="served")
+    ids = {row["id"] for row in eligible_rows(conn, cfg)}
+    assert touched in ids  # actually-served docs stay judgeable
+
+
+def test_targeting_disabled_keeps_catalog(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path, targeting={"sources": [], "exclude_catalog_docs": False})
+    catalog = _catalog_doc(conn, "catalog-2")
+    ids = {row["id"] for row in eligible_rows(conn, cfg)}
+    assert catalog in ids  # inert targeting keeps legacy behavior
+
+
+def test_targeting_loop_origin_is_a_lesson(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    loop_doc = upsert_knowledge(
+        conn, knowledge_type="doc", gate="auto", slug="loop-proc",
+        title="loop procedure", doc_kind="procedure", status="current", origin="loop",
+    )
+    ids = {row["id"] for row in eligible_rows(conn, cfg)}
+    assert loop_doc in ids  # loop-distilled docs are not catalog backlog
 
 
 def test_private_scope_and_egress_drop(tmp_path: Path) -> None:

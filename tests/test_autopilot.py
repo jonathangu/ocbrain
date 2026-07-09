@@ -28,6 +28,9 @@ def _cfg(tmp_path: Path):
         ),
         review=dataclasses.replace(cfg.review, session_roots=[str(roots)]),
         judge=dataclasses.replace(cfg.judge, enabled=False),
+        # Keep the embed stage hermetic: disabled means embed_pending self-skips
+        # with no network egress even if OPENAI_API_KEY is present in the env.
+        embed=dataclasses.replace(cfg.embed, enabled=False),
         dataset=dataclasses.replace(
             cfg.dataset,
             export_dir=str(tmp_path / "datasets"),
@@ -284,6 +287,136 @@ def test_poisoned_connection_still_records_ledger(tmp_path):
     ).fetchone()
     verify.close()
     assert row is not None
+
+
+def test_stage_names_include_embed_after_autolabel():
+    names = list(autopilot.STAGE_NAMES)
+    assert "embed" in names
+    assert names.index("embed") == names.index("autolabel") + 1
+    assert "embed" in autopilot.STAGES
+
+
+def test_profile_light_runs_fast_subset_with_embed(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    result = autopilot.run_autopilot(conn, cfg, db_path=path, profile="light")
+
+    assert result["status"] == "ok"
+    ran = list(result["stages"].keys())
+    # light = migrate → review → autolabel → embed → tripwires → promote → maintain,
+    # ordered by STAGE_NAMES; embed injected after autolabel.
+    assert ran == [
+        "migrate",
+        "review",
+        "autolabel",
+        "embed",
+        "tripwires",
+        "promote",
+        "maintain",
+    ]
+    # The fast profile skips the expensive stages.
+    assert "snapshot" not in ran
+    assert "dataset_mine" not in ran and "dataset_export" not in ran
+
+
+def test_profile_heavy_runs_full_cycle_with_embed(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    result = autopilot.run_autopilot(conn, cfg, db_path=path, profile="heavy")
+
+    assert result["status"] == "ok"
+    ran = list(result["stages"].keys())
+    # heavy is the full sequence — every declared stage, embed included.
+    assert ran == list(autopilot.STAGE_NAMES)
+    assert "embed" in ran
+
+
+def test_profile_injects_embed_only_once_when_config_already_lists_it(tmp_path):
+    base = _cfg(tmp_path)
+    profiles = dict(base.autopilot.profiles)
+    profiles["custom"] = ["migrate", "autolabel", "embed", "maintain"]
+    cfg = dataclasses.replace(
+        base, autopilot=dataclasses.replace(base.autopilot, profiles=profiles)
+    )
+    stages = autopilot._resolve_profile_stages(cfg, "custom")
+    assert stages.count("embed") == 1
+
+
+def test_unknown_profile_raises(tmp_path):
+    cfg = _cfg(tmp_path)
+    try:
+        autopilot._resolve_profile_stages(cfg, "nope")
+    except ValueError as exc:
+        assert "nope" in str(exc)
+    else:  # pragma: no cover - must raise
+        raise AssertionError("expected ValueError for unknown profile")
+
+
+def test_profile_and_stages_are_mutually_exclusive(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    try:
+        autopilot.run_autopilot(
+            conn, cfg, db_path=path, profile="light", stages=["maintain"]
+        )
+    except ValueError as exc:
+        assert "profile" in str(exc)
+    else:  # pragma: no cover - must raise
+        raise AssertionError("expected ValueError when both profile and stages given")
+
+
+def test_light_and_heavy_share_one_lock(tmp_path):
+    # profile_locks == "shared": a held autopilot lock blocks BOTH profiles, so an
+    # overlapping light/heavy fire skips cleanly instead of double-running.
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    assert cfg.autopilot.profile_locks == "shared"
+    with file_lock(cfg.autopilot.lock_path) as acquired:
+        assert acquired
+        light = autopilot.run_autopilot(conn, cfg, db_path=path, profile="light")
+        heavy = autopilot.run_autopilot(conn, cfg, db_path=path, profile="heavy")
+    assert light["status"] == "locked" and heavy["status"] == "locked"
+
+
+def test_maintain_wires_catalog_archival(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+    result = autopilot.stage_maintain(ctx)
+    # Archival is wired in and reports its own sub-result when enabled.
+    assert "archive" in result
+    assert result["archive"]["action"] == "archive-catalog"
+    assert result["changed"] >= 0
+
+
+def test_maintain_skips_archival_when_disabled(tmp_path):
+    conn, path = _db(tmp_path)
+    base = _cfg(tmp_path)
+    cfg = dataclasses.replace(
+        base, archive=dataclasses.replace(base.archive, enabled=False)
+    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+    result = autopilot.stage_maintain(ctx)
+    assert "archive" not in result
+
+
+def test_embed_stage_skipped_on_dry_run(tmp_path):
+    conn, path = _db(tmp_path)
+    base = _cfg(tmp_path)
+    # Even with embedding enabled, a dry run must make no egress call.
+    cfg = dataclasses.replace(base, embed=dataclasses.replace(base.embed, enabled=True))
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path, dry_run=True)
+    result = autopilot.stage_embed(ctx)
+    assert result == {"action": "embed", "changed": 0, "skipped": "dry_run"}
+
+
+def test_embed_stage_self_skips_when_disabled(tmp_path):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)  # embed disabled in the fixture
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+    result = autopilot.stage_embed(ctx)
+    assert result["action"] == "embed" and result["changed"] == 0
+    assert result.get("status") == "skipped"
 
 
 def test_harvest_memory_globs_imports_doctrine(tmp_path):

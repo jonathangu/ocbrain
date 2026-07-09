@@ -7,7 +7,13 @@ Two sources:
   ``rejected`` is the first attempt ``A1``, ``chosen`` is the final accepted
   attempt (walk forward while corrections continue; accept on affirmation /
   topic-change / clean end). Both sides must differ by ``claim_key``, fit
-  ``dpo_side_chars``, and survive the secret/injection scrub.
+  ``dpo_side_chars``, and survive the secret/injection scrub. Under
+  ``cfg.dataset.dpo_relaxed_gate`` (v0.3), an *additive* relaxed pass anchored on
+  the correction turn also admits pairs the strict structure rejects — a
+  correction that states the fix as the thread's last word (no accepted answer
+  follows) and a correction that lands several turns after the answer it refers
+  to. Every relaxed pair is tagged ``gate='relaxed'`` in metadata; strict pairs
+  are tagged ``gate='strict'``. The relaxed pass never restates a strict pair.
 * **Event-core pairs** (0 today, grow as autopilot runs) — ``compilation_decided``
   edits, ``correction_recorded`` edit/reframe ops, and ``heal_conflicts``
   value-type supersessions. ``mark_wrong``/``retract`` without a replacement is a
@@ -65,6 +71,11 @@ class DpoPair:
     source_uri: str | None
     occurred_at: str | None
     session_id: str | None = None
+    # Structural provenance of the pair: 'strict' == the canonical
+    # answer→correction→accepted structure; 'relaxed' == admitted only by the
+    # widened v0.3 gate (missing acceptance turn, delayed correction, or implicit
+    # correction cue). Stamped into metadata so training can filter.
+    gate: str = "strict"
     # Author provenance of the correction (transcript pairs only): the telegram
     # sender id who issued the correction and their founder weight (1.0 == generic).
     corrected_by: str | None = None
@@ -120,12 +131,32 @@ def _prev_user(session: Session, before: int) -> int | None:
     return None
 
 
+def _prev_assistant_within(session: Session, before: int, max_back: int) -> int | None:
+    """Nearest assistant answer within ``max_back`` turn positions before ``before``.
+
+    Used by the relaxed gate to find the antecedent answer a *delayed* correction
+    refers to (spec: search back N turns). ``max_back`` counts turn positions, so
+    an assistant two turns back (answer → intermediate user → correction) is found
+    at ``max_back >= 2``.
+    """
+    lo = max(0, before - max_back)
+    for k in range(before - 1, lo - 1, -1):
+        if session.turns[k].role == "assistant" and session.turns[k].text.strip():
+            return k
+    return None
+
+
+def _pair_key(rejected: str, chosen: str) -> tuple[str, str]:
+    return (claim_key(rejected), claim_key(chosen))
+
+
 def find_transcript_pairs(session: Session, cfg: OcbrainConfig | None = None) -> list[DpoPair]:
     cfg = cfg or load_config()
     threshold = cfg.correction.threshold
     lo, hi = cfg.dataset.dpo_side_chars
     turns = session.turns
     pairs: list[DpoPair] = []
+    seen: set[tuple[str, str]] = set()
     for a1 in range(len(turns)):
         if turns[a1].role != "assistant" or not turns[a1].text.strip():
             continue
@@ -169,6 +200,7 @@ def find_transcript_pairs(session: Session, cfg: OcbrainConfig | None = None) ->
             confidence = 0.95
         corrected_by = turns[u].authored_by
         corrector_weight = founder_weight(cfg, corrected_by)
+        seen.add(_pair_key(rejected, chosen))
         pairs.append(
             DpoPair(
                 prompt_messages=tuple(
@@ -186,9 +218,125 @@ def find_transcript_pairs(session: Session, cfg: OcbrainConfig | None = None) ->
                 session_id=session.session_id,
                 corrected_by=corrected_by,
                 corrector_weight=corrector_weight,
+                gate="strict",
             )
         )
+    if cfg.dataset.dpo_relaxed_gate:
+        pairs.extend(_find_relaxed_transcript_pairs(session, cfg, seen))
     return pairs
+
+
+# How many turn positions back a delayed correction may sit from its antecedent
+# answer under the relaxed gate (spec: N=4).
+_RELAXED_LOOKBACK = 4
+
+
+def _find_relaxed_transcript_pairs(
+    session: Session, cfg: OcbrainConfig, seen: set[tuple[str, str]]
+) -> list[DpoPair]:
+    """Additive v0.3 relaxed-gate pairs the strict structure rejects.
+
+    Anchored on the *correction* turn rather than the first attempt, this admits:
+
+    * (a) **missing acceptance** — the correction that states the fix is the
+      thread's last word (no accepted assistant answer follows). The correction
+      text itself becomes ``chosen``.
+    * (b) **delayed correction** — the correction lands several turns after the
+      answer it refers to; we search back up to ``_RELAXED_LOOKBACK`` turns for
+      the antecedent assistant answer (``rejected``).
+
+    (c) implicit-correction *detection* is shared via ``text.correction_score``.
+
+    Every pair here is tagged ``gate='relaxed'``. Strict pairs already emitted are
+    skipped via ``seen`` so the relaxed pass only *adds* — it never restates or
+    overrides a strict pair.
+    """
+    threshold = cfg.correction.threshold
+    lo, hi = cfg.dataset.dpo_side_chars
+    turns = session.turns
+    out: list[DpoPair] = []
+    for u in range(len(turns)):
+        t = turns[u]
+        if t.role != "user" or t.kind == "injected":
+            continue
+        if correction_score(t.text) < threshold:
+            continue
+        a1 = _prev_assistant_within(session, u, _RELAXED_LOOKBACK)
+        if a1 is None:
+            continue
+        req = _prev_user(session, a1)
+        if req is None:
+            continue
+        # The antecedent's own request must not itself be a correction — same
+        # first-attempt guard the strict path applies.
+        if correction_score(turns[req].text) >= threshold:
+            continue
+        # Resolve the chosen answer: the accepted answer after the correction, or
+        # (case a) the correction text itself when it is the thread's last word.
+        chosen_idx: int | None = None
+        cursor = u
+        while True:
+            cand = _next_assistant(session, cursor)
+            if cand is None:
+                break
+            chosen_idx = cand
+            follow = _next_user(session, cand)
+            if follow is None:
+                break
+            if correction_score(turns[follow].text) >= threshold:
+                cursor = follow
+                continue
+            break
+        if chosen_idx is not None:
+            chosen_src = turns[chosen_idx].text
+            occurred_at = turns[chosen_idx].ts or session.occurred_at
+        elif _next_user(session, u) is None:
+            # (a) missing acceptance turn: the corrected instruction is the last
+            # word. The founder's stated fix is the preferred output.
+            chosen_src = t.text
+            occurred_at = t.ts or session.occurred_at
+        else:
+            continue
+        rejected = redact_secrets(turns[a1].text.strip())
+        chosen = redact_secrets(chosen_src.strip())
+        if not (lo <= len(rejected) <= hi and lo <= len(chosen) <= hi):
+            continue
+        if claim_key(chosen) == claim_key(rejected):
+            continue
+        if find_probable_secret_leaks(rejected) or find_probable_injection(rejected):
+            continue
+        if find_probable_secret_leaks(chosen) or find_probable_injection(chosen):
+            continue  # chosen can be a raw user turn under (a); scrub it too
+        key = _pair_key(rejected, chosen)
+        if key in seen:
+            continue  # strict already emitted this pair
+        seen.add(key)
+        corrected_by = t.authored_by
+        corrector_weight = founder_weight(cfg, corrected_by)
+        # Relaxed structural evidence is softer than strict; cap confidence below
+        # the strict ceiling so training can weight accordingly.
+        confidence = min(0.8, correction_score(t.text))
+        out.append(
+            DpoPair(
+                prompt_messages=tuple(
+                    _exported_prompt(session, req, cfg.dataset.sft_max_context_chars)
+                ),
+                chosen=chosen,
+                rejected=rejected,
+                correction_kind="transcript",
+                hard=False,
+                confidence=confidence,
+                evidence_ids=(),  # filled by the caller from the transcript evidence
+                privacy_scope="workspace",
+                source_uri=session.source_uri,
+                occurred_at=occurred_at,
+                session_id=session.session_id,
+                corrected_by=corrected_by,
+                corrector_weight=corrector_weight,
+                gate="relaxed",
+            )
+        )
+    return out
 
 
 def _knowledge_evidence_ids(conn: sqlite3.Connection, knowledge_id: str) -> list[str]:
@@ -371,6 +519,7 @@ def _pair_metadata(pair: DpoPair) -> dict[str, Any]:
         "hard": pair.hard,
         "confidence": pair.confidence,
         "session_id": pair.session_id,
+        "gate": pair.gate,
     }
     if pair.corrected_by and pair.corrector_weight != 1.0:
         meta["corrected_by"] = pair.corrected_by
