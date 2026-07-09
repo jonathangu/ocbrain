@@ -79,6 +79,19 @@ class AutopilotContext:
     def session_roots(self) -> list[str]:
         return self.roots if self.roots is not None else list(self.cfg.review.session_roots)
 
+    def budget_for(self, stage: str) -> float | None:
+        """Per-stage wall-clock budget in seconds (spec §4.2).
+
+        A stage listed in ``cfg.autopilot.stage_budgets`` uses its own value
+        (e.g. ``dataset_mine`` at 900s); every other budget-aware stage falls
+        back to the shared ``stage_budget_seconds``. ``None`` disables the
+        budget entirely (unbounded run).
+        """
+        if self.stage_budget_seconds is None:
+            return None
+        override = self.cfg.autopilot.stage_budgets.get(stage)
+        return float(override) if override is not None else self.stage_budget_seconds
+
 
 # --------------------------------------------------------------------------- #
 # Stage 1 — snapshot
@@ -137,7 +150,7 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         imported_history_sources,
     )
 
-    deadline = _deadline(ctx)
+    deadline = _deadline(ctx, "harvest")
     files = history_files([Path(r).expanduser() for r in ctx.session_roots])
     existing = imported_history_sources(ctx.conn)
     imported = 0
@@ -241,7 +254,7 @@ def _iter_settled_sessions(
 
 
 def stage_review(ctx: AutopilotContext) -> dict[str, Any]:
-    deadline = _deadline(ctx)
+    deadline = _deadline(ctx, "review")
     sessions = _iter_settled_sessions(ctx, deadline)
     return review_sessions(ctx.conn, sessions, ctx.cfg, now_ns=time.time_ns())
 
@@ -261,7 +274,7 @@ def stage_autolabel(ctx: AutopilotContext) -> dict[str, Any]:
         ctx.conn,
         ctx.cfg,
         now=ctx.now,
-        time_budget_seconds=ctx.stage_budget_seconds,
+        time_budget_seconds=ctx.budget_for("autolabel"),
     )
 
 
@@ -269,7 +282,12 @@ def stage_autolabel(ctx: AutopilotContext) -> dict[str, Any]:
 # Stage 8 — tripwires
 # --------------------------------------------------------------------------- #
 def stage_tripwires(ctx: AutopilotContext) -> dict[str, Any]:
-    return run_tripwires(ctx.conn, ctx.cfg, now=ctx.now).as_dict()
+    return run_tripwires(
+        ctx.conn,
+        ctx.cfg,
+        now=ctx.now,
+        time_budget_seconds=ctx.budget_for("tripwires"),
+    ).as_dict()
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +321,7 @@ def stage_dataset_mine(ctx: AutopilotContext) -> dict[str, Any]:
         cfg=ctx.cfg,
         roots=ctx.session_roots,
         repos=ctx.repos,
-        time_budget_seconds=ctx.stage_budget_seconds,
+        time_budget_seconds=ctx.budget_for("dataset_mine"),
     )
 
 
@@ -360,10 +378,11 @@ def _anchor_side_path(cfg_value: str, db_path: Path | str | None) -> Path:
 # --------------------------------------------------------------------------- #
 # Time-budget helpers
 # --------------------------------------------------------------------------- #
-def _deadline(ctx: AutopilotContext) -> float | None:
-    if ctx.stage_budget_seconds is None:
+def _deadline(ctx: AutopilotContext, stage: str | None = None) -> float | None:
+    budget = ctx.budget_for(stage) if stage is not None else ctx.stage_budget_seconds
+    if budget is None:
         return None
-    return time.monotonic() + ctx.stage_budget_seconds
+    return time.monotonic() + budget
 
 
 def _expired(deadline: float | None) -> bool:

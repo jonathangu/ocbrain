@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -377,15 +378,26 @@ def run_tripwires(
     *,
     limit: int = 1000,
     now: datetime | None = None,
+    time_budget_seconds: float | None = None,
 ) -> MaintenanceResult:
     """Fire the tripwire registry over candidate/current rows touched since watermark.
 
     Each eligible (not-quarantined) row is checked against every tripwire; the first
     that fires auto-quarantines the row. Watermarked on ``knowledge.updated_at`` so a
     row re-enters when it changes. Idempotent: quarantined rows drop out of the query.
+
+    ``time_budget_seconds`` bounds wall-clock like the other budget-aware stages
+    (spec §4.2): when the deadline passes the loop stops early and the watermark
+    advances only past rows that were fully processed, so the next run resumes
+    exactly where this one left off.
     """
     quarantine_cfg = _quarantine_cfg(cfg)
     timestamp = now or datetime.now(UTC)
+    deadline = (
+        time.monotonic() + time_budget_seconds
+        if time_budget_seconds is not None
+        else None
+    )
     watermark = _get_watermark(conn, "tripwires", "knowledge") or ""
     rows = conn.execute(
         """
@@ -402,6 +414,8 @@ def run_tripwires(
     details: list[dict[str, Any]] = []
     max_watermark = watermark
     for row in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if row["updated_at"] and row["updated_at"] > max_watermark:
             max_watermark = row["updated_at"]
         for slug, predicate in TRIPWIRES:

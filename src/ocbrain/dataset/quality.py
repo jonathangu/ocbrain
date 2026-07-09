@@ -151,12 +151,19 @@ def store_example(
     label = base_label
     confidence = base_confidence
     scrub = scrub_reasons(target_text, canonical_body)
-    if scrub:
+    # injection_flagged is ADVISORY (spec R2): a flagged example STAYS in the
+    # dataset — knowledge-layer quarantine is the enforcement path, and the count
+    # is surfaced in the export manifest. It is recorded in quality_reasons but
+    # never excludes an example on its own. Every other scrub reason is hard.
+    hard_scrub = [r for r in scrub if r != "injection_flagged"]
+    if hard_scrub:
         label = "excluded"
-        reasons.extend(scrub)
+        reasons.extend(hard_scrub)
     elif _existing_dedup(conn, dataset, dedup_key):
         label = "excluded"
         reasons.append("near_dup")
+    if "injection_flagged" in scrub:
+        reasons.append("injection_flagged")
 
     digest = content_hash(canonical_body)
     example_id = stable_id("dsx", dataset, digest)

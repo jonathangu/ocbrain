@@ -151,6 +151,26 @@ def test_stage_time_budget_zero_processes_nothing(tmp_path):
     assert result["changed"] == 0
 
 
+def test_budget_for_resolves_per_stage_override(tmp_path):
+    # R2: stage_budgets overrides one stage; every other budget-aware stage
+    # falls back to the shared stage_budget_seconds.
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    cfg = dataclasses.replace(
+        cfg,
+        autopilot=dataclasses.replace(cfg.autopilot, stage_budgets={"dataset_mine": 900}),
+    )
+    ctx = autopilot.AutopilotContext(
+        conn=conn, cfg=cfg, db_path=path, stage_budget_seconds=30.0
+    )
+    assert ctx.budget_for("dataset_mine") == 900.0
+    assert ctx.budget_for("tripwires") == 30.0
+    assert ctx.budget_for("autolabel") == 30.0
+    # A None shared budget disables budgets even with no override.
+    ctx_none = dataclasses.replace(ctx, stage_budget_seconds=None)
+    assert ctx_none.budget_for("dataset_mine") is None
+
+
 def test_dry_run_skips_snapshot_and_export_and_ledger(tmp_path):
     conn, path = _db(tmp_path)
     cfg = _cfg(tmp_path)

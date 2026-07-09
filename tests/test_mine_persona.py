@@ -13,7 +13,11 @@ from ocbrain.dataset.mine_persona import (
 from ocbrain.dataset.transcripts import Session, Turn
 from ocbrain.db import connect, init_db
 
-CFG = load_config()
+# Unit tests must be isolated from the operator's on-disk config
+# (data/ocbrain.config.json): loading from a guaranteed-missing path yields the
+# pure defaults (e.g. empty persona_git_authors == match-all for the throwaway
+# test repos below), independent of whatever real identity config is installed.
+CFG = load_config(path=Path("/nonexistent/ocbrain-unit-test-config.json"))
 AGENT_PROMPT = "The agent has finished the task and is awaiting your review and next instruction."
 JON_MSG = "Let's ship the release tonight after the final smoke test passes cleanly for us."
 

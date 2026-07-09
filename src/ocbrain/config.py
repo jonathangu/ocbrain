@@ -34,6 +34,10 @@ class AutopilotConfig:
     snapshot_dir: str = "data/snapshots/"
     snapshot_keep: int = 3
     stage_budget_seconds: int = 300
+    # Per-stage wall-clock overrides (seconds). A stage named here uses its own
+    # budget; every other budget-aware stage falls back to stage_budget_seconds.
+    # e.g. {"dataset_mine": 900}. Set via config JSON / OCBRAIN_AUTOPILOT_STAGE_BUDGETS.
+    stage_budgets: dict[str, int] = field(default_factory=dict)
     runtimes_excerpt: list[str] = field(default_factory=list)
 
 

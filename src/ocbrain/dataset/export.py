@@ -102,16 +102,25 @@ def _selected_rows(
 def _corpus_stats(conn: sqlite3.Connection, dataset: str) -> dict[str, Any]:
     label_counts: dict[str, int] = {}
     scope_counts: dict[str, int] = {}
+    # Advisory injection tally (spec R2): flagged examples STAY in the dataset —
+    # quarantine is the enforcement layer — but the manifest reports how many
+    # carry the injection_flagged advisory reason, per stream.
+    injection_flags = 0
     for row in conn.execute(
-        "SELECT quality_label, privacy_scope FROM dataset_examples WHERE dataset = ?",
+        "SELECT quality_label, privacy_scope, quality_reasons "
+        "FROM dataset_examples WHERE dataset = ?",
         (dataset,),
     ):
         label_counts[row["quality_label"]] = label_counts.get(row["quality_label"], 0) + 1
         scope_counts[row["privacy_scope"]] = scope_counts.get(row["privacy_scope"], 0) + 1
+        reasons = row["quality_reasons"]
+        if reasons and "injection_flagged" in reasons:
+            injection_flags += 1
     return {
         "label_counts": dict(sorted(label_counts.items())),
         "scope_counts": dict(sorted(scope_counts.items())),
         "excluded_count": label_counts.get("excluded", 0),
+        "injection_flags": injection_flags,
     }
 
 
@@ -261,6 +270,7 @@ def export_all(
                 "label_counts": d["label_counts"],
                 "scope_counts": d["scope_counts"],
                 "excluded_count": d["excluded_count"],
+                "injection_flags": d["injection_flags"],
             }
             for name, d in per_dataset.items()
         },
