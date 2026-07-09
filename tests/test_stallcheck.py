@@ -295,6 +295,57 @@ def test_run_pages_once_then_dedups_and_heartbeats(tmp_path, monkeypatch):
     assert len(sent) == 1  # no second Telegram message
 
 
+def test_digest_is_bounded_below_telegram_limit(tmp_path):
+    findings = [
+        stallcheck.Finding(
+            stall_class="ingress_handler_timeout",
+            unit_id=f"telegram/00000009022238{i:02d}",
+            terminal_signature="handler-timeout",
+            snippet="Telegram isolated polling spool handler timed out behind update " * 2,
+            artifact_path=f"runner:channel_ingress_events/00000009022238{i:02d}",
+            age_seconds=3600.0 * i,
+            occurred_at=datetime.now(UTC).isoformat(),
+        )
+        for i in range(40)
+    ]
+    text, included = stallcheck.build_digest_message(findings, backlog=True)
+    assert len(text) <= stallcheck.MAX_MESSAGE_CHARS
+    assert 0 < included < len(findings)
+    assert "more (next digest)" in text
+
+
+def test_run_failed_send_keeps_findings_eligible_and_first_run(tmp_path, monkeypatch):
+    wf = tmp_path / "wf_stall"
+    wf.mkdir()
+    agent = wf / "agent-retry01.jsonl"
+    _write_agent_jsonl(agent, last_text="Standing by, waiting on the monitor.")
+    _age(agent, minutes=90)
+    cfg = _cfg(
+        workflow_globs=(f"{tmp_path}/wf_*/",),
+        pager_chat_id="123",
+        pager_openclaw_json=str(tmp_path / "openclaw.json"),
+    )
+    brain = _brain(tmp_path)
+
+    # First run: Telegram rejects with HTTP 400 -> nothing is marked paged.
+    monkeypatch.setattr(stallcheck, "send_telegram", lambda c, t: 400)
+    r1 = stallcheck.run(cfg, brain, runner=None, now=datetime.now(UTC))
+    assert r1.page_status == 400
+    assert stallcheck.is_first_run(brain) is True  # backlog window NOT retired
+    fp = r1.paged[0].fingerprint
+    assert stallcheck.already_paged(brain, fp) is False  # still eligible
+
+    # Second run: Telegram accepts -> now it pages and dedups thereafter.
+    sent: list[str] = []
+    monkeypatch.setattr(stallcheck, "send_telegram", lambda c, t: sent.append(t) or 200)
+    stallcheck.run(cfg, brain, runner=None, now=datetime.now(UTC) + timedelta(minutes=15))
+    assert len(sent) == 1
+    assert stallcheck.already_paged(brain, fp) is True
+    r3 = stallcheck.run(cfg, brain, runner=None, now=datetime.now(UTC) + timedelta(minutes=30))
+    assert r3.paged == []
+    assert len(sent) == 1  # no re-page
+
+
 def test_run_inert_pager_when_unconfigured(tmp_path):
     wf = tmp_path / "wf_stall"
     wf.mkdir()

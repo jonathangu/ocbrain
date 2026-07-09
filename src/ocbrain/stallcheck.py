@@ -66,6 +66,11 @@ DEFAULT_STALE_MINUTES = 20
 DEFAULT_TERMINAL_BACKLOG_HOURS = 48
 DEFAULT_INGRESS_WINDOW_HOURS = 720
 DEFAULT_SELF_INTERVAL_SECONDS = 900
+# Telegram rejects a sendMessage body over 4096 chars with HTTP 400, so the
+# digest is bounded two ways: at most this many stalls per run (the rest ride the
+# next 15-min cycle), and a hard character budget below the API ceiling.
+DEFAULT_MAX_PAGES_PER_RUN = 8
+MAX_MESSAGE_CHARS = 3900
 
 DEFAULT_WORKFLOW_GLOBS: tuple[str, ...] = (
     "/Users/guclaw/.claude/projects/*/*/subagents/workflows/*/",
@@ -100,6 +105,7 @@ class StallCheckConfig:
     terminal_backlog_hours: int = DEFAULT_TERMINAL_BACKLOG_HOURS
     ingress_window_hours: int = DEFAULT_INGRESS_WINDOW_HOURS
     self_interval_seconds: int = DEFAULT_SELF_INTERVAL_SECONDS
+    max_pages_per_run: int = DEFAULT_MAX_PAGES_PER_RUN
     # Spec default: a zero-byte .output is a stall. In practice this system's
     # .output files are also used as background-command stdout spools, many of
     # which are legitimately empty, so an operator can turn the zero-byte clause
@@ -153,6 +159,7 @@ def load_config(config_path: Path | str | None = None) -> StallCheckConfig:
         ),
         ingress_window_hours=int(sc.get("ingress_window_hours", DEFAULT_INGRESS_WINDOW_HOURS)),
         self_interval_seconds=int(sc.get("self_interval_seconds", DEFAULT_SELF_INTERVAL_SECONDS)),
+        max_pages_per_run=int(sc.get("max_pages_per_run", DEFAULT_MAX_PAGES_PER_RUN)),
         flag_zero_byte_output=bool(sc.get("flag_zero_byte_output", True)),
         pager_account=str(pg.get("account", "default")),
         pager_chat_id=(str(pg["chat_id"]) if pg.get("chat_id") is not None else None),
@@ -524,8 +531,12 @@ def mark_first_run_done(conn: sqlite3.Connection, now: datetime) -> None:
 
 
 def already_paged(conn: sqlite3.Connection, fingerprint: str) -> bool:
+    """True only if this stall was ACTUALLY delivered (paged_at set). A finding
+    that was recorded but whose page never sent (inert pager, HTTP error, or held
+    over a per-run cap) stays eligible so the next run retries it."""
     row = conn.execute(
-        "SELECT 1 FROM stall_pages WHERE fingerprint = ? LIMIT 1", (fingerprint,)
+        "SELECT 1 FROM stall_pages WHERE fingerprint = ? AND paged_at IS NOT NULL LIMIT 1",
+        (fingerprint,),
     ).fetchone()
     return row is not None
 
@@ -654,22 +665,45 @@ def read_bot_token(openclaw_json: str, account: str) -> str | None:
     return token or None
 
 
+def _finding_block(f: Finding) -> str:
+    age_h = f.age_seconds / 3600.0
+    lines = [f"• {f.stall_class} — {f.unit_id} (idle {age_h:.1f}h)"]
+    if f.snippet:
+        lines.append(f'  "{_snip(f.snippet)}"')
+    lines.append(f"  {f.artifact_path}")
+    lines.append("  → fresh agent: review the diff, finish from last step")
+    return "\n".join(lines)
+
+
 def build_digest_message(
-    findings: list[Finding], *, prefix: str = "", backlog: bool = False
-) -> str:
-    header = f"{len(findings)} stalled agent(s)"
+    findings: list[Finding],
+    *,
+    prefix: str = "",
+    backlog: bool = False,
+    max_chars: int = MAX_MESSAGE_CHARS,
+) -> tuple[str, int]:
+    """Render a bounded digest. Returns ``(text, n_included)`` — blocks are added
+    until the character budget is hit, and any remainder is summarized in a
+    footer so the message never exceeds Telegram's 4096-char limit."""
+    total = len(findings)
+    header = f"{total} stalled agent(s)"
     if backlog:
         header += " (backlog on first run)"
-    lines = [f"{prefix}{header}:" if prefix else f"{header}:"]
+    header = f"{prefix}{header}:" if prefix else f"{header}:"
+    body: list[str] = [header]
+    included = 0
     for f in findings:
-        lines.append("")
-        age_h = f.age_seconds / 3600.0
-        lines.append(f"• {f.stall_class} — {f.unit_id} (idle {age_h:.1f}h)")
-        if f.snippet:
-            lines.append(f'  "{_snip(f.snippet)}"')
-        lines.append(f"  artifact: {f.artifact_path}")
-        lines.append(f"  action: {f.suggested_action}")
-    return "\n".join(lines)
+        block = _finding_block(f)
+        remaining = total - included - 1
+        footer = f"\n… +{remaining} more (next digest)" if remaining > 0 else ""
+        candidate = "\n".join(body + ["", block]) + footer
+        if len(candidate) > max_chars and included > 0:
+            body.append(f"\n… +{total - included} more (next digest)")
+            break
+        body.append("")
+        body.append(block)
+        included += 1
+    return "\n".join(body), included
 
 
 def send_telegram(cfg: StallCheckConfig, text: str) -> int | None:
@@ -763,24 +797,42 @@ def run(
 
     if first_run:
         # One-time backlog digest: page everything new, including >48h terminals.
-        to_page = list(new_findings)
+        candidates = list(new_findings)
     else:
         # Steady state: page only new findings that are not already terminal-and-old.
-        to_page = [f for f in new_findings if f.age_seconds <= backlog_cutoff]
-    to_page.sort(key=lambda f: f.age_seconds, reverse=True)
+        candidates = [f for f in new_findings if f.age_seconds <= backlog_cutoff]
+    candidates.sort(key=lambda f: f.age_seconds, reverse=True)
+    # Bound each run to one digest of at most max_pages_per_run stalls; the rest
+    # remain un-paged (paged_at NULL) and ride the next cycle.
+    to_page = candidates[: max(0, cfg.max_pages_per_run)]
     report.paged = to_page
 
-    # Record ledger rows for every new finding (paged or held), so each dedups next run.
-    paged_fps = {f.fingerprint for f in to_page}
-    for finding in new_findings:
-        record_page(brain, finding, now, paged=finding.fingerprint in paged_fps)
-
+    # Send the digest, then figure out which fingerprints were actually delivered.
+    delivered_fps: set[str] = set()
+    pager_configured = bool(cfg.pager_chat_id and cfg.pager_openclaw_json)
+    send_attempted = False
     if to_page and send:
-        message = build_digest_message(to_page, prefix=message_prefix, backlog=first_run)
+        message, included = build_digest_message(
+            to_page, prefix=message_prefix, backlog=first_run
+        )
+        send_attempted = pager_configured
         report.page_status = send_telegram(cfg, message)
+        delivered = report.page_status is not None and 200 <= report.page_status < 300
+        if delivered:
+            delivered_fps = {f.fingerprint for f in to_page[:included]}
+
+    # Ledger every new finding so run_count/last_seen advance; stamp paged_at ONLY
+    # on genuine delivery, so an undelivered stall stays eligible for the next run.
+    for finding in new_findings:
+        record_page(brain, finding, now, paged=finding.fingerprint in delivered_fps)
 
     upsert_self_heartbeat(brain, cfg, now)
-    mark_first_run_done(brain, now)
+    # Retire the first-run backlog window only once the backlog has actually been
+    # delivered (or there was nothing to deliver / the pager is inert). A failed
+    # send leaves first_run set so the whole backlog — including >48h items — retries.
+    send_failed = bool(to_page) and send_attempted and not delivered_fps
+    if not send_failed:
+        mark_first_run_done(brain, now)
     brain.commit()
     return report
 
