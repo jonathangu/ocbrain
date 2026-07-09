@@ -299,6 +299,26 @@ CREATE TABLE IF NOT EXISTS dataset_sources (
   PRIMARY KEY (source_uri, dataset)
 );
 
+-- v0.3 additive tables. CREATE ... IF NOT EXISTS keeps init_db idempotent.
+-- embed_runs: one row per embedding batch, for daily-cap accounting + auditing.
+CREATE TABLE IF NOT EXISTS embed_runs (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  items INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_embed_runs_ts ON embed_runs(ts);
+
+-- projection_cursor: single-row incremental cursor so the projection rebuild can
+-- fold only events after last_event_rowid instead of full-folding every event.
+CREATE TABLE IF NOT EXISTS projection_cursor (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_event_rowid INTEGER,
+  updated_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS dataset_exports (
   id TEXT PRIMARY KEY,
   ts TEXT NOT NULL,
@@ -349,6 +369,12 @@ _V2_EVIDENCE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("injection_scan_status", "TEXT"),
     ("injection_scan_hits", "TEXT"),
 )
+# v0.3 additive columns. embedding holds the raw vector bytes; embedded_at marks
+# when it was computed (NULL == not yet embedded / stale, eligible for re-embed).
+_V3_KNOWLEDGE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("embedding", "BLOB"),
+    ("embedded_at", "TEXT"),
+)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -384,6 +410,8 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     """
     _migrate_retrieval_uses(conn)
     for column, decl in _V2_KNOWLEDGE_COLUMNS:
+        _ensure_column(conn, "knowledge", column, decl)
+    for column, decl in _V3_KNOWLEDGE_COLUMNS:
         _ensure_column(conn, "knowledge", column, decl)
     for column, decl in _V2_EVIDENCE_COLUMNS:
         _ensure_column(conn, "evidence", column, decl)
