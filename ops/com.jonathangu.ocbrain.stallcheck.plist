@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jonathangu.ocbrain.stallcheck</string>
+  <!--
+    ocbrain STALL CHECKER — the passive progress watchdog, every 15 minutes
+    (StartInterval 900). One pass scans the agent exhaust (Reader A: workflow
+    passive-wait transcripts + zombie task .output files) and the runner sqlite
+    read-only (Reader B: lost/stale task_runs, Reader C: handler-timeout ingress
+    events), feeds each finding into the brain's deadman engine (loop_liveness +
+    loop_tripwire evidence), writes its own 'stallcheck' heartbeat row, and
+    sends ONE deduplicated Telegram digest of any NEW stalls.
+
+    Runs the SHARED-pattern env wrapper (not uv directly). The wrapper sources
+    the chmod-600 env file and sets OCBRAIN_DB + OCBRAIN_CONFIG. The Telegram bot
+    token is read by the checker from openclaw.json at send time and never
+    appears in this plist, the wrapper env, or any log line. RunAtLoad is false
+    so bootstrap does not fire an unscheduled pass; the 15-minute timer drives it.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>/Users/guclaw/.openclaw/service-env/ocbrain-stallcheck-wrapper.sh</string>
+  </array>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityBackgroundIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/stallcheck.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/stallcheck.err.log</string>
+</dict>
+</plist>

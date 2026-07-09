@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,8 +47,16 @@ INSTRUCTIONS = (
 )
 
 
+# The brain DB has heavy concurrent writers (autopilot, stallcheck). Wait on a
+# lock rather than fail-fast, and bound-retry write tool calls that still lose.
+DB_BUSY_TIMEOUT_MS = 5000
+WRITE_LOCK_RETRIES = 3
+WRITE_LOCK_BACKOFF_SECONDS = 0.25
+
+
 def serve(db_path: Path, *, allow_writes: bool = False) -> int:
     conn = connect(db_path)
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     init_db(conn)
     for line in sys.stdin:
         if not line.strip():
@@ -87,7 +97,7 @@ def handle_request(
         elif method == "tools/list":
             result = {"tools": tool_list()}
         elif method == "tools/call":
-            result = call_tool(conn, request.get("params", {}))
+            result = _call_tool_with_lock_retry(conn, request.get("params", {}))
         elif method == "resources/list":
             result = {"resources": resource_list(conn)}
         elif method == "resources/read":
@@ -103,6 +113,27 @@ def handle_request(
         return error_response(request_id, -32001, str(exc))
     except Exception as exc:  # noqa: BLE001 - MCP errors must be serialized.
         return error_response(request_id, -32000, str(exc))
+
+
+def _call_tool_with_lock_retry(conn, params: dict[str, Any]) -> dict[str, Any]:
+    """Dispatch a tool call, bound-retrying on 'database is locked'.
+
+    Write tools use idempotent upserts and commit atomically at the end, so a
+    call that aborts on a lock has not partially applied — retrying the whole
+    call is safe. Reads simply re-run.
+    """
+    for attempt in range(WRITE_LOCK_RETRIES):
+        try:
+            return call_tool(conn, params)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or attempt == WRITE_LOCK_RETRIES - 1:
+                raise
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            time.sleep(WRITE_LOCK_BACKOFF_SECONDS)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
