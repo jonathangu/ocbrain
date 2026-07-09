@@ -36,6 +36,7 @@ from ocbrain.autolabel import (
     record_signal,
     set_watermark,
 )
+from ocbrain.config import founder_weight
 from ocbrain.db import link_knowledge_evidence, upsert_knowledge
 from ocbrain.schema import Candidate, Risk, Scope, Target
 from ocbrain.text import (
@@ -147,15 +148,19 @@ def review_session(
         ref = f"{path}#{index}"
 
         if role == "user" and text:
+            author = _author(turn)
+            weight_mult = founder_weight(cfg, author)
             if correction_score(text) >= threshold and _assistant_within(turns, index, 3):
                 signal_count += _emit(
-                    conn, "user_correction", "bad", 0.8, session_key, ref, occurred,
-                    {"snippet": summarize_text(text, 200)},
+                    conn, "user_correction", "bad", 0.8 * weight_mult, session_key, ref,
+                    occurred,
+                    _author_details(author, weight_mult, {"snippet": summarize_text(text, 200)}),
                 )
                 has_correction = True
             elif AFFIRMATION_RE.search(text):
                 signal_count += _emit(
-                    conn, "user_thanks", "good", 0.6, session_key, ref, occurred, {}
+                    conn, "user_thanks", "good", 0.6 * weight_mult, session_key, ref, occurred,
+                    _author_details(author, weight_mult, {}),
                 )
             if (
                 APPROVAL_RE.search(text)
@@ -163,7 +168,8 @@ def review_session(
                 and _role(turns[index - 1]) == "assistant"
             ):
                 signal_count += _emit(
-                    conn, "user_approval", "good", 0.5, session_key, ref, occurred, {}
+                    conn, "user_approval", "good", 0.5 * weight_mult, session_key, ref, occurred,
+                    _author_details(author, weight_mult, {}),
                 )
 
         if role == "tool" and text:
@@ -375,6 +381,25 @@ def _role(turn: Any) -> str:
 
 def _text(turn: Any) -> str:
     return str(getattr(turn, "text", "") or "")
+
+
+def _author(turn: Any) -> str | None:
+    value = getattr(turn, "authored_by", None)
+    return str(value) if value else None
+
+
+def _author_details(
+    author: str | None, weight_mult: float, base: dict[str, Any]
+) -> dict[str, Any]:
+    """Fold author provenance into a signal's details when a founder authored it.
+
+    A generic (weight 1.0) author adds nothing, keeping stable signal ids and the
+    existing fixtures unchanged; a founder stamps ``authored_by`` + ``author_weight``
+    so the label fold's weight is auditable to the person who spoke.
+    """
+    if author and weight_mult != 1.0:
+        return {**base, "authored_by": author, "author_weight": weight_mult}
+    return base
 
 
 def _is_error(turn: Any) -> bool:

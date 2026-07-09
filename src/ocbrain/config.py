@@ -114,6 +114,15 @@ class DatasetConfig:
     # live in committed code. The operator supplies real values via the config
     # JSON file or OCBRAIN_DATASET_* env overrides (never committed).
     persona_author_ids: list[str] = field(default_factory=list)
+    # Founder feedback authors: telegram sender ids whose corrections / approvals /
+    # thanks carry extra weight in the label fold and get author-provenance stamped
+    # on mined DPO pairs. Each entry is a ``{"id": "<sender_id>", "weight": <float>}``
+    # dict supplied by the LOCAL config JSON (never committed — this repo is public).
+    # Ships EMPTY: an author absent from this list is a generic user (weight 1.0).
+    # Membership here does NOT admit an author into the persona/voice stream; that is
+    # governed solely by ``persona_author_ids`` (a founder like a co-founder can be a
+    # feedback author WITHOUT ever becoming a persona target).
+    founder_feedback_authors: list[dict] = field(default_factory=list)
     persona_direct_agents: list[str] = field(default_factory=lambda: ["main"])
     persona_git_repos: list[str] = field(default_factory=list)
     persona_git_authors: list[str] = field(default_factory=list)
@@ -125,6 +134,12 @@ class DatasetConfig:
     learning_db: str = "~/.openclaw/learning.db"
     commitments_path: str = "~/.openclaw/commitments/commitments.json"
     cron_state_path: str = "~/.openclaw/cron/jobs-state.json"
+    # Curated memory / identity / doctrine files to harvest as ``memory_file``
+    # evidence, in addition to the transcript session_roots. Absolute paths or
+    # globs; ships EMPTY (public repo). The operator points these at high-value
+    # doctrine outside the session roots — e.g. per-workspace MEMORY.md / IDENTITY
+    # files that the transcript harvest never reaches.
+    memory_globs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -231,3 +246,49 @@ def _load_config_from_environ(path: Path | str | None) -> OcbrainConfig:
         if overrides:
             section_changes[f.name] = _apply_section_overrides(section, overrides)
     return replace(cfg, **section_changes) if section_changes else cfg
+
+
+# --------------------------------------------------------------------------- #
+# Founder feedback helpers
+# --------------------------------------------------------------------------- #
+def founder_ids(cfg: OcbrainConfig) -> list[str]:
+    """Return the configured founder-feedback author ids (attribution only).
+
+    These ids let the transcript parser stamp ``authored_by`` on a founder's turns
+    even when the founder is not a persona author, so their corrections/approvals
+    can be weighted and their DPO pairs tagged. Being here never admits an author
+    into the persona/voice stream (that is ``persona_author_ids`` only).
+    """
+    out: list[str] = []
+    for entry in cfg.dataset.founder_feedback_authors:
+        if isinstance(entry, dict):
+            ident = str(entry.get("id") or "").strip()
+        else:
+            ident = str(entry or "").strip()
+        if ident:
+            out.append(ident)
+    return out
+
+
+def founder_weight(cfg: OcbrainConfig, author_id: str | None) -> float:
+    """Weight multiplier for a signal authored by ``author_id`` (1.0 == generic).
+
+    A founder in ``founder_feedback_authors`` carries their configured weight; an
+    author absent from the list (or ``None``) is a generic user at 1.0. A present
+    entry with a missing/invalid ``weight`` also falls back to 1.0.
+    """
+    if not author_id:
+        return 1.0
+    target = str(author_id).strip()
+    for entry in cfg.dataset.founder_feedback_authors:
+        if not isinstance(entry, dict):
+            if str(entry or "").strip() == target:
+                return 1.0
+            continue
+        if str(entry.get("id") or "").strip() == target:
+            try:
+                weight = float(entry.get("weight", 1.0))
+            except (TypeError, ValueError):
+                return 1.0
+            return weight if weight > 0 else 1.0
+    return 1.0

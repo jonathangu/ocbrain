@@ -192,11 +192,15 @@ def classify_user_text(
     author_ids: Sequence[str] = (),
     agent: str | None = None,
     direct_agents: Sequence[str] = (),
+    founder_ids: Sequence[str] = (),
 ) -> UserClass:
     """Classify a user turn (spec §7.1 ``classify_user_text``).
 
     ``author_ids`` are the config-driven telegram identities (sender_id /
-    username) that verify a turn as Jonathan-authored — NEVER hardcoded here.
+    username) that verify a turn as persona (Jonathan) authored — NEVER hardcoded
+    here. ``founder_ids`` are additional feedback-author identities (e.g. a
+    co-founder) that get ``authored_by`` stamped for attribution/weighting but are
+    NOT persona-verified: their turns must never enter the persona/voice stream.
     """
     ts, body = strip_timestamp_prefix(text or "")
     stripped = body.strip()
@@ -208,12 +212,21 @@ def classify_user_text(
         verified = False
         if envelope is not None:
             ids = {str(a) for a in author_ids}
+            fids = {str(a) for a in founder_ids}
             sender = str(envelope.get("sender_id") or "").strip()
             username = str(envelope.get("username") or "").strip()
             for candidate in (sender, username):
-                if candidate and candidate in ids:
+                if not candidate:
+                    continue
+                if candidate in ids:
+                    # Persona author: verified, admissible as voice.
                     authored_by = candidate
                     verified = True
+                    break
+                if candidate in fids:
+                    # Founder feedback author (non-persona): attributed but never
+                    # verified — records who spoke without admitting persona voice.
+                    authored_by = candidate
                     break
         # A media-only envelope message stays classified as media residue.
         if message and _MEDIA_RE.match(message):
@@ -284,11 +297,27 @@ def _tool_result_text(content: object, truncate: int) -> str:
     return text[:truncate]
 
 
+def _distinct_authors(a: Turn, b: Turn) -> bool:
+    """True when two turns carry different identified authors (multi-user group).
+
+    Collapsing user turns from different senders (e.g. a founder and the operator
+    speaking back-to-back in a telegram group) would erase the per-sender
+    attribution that founder weighting and persona isolation depend on, so such
+    turns are kept separate.
+    """
+    return bool(a.authored_by and b.authored_by and a.authored_by != b.authored_by)
+
+
 def _collapse(turns: list[Turn]) -> tuple[Turn, ...]:
-    """Collapse consecutive same-role turns (spec §7.1)."""
+    """Collapse consecutive same-role turns (spec §7.1).
+
+    Same-role turns merge, EXCEPT consecutive user turns authored by two distinct
+    identified senders, which stay separate so multi-user telegram groups keep
+    Patrick-vs-Jonathan-vs-agent attribution intact.
+    """
     out: list[Turn] = []
     for turn in turns:
-        if out and out[-1].role == turn.role:
+        if out and out[-1].role == turn.role and not _distinct_authors(out[-1], turn):
             prev = out[-1]
             merged_text = "\n".join(t for t in (prev.text, turn.text) if t)
             out[-1] = replace(
@@ -339,6 +368,7 @@ def parse_openclaw_session(
     author_ids: Sequence[str] = (),
     direct_agents: Sequence[str] = (),
     tool_result_truncate: int = 500,
+    founder_ids: Sequence[str] = (),
 ) -> Session:
     runtime = "openclaw"
     agent = _agent_from_path(path, runtime)
@@ -365,7 +395,11 @@ def parse_openclaw_session(
         if role == "user":
             text = _text_from_blocks(content)
             cls = classify_user_text(
-                text, author_ids=author_ids, agent=agent, direct_agents=direct_agents
+                text,
+                author_ids=author_ids,
+                agent=agent,
+                direct_agents=direct_agents,
+                founder_ids=founder_ids,
             )
             raw.append(
                 Turn(
@@ -418,6 +452,7 @@ def parse_claude_session(
     author_ids: Sequence[str] = (),
     direct_agents: Sequence[str] = (),
     tool_result_truncate: int = 500,
+    founder_ids: Sequence[str] = (),
 ) -> Session:
     runtime = "claude"
     agent = _agent_from_path(path, runtime)
@@ -452,7 +487,11 @@ def parse_claude_session(
                 continue
             text = _text_from_blocks(content)
             cls = classify_user_text(
-                text, author_ids=author_ids, agent=agent, direct_agents=direct_agents
+                text,
+                author_ids=author_ids,
+                agent=agent,
+                direct_agents=direct_agents,
+                founder_ids=founder_ids,
             )
             raw.append(
                 Turn(
@@ -494,6 +533,7 @@ def parse_codex_session(
     author_ids: Sequence[str] = (),
     direct_agents: Sequence[str] = (),
     tool_result_truncate: int = 500,
+    founder_ids: Sequence[str] = (),
 ) -> Session:
     runtime = "codex"
     agent = _agent_from_path(path, runtime)
@@ -529,7 +569,11 @@ def parse_codex_session(
                 raw.append(Turn(role="user", text=text, kind="injected", ts=ts))
             else:  # user
                 cls = classify_user_text(
-                    text, author_ids=author_ids, agent=agent, direct_agents=direct_agents
+                    text,
+                    author_ids=author_ids,
+                    agent=agent,
+                    direct_agents=direct_agents,
+                    founder_ids=founder_ids,
                 )
                 raw.append(
                     Turn(
@@ -624,6 +668,7 @@ def parse_transcript(
     author_ids: Sequence[str] = (),
     direct_agents: Sequence[str] = (),
     tool_result_truncate: int = 500,
+    founder_ids: Sequence[str] = (),
 ) -> Session | None:
     """Parse any supported transcript into a :class:`Session` (None for junk)."""
     path = Path(path)
@@ -638,6 +683,7 @@ def parse_transcript(
         "author_ids": author_ids,
         "direct_agents": direct_agents,
         "tool_result_truncate": tool_result_truncate,
+        "founder_ids": founder_ids,
     }
     if fmt == "codex":
         return parse_codex_session(path, **kwargs)

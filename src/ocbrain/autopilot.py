@@ -179,7 +179,57 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
             continue
         existing.add((result["path"], f"{result['runtime']}_history_file"))
         imported += 1
-    return {"action": "harvest", "changed": imported, "imported": imported, "skipped": skipped}
+    mem = _harvest_memory_globs(ctx, deadline)
+    imported += mem
+    return {
+        "action": "harvest",
+        "changed": imported,
+        "imported": imported,
+        "memory_imported": mem,
+        "skipped": skipped,
+    }
+
+
+def _harvest_memory_globs(ctx: AutopilotContext, deadline: float | None) -> int:
+    """Import curated memory/doctrine files (``dataset.memory_globs``) as evidence.
+
+    These are high-value files OUTSIDE the transcript session roots (e.g. a
+    per-workspace ``MEMORY.md`` carrying founder doctrine). ``upsert_evidence``
+    dedups on ``(source_uri, content_hash)`` so re-imports are idempotent.
+    """
+    import glob
+    import os
+
+    from ocbrain.cli import import_memory_file
+
+    globs = list(ctx.cfg.dataset.memory_globs)
+    if not globs:
+        return 0
+    seen: set[str] = set()
+    imported = 0
+    for pattern in globs:
+        expanded = os.path.expanduser(str(pattern))
+        for match in sorted(glob.glob(expanded, recursive=True)):
+            if _expired(deadline):
+                return imported
+            path = Path(match)
+            key = str(path)
+            if key in seen or not path.is_file():
+                continue
+            seen.add(key)
+            try:
+                result = import_memory_file(
+                    ctx.conn,
+                    path,
+                    project=None,
+                    privacy_scope="workspace",
+                    max_bytes=200_000,
+                )
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if result is not None:
+                imported += 1
+    return imported
 
 
 # --------------------------------------------------------------------------- #
@@ -216,12 +266,14 @@ class _ReviewSession:
 def _iter_settled_sessions(
     ctx: AutopilotContext, deadline: float | None
 ) -> Iterator[_ReviewSession]:
+    from ocbrain.config import founder_ids as _founder_ids
     from ocbrain.dataset.transcripts import iter_transcript_files, parse_transcript
 
     settle_seconds = ctx.cfg.review.settle_minutes * 60
     now_ns = time.time_ns()
     author_ids = ctx.cfg.dataset.persona_author_ids
     direct_agents = ctx.cfg.dataset.persona_direct_agents
+    founder_ids = _founder_ids(ctx.cfg)
     for path in iter_transcript_files(ctx.session_roots):
         if _expired(deadline):
             return
@@ -237,6 +289,7 @@ def _iter_settled_sessions(
                 author_ids=author_ids,
                 direct_agents=direct_agents,
                 tool_result_truncate=ctx.cfg.dataset.tool_result_truncate,
+                founder_ids=founder_ids,
             )
         except (OSError, UnicodeError, ValueError):
             continue

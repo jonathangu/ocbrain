@@ -37,6 +37,9 @@ def _cfg(tmp_path: Path):
             learning_db=str(tmp_path / "no-learning.db"),
             commitments_path=str(tmp_path / "no-commitments.json"),
             cron_state_path=str(tmp_path / "no-cron.json"),
+            # Keep the memory-glob harvest hermetic (the operator's real config may
+            # point at workspace doctrine files outside tmp_path).
+            memory_globs=[],
         ),
     )
 
@@ -281,3 +284,35 @@ def test_poisoned_connection_still_records_ledger(tmp_path):
     ).fetchone()
     verify.close()
     assert row is not None
+
+
+def test_harvest_memory_globs_imports_doctrine(tmp_path):
+    """dataset.memory_globs pulls curated doctrine files in as memory_file evidence.
+
+    These live OUTSIDE the transcript session roots (e.g. a per-workspace MEMORY.md
+    carrying founder doctrine that the transcript harvest never reaches).
+    """
+    conn, path = _db(tmp_path)
+    memdir = tmp_path / "doctrine"
+    memdir.mkdir()
+    (memdir / "MEMORY.md").write_text(
+        "# Doctrine\n\nUse 'ready' for ripeness and 'available' for stock.\n",
+        encoding="utf-8",
+    )
+    base = _cfg(tmp_path)
+    cfg = dataclasses.replace(
+        base,
+        dataset=dataclasses.replace(base.dataset, memory_globs=[str(memdir / "*.md")]),
+    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
+    assert autopilot._harvest_memory_globs(ctx, None) == 1
+    row = conn.execute(
+        "SELECT source_uri FROM evidence WHERE source_type = 'memory_file'"
+    ).fetchone()
+    assert row is not None and row["source_uri"].endswith("MEMORY.md")
+    # Re-running does not create a duplicate evidence row (content_hash dedup).
+    autopilot._harvest_memory_globs(ctx, None)
+    count = conn.execute(
+        "SELECT COUNT(*) FROM evidence WHERE source_type = 'memory_file'"
+    ).fetchone()[0]
+    assert count == 1

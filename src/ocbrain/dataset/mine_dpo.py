@@ -27,7 +27,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ocbrain.config import OcbrainConfig, load_config
+from ocbrain.config import OcbrainConfig, founder_ids, founder_weight, load_config
 from ocbrain.dataset.quality import store_example
 from ocbrain.dataset.transcripts import (
     Session,
@@ -65,6 +65,10 @@ class DpoPair:
     source_uri: str | None
     occurred_at: str | None
     session_id: str | None = None
+    # Author provenance of the correction (transcript pairs only): the telegram
+    # sender id who issued the correction and their founder weight (1.0 == generic).
+    corrected_by: str | None = None
+    corrector_weight: float = 1.0
 
 
 def scope_tag_to_privacy(tag: ScopeTag) -> str:
@@ -163,6 +167,8 @@ def find_transcript_pairs(session: Session, cfg: OcbrainConfig | None = None) ->
         confidence = min(0.9, correction_score(correction_text))
         if _ANSWER_RE.search(correction_text):
             confidence = 0.95
+        corrected_by = turns[u].authored_by
+        corrector_weight = founder_weight(cfg, corrected_by)
         pairs.append(
             DpoPair(
                 prompt_messages=tuple(
@@ -178,6 +184,8 @@ def find_transcript_pairs(session: Session, cfg: OcbrainConfig | None = None) ->
                 source_uri=session.source_uri,
                 occurred_at=turns[chosen_idx].ts or session.occurred_at,
                 session_id=session.session_id,
+                corrected_by=corrected_by,
+                corrector_weight=corrector_weight,
             )
         )
     return pairs
@@ -345,12 +353,7 @@ def _store_pair(conn: sqlite3.Connection, pair: DpoPair) -> dict[str, Any] | Non
         evidence_ids=list(pair.evidence_ids),
         privacy_scope=pair.privacy_scope,
         body=body,
-        metadata={
-            "correction_kind": pair.correction_kind,
-            "hard": pair.hard,
-            "confidence": pair.confidence,
-            "session_id": pair.session_id,
-        },
+        metadata=_pair_metadata(pair),
         target_text=pair.chosen,
         base_label="good",
         base_confidence=pair.confidence,
@@ -358,6 +361,22 @@ def _store_pair(conn: sqlite3.Connection, pair: DpoPair) -> dict[str, Any] | Non
         session_id=pair.session_id,
         occurred_at=pair.occurred_at,
     )
+
+
+def _pair_metadata(pair: DpoPair) -> dict[str, Any]:
+    """DPO example metadata, with founder author provenance when a founder issued
+    the correction (``corrected=chosen`` tagged with who corrected it)."""
+    meta: dict[str, Any] = {
+        "correction_kind": pair.correction_kind,
+        "hard": pair.hard,
+        "confidence": pair.confidence,
+        "session_id": pair.session_id,
+    }
+    if pair.corrected_by and pair.corrector_weight != 1.0:
+        meta["corrected_by"] = pair.corrected_by
+        meta["corrector_weight"] = pair.corrector_weight
+        meta["founder_correction"] = True
+    return meta
 
 
 def _transcript_source_kind(pair: DpoPair) -> str:
@@ -421,6 +440,7 @@ def mine_dpo(
                 author_ids=cfg.dataset.persona_author_ids,
                 direct_agents=cfg.dataset.persona_direct_agents,
                 tool_result_truncate=cfg.dataset.tool_result_truncate,
+                founder_ids=founder_ids(cfg),
             )
             emitted = 0 if session is None else _emit_transcript(session)
             record_source(conn, str(path), "dpo", fingerprint, emitted)

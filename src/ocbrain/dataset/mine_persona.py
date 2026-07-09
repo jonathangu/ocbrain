@@ -28,7 +28,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from ocbrain.config import OcbrainConfig, load_config
+from ocbrain.config import OcbrainConfig, founder_ids, load_config
 from ocbrain.dataset.quality import store_example
 from ocbrain.dataset.transcripts import Session, iter_transcript_files, parse_transcript
 from ocbrain.ids import content_hash as _content_hash
@@ -88,7 +88,15 @@ def telegram_examples(
         if not verified:
             if verified_only:
                 continue
-            # bare admitted only when the agent is a configured direct driver
+            # PERSONA ISOLATION: a turn from an IDENTIFIED non-persona sender (e.g. a
+            # founder/co-founder attributed via founder_feedback_authors, or any other
+            # named group member) is never persona/voice — only the operator's own
+            # words may become assistant targets. Their feedback flows through the
+            # signal + DPO paths instead, never here.
+            if turn.authored_by is not None:
+                continue
+            # bare, unattributed text is admitted only when the agent is a configured
+            # direct driver (the operator typing to their own main agent).
             if session.agent not in set(cfg.dataset.persona_direct_agents):
                 continue
         target = redact_secrets(turn.text.strip())
@@ -340,6 +348,7 @@ def mine_persona(
                 author_ids=cfg.dataset.persona_author_ids,
                 direct_agents=cfg.dataset.persona_direct_agents,
                 tool_result_truncate=cfg.dataset.tool_result_truncate,
+                founder_ids=founder_ids(cfg),
             )
             if session is None:
                 continue
