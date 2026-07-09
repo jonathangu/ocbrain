@@ -26,11 +26,13 @@ Hard guarantees (R6/R8):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
+import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -47,7 +49,15 @@ from ocbrain.scope import (
 )
 from ocbrain.text import redact_secrets
 
+logger = logging.getLogger(__name__)
+
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+
+# One bounded retry with backoff on transient read timeouts (the heavy run's
+# 'read operation timed out'). The call is otherwise best-effort — permanent
+# failures still propagate to the autolabel stage's guard, which records them.
+_TIMEOUT_MAX_RETRIES = 1
+_TIMEOUT_BACKOFF_SECONDS = 2.0
 
 _JUDGE_SYSTEM = (
     "You are a strict knowledge-quality judge. For each item decide whether the "
@@ -273,6 +283,58 @@ def call_openai(
         raise RuntimeError(f"judge call failed: {exc}") from exc
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """True for transient read/socket timeouts worth one retry.
+
+    ``call_openai`` lets a socket read timeout surface as ``TimeoutError``
+    (``socket.timeout`` is its alias) and wraps ``URLError`` connection failures
+    into a ``RuntimeError`` whose message carries the underlying reason, so we
+    match both the type and the 'timed out' text.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timed out" in str(exc).lower()
+
+
+def _call_with_timeout_retry(
+    call: Any,
+    payload: dict[str, Any],
+    *,
+    api_key: str,
+    model: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    """Invoke ``call`` with one bounded, backed-off retry on timeout errors.
+
+    Non-timeout failures (and a timeout that persists past the retry budget)
+    propagate unchanged.
+    """
+    attempt = 0
+    while True:
+        try:
+            return call(payload, api_key=api_key, model=model)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless a retryable timeout
+            if attempt >= _TIMEOUT_MAX_RETRIES or not _is_timeout_error(exc):
+                raise
+            attempt += 1
+            logger.warning(
+                "judge: hosted call timed out (attempt %d/%d); retrying after backoff",
+                attempt,
+                _TIMEOUT_MAX_RETRIES + 1,
+            )
+            sleep(_TIMEOUT_BACKOFF_SECONDS * attempt)
+
+
+def _knowledge_exists(conn: sqlite3.Connection, knowledge_id: Any) -> bool:
+    """Whether ``knowledge_id`` still names a live ``knowledge`` row."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM knowledge WHERE id = ? LIMIT 1", (knowledge_id,)
+        ).fetchone()
+        is not None
+    )
+
+
 def _cost_usd(cfg: Any, model: str, usage: dict[str, Any]) -> float:
     prices = cfg.judge.price_per_mtok.get(model)
     if not prices:
@@ -353,6 +415,7 @@ def judge_ambiguous(
     call: Any = call_openai,
     now: datetime | None = None,
     env: Mapping[str, str] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Judge ambiguous rows within budget; fold verdicts as ``llm_judge`` signals.
 
@@ -386,6 +449,7 @@ def judge_ambiguous(
 
     total_cost = spent_today(conn, now=now)
     folded = 0
+    skipped_missing = 0
     batches = 0
     for start in range(0, len(rows), cfg.judge.batch_size):
         batch = rows[start : start + cfg.judge.batch_size]
@@ -404,7 +468,9 @@ def judge_ambiguous(
 
         payload = _build_payload(cfg, model, included)
         request_hash = sha256_text(canonical_json(payload))
-        response = call(payload, api_key=api_key, model=model)
+        response = _call_with_timeout_retry(
+            call, payload, api_key=api_key, model=model, sleep=sleep
+        )
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
         cost = _cost_usd(cfg, model, usage)
         verdicts = _parse_verdicts(response)
@@ -421,7 +487,9 @@ def judge_ambiguous(
             egress_audit_id=audit_id,
             ts=now_iso(),
         )
-        folded += _fold_verdicts(conn, cfg, verdicts)
+        fold_n, skip_n = _fold_verdicts(conn, cfg, verdicts)
+        folded += fold_n
+        skipped_missing += skip_n
         batches += 1
         total_cost += cost
         if total_cost >= cfg.judge.daily_usd_cap:
@@ -432,6 +500,7 @@ def judge_ambiguous(
         "changed": folded,
         "status": "ok",
         "batches": batches,
+        "skipped_missing": skipped_missing,
     }
 
 
@@ -487,12 +556,29 @@ def _write_egress_audit(
 
 def _fold_verdicts(
     conn: sqlite3.Connection, cfg: Any, verdicts: list[dict[str, Any]]
-) -> int:
+) -> tuple[int, int]:
+    """Fold verdicts into ``llm_judge`` signals. Returns ``(folded, skipped)``.
+
+    A verdict id round-trips through a hosted model and may be *stale* (the row
+    was archived/deleted between selection and fold) or *hallucinated* (an id we
+    never sent). ``signal_events.knowledge_id`` carries a FK to ``knowledge(id)``
+    and SQLite's ``INSERT OR IGNORE`` does NOT suppress FK violations, so folding
+    an unknown id raises 'FOREIGN KEY constraint failed' and aborts the whole
+    run. We skip-and-log those instead so real verdicts still land.
+    """
     folded = 0
+    skipped = 0
     for verdict in verdicts:
         polarity = _VERDICT_POLARITY.get(str(verdict.get("label")))
         knowledge_id = verdict.get("id")
         if polarity is None or not knowledge_id:
+            continue
+        if not _knowledge_exists(conn, knowledge_id):
+            skipped += 1
+            logger.warning(
+                "judge: skipping verdict for unknown knowledge id "
+                "(stale/archived/hallucinated); not folding"
+            )
             continue
         record_signal(
             conn,
@@ -510,4 +596,4 @@ def _fold_verdicts(
             ),
         )
         folded += 1
-    return folded
+    return folded, skipped

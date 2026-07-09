@@ -243,6 +243,124 @@ def test_verdict_folds_to_signal(tmp_path: Path) -> None:
     assert signal["knowledge_id"] == kid
 
 
+def test_fold_skips_row_deleted_between_selection_and_write(tmp_path: Path) -> None:
+    # Ruling 2: the real light-run FK failure. A row selected for judging is
+    # archived/deleted before the verdict is folded; signal_events.knowledge_id
+    # FKs to knowledge(id) and INSERT OR IGNORE does NOT suppress FK violations,
+    # so the naive fold aborts the run with 'FOREIGN KEY constraint failed'.
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    kid = _neutral_with_mass(conn, "vanishing")
+
+    def deleting_call(payload, *, api_key, model):
+        # Simulate a concurrent archive/delete landing between selection and fold.
+        conn.execute("DELETE FROM signal_events WHERE knowledge_id=?", (kid,))
+        conn.execute("DELETE FROM knowledge WHERE id=?", (kid,))
+        items = json.loads(payload["messages"][1]["content"])
+        verdicts = [
+            {"id": item["id"], "label": "good", "confidence": 0.8, "rationale": "ok"}
+            for item in items
+        ]
+        return {
+            "choices": [{"message": {"content": json.dumps(verdicts)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        }
+
+    result = judge_ambiguous(conn, cfg, call=deleting_call, env=KEY_ENV)
+    # No crash; the run completes and records the skip.
+    assert result["status"] == "ok"
+    assert result["changed"] == 0
+    assert result["skipped_missing"] >= 1
+    # A judge_runs row with items>0 still lands (the batch WAS dispatched).
+    run = conn.execute(
+        "SELECT COUNT(*) FROM judge_runs WHERE status='ok' AND item_count>0"
+    ).fetchone()[0]
+    assert run >= 1
+    # No dangling signal for the deleted row.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM signal_events WHERE kind='llm_judge'"
+    ).fetchone()[0] == 0
+
+
+def test_fold_skips_hallucinated_verdict_id(tmp_path: Path) -> None:
+    # The hosted model echoes an id we never sent (or a mangled one).
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    kid = _neutral_with_mass(conn, "real")
+
+    def ghost_call(payload, *, api_key, model):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            [
+                                {"id": kid, "label": "good", "confidence": 0.7},
+                                {"id": "know-ghost-does-not-exist", "label": "bad",
+                                 "confidence": 0.9},
+                            ]
+                        )
+                    }
+                }
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        }
+
+    result = judge_ambiguous(conn, cfg, call=ghost_call, env=KEY_ENV)
+    assert result["status"] == "ok"
+    assert result["changed"] == 1  # the real row folded
+    assert result["skipped_missing"] == 1  # the ghost skipped, no crash
+    folded = conn.execute(
+        "SELECT knowledge_id FROM signal_events WHERE kind='llm_judge'"
+    ).fetchall()
+    assert [r["knowledge_id"] for r in folded] == [kid]
+
+
+def test_call_retries_once_on_read_timeout(tmp_path: Path) -> None:
+    # Ruling 2: heavy-run transient 'read operation timed out' -> one bounded retry.
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    kid = _neutral_with_mass(conn, "flaky")
+    calls = {"n": 0}
+
+    def flaky_call(payload, *, api_key, model):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("The read operation timed out")
+        items = json.loads(payload["messages"][1]["content"])
+        verdicts = [{"id": item["id"], "label": "good", "confidence": 0.8} for item in items]
+        return {
+            "choices": [{"message": {"content": json.dumps(verdicts)}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+        }
+
+    result = judge_ambiguous(
+        conn, cfg, call=flaky_call, env=KEY_ENV, sleep=lambda _s: None
+    )
+    assert calls["n"] == 2  # one retry
+    assert result["status"] == "ok"
+    assert result["changed"] >= 1
+    signal = conn.execute(
+        "SELECT knowledge_id FROM signal_events WHERE kind='llm_judge'"
+    ).fetchone()
+    assert signal["knowledge_id"] == kid
+
+
+def test_call_reraises_persistent_timeout(tmp_path: Path) -> None:
+    # A timeout that outlives the retry budget still propagates (autolabel guards it).
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    _neutral_with_mass(conn, "dead")
+
+    def always_timeout(payload, *, api_key, model):
+        raise TimeoutError("The read operation timed out")
+
+    import pytest
+
+    with pytest.raises(TimeoutError):
+        judge_ambiguous(conn, cfg, call=always_timeout, env=KEY_ENV, sleep=lambda _s: None)
+
+
 def test_response_stores_verdicts_only_and_audit(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)

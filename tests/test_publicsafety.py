@@ -151,6 +151,109 @@ def test_test_dir_excluded_from_content_scans(repo: Path) -> None:
     assert result.ok, result.report()
 
 
+# --- assigned_secret precision (ruling 1a) -------------------------------- #
+
+
+def _commit_added_line(repo: Path, rel: str, line: str) -> str:
+    """Commit ``rel`` containing ``line`` and return ``base..head`` for scan()."""
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / rel).write_text(line + "\n", encoding="utf-8")
+    _git(repo, "add", rel)
+    _git(repo, "commit", "-q", "-m", f"add {rel}")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    return f"{base}..{head}"
+
+
+def test_assigned_secret_fires_on_quoted_literal(repo: Path) -> None:
+    # RHS is a quoted literal of plausible secret length -> real leak, caught.
+    rng = _commit_added_line(repo, "conf.py", 'password = "hunter2plausiblelen"')
+    result = ps.scan(repo, diff_range=rng)
+    leaks = [f for f in result.findings if f.rule == "secret_leak"]
+    assert leaks and leaks[0].path == "conf.py", result.report()
+    assert "assigned_secret" in leaks[0].detail
+
+
+def test_assigned_secret_ignores_env_lookup(repo: Path) -> None:
+    # The exact embed.py false-positive shape: env lookup, not a secret.
+    rng = _commit_added_line(
+        repo, "embed.py", "    api_key = resolved_env.get(cfg.embed.api_key_env)"
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "secret_leak" for f in result.findings), result.report()
+
+
+def test_assigned_secret_ignores_identifier_and_annotation(repo: Path) -> None:
+    for line in (
+        "    api_key: str,",  # type annotation
+        "    response = call(payload, api_key=api_key, model=model)",  # identifier
+        "    secret = self.config.secret  # attribute access",  # attribute access
+    ):
+        rng = _commit_added_line(repo, "mod.py", line)
+        result = ps.scan(repo, diff_range=rng)
+        assert not any(
+            f.rule == "secret_leak" for f in result.findings
+        ), f"{line!r} -> {result.report()}"
+
+
+def test_refine_secret_leaks_unit() -> None:
+    # env lookup: assigned_secret dropped.
+    assert ps.refine_secret_leaks(
+        "api_key = resolved_env.get(x)", ["assigned_secret"]
+    ) == []
+    # quoted literal: assigned_secret kept.
+    assert ps.refine_secret_leaks(
+        'token = "xoxb-plausible-length"', []
+    ) == ["assigned_secret"]
+    # unrelated format leak passes through untouched.
+    assert ps.refine_secret_leaks("k = v", ["openai_key"]) == ["openai_key"]
+
+
+# --- plist entropy / private-path exemption (ruling 1b) ------------------- #
+
+
+def test_plist_skips_entropy_and_private_path(repo: Path) -> None:
+    # A launchd plist whose <string> carries wrapper + workspace log paths.
+    (repo / "ops").mkdir()
+    plist = (
+        "<plist><array>\n"
+        "  <string>/Users/bob/other-private/service-env/run-wrapper.sh</string>\n"
+        "  <string>/Users/bob/code/employer-secret-repo/logs/out.log</string>\n"
+        "</array></plist>\n"
+    )
+    base = _git(repo, "rev-parse", "HEAD").strip()
+    (repo / "ops" / "svc.plist").write_text(plist, encoding="utf-8")
+    _git(repo, "add", "ops/svc.plist")
+    _git(repo, "commit", "-q", "-m", "add plist")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    result = ps.scan(repo, diff_range=f"{base}..{head}")
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+    assert not any(f.rule == "private_path" for f in result.findings), result.report()
+
+
+def test_plist_still_subject_to_placement_and_denylist(repo: Path) -> None:
+    # Placement (a) and denylist (b) STILL apply to plists.
+    _write_denylist(repo, [FAKE_DENY])
+    (repo / "ops").mkdir()
+    (repo / "ops" / "svc.plist").write_text(
+        f"<plist><string>marker {FAKE_DENY} here</string></plist>\n", encoding="utf-8"
+    )
+    (repo / "logs").mkdir()
+    (repo / "logs" / "job.plist").write_text("<plist/>\n", encoding="utf-8")
+    _git(repo, "add", "-f", "ops/svc.plist", "logs/job.plist")
+    _git(repo, "commit", "-q", "-m", "plist with deny + bad placement")
+    result = ps.scan(repo)
+    assert any(f.rule == "denylist" for f in result.findings), result.report()
+    assert any(
+        f.rule == "tracked_data_artifact" and f.path == "logs/job.plist"
+        for f in result.findings
+    ), result.report()
+
+
+def test_entropy_pathcheck_excluded_unit() -> None:
+    assert ps.entropy_pathcheck_excluded("ops/com.jonathangu.ocbrain.autopilot.light.plist")
+    assert not ps.entropy_pathcheck_excluded("src/ocbrain/cli.py")
+
+
 def test_diff_range_ignores_removed_lines(repo: Path) -> None:
     # Removing a secret must not be flagged as adding one.
     (repo / "old.py").write_text(f'X = "{FAKE_SECRET}"\n', encoding="utf-8")

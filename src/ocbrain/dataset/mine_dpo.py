@@ -31,6 +31,7 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ocbrain.config import OcbrainConfig, founder_ids, founder_weight, load_config
@@ -616,3 +617,186 @@ def mine_dpo(
         "excluded": excluded,
         "files_mined": files_mined,
     }
+
+
+# --------------------------------------------------------------------------- #
+# One-time founder re-mine (v0.3, Ruling 3)
+# --------------------------------------------------------------------------- #
+# Real founder corrections sat in sessions fingerprint-watermarked as mined under
+# the OLD strict gate, so ``iter_unmined_transcripts`` skips them and the relaxed
+# gate never re-examines them. This narrow, idempotent mechanism BYPASSES (never
+# clears) the dpo watermark ledger for sessions that actually contain a configured
+# founder id — read from LOCAL config only — and re-mines just those files under
+# the relaxed gate. The ``dataset_sources`` watermark ledger is left untouched, so
+# normal watermarking is preserved for every later run; content-hash + dedup-key
+# in ``store_example`` make re-runs produce no duplicate examples.
+
+
+def _session_has_founder_turn(session: Session, founder: set[str]) -> bool:
+    """True if any non-injected user turn was authored by a configured founder."""
+    return any(
+        turn.role == "user"
+        and turn.kind != "injected"
+        and turn.authored_by in founder
+        for turn in session.turns
+    )
+
+
+def remine_founder_sessions(
+    conn: sqlite3.Connection,
+    *,
+    cfg: OcbrainConfig | None = None,
+    roots: Iterable[str] | None = None,
+    limit: int | None = None,
+    time_budget_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Re-mine watermarked transcripts that contain a founder correction.
+
+    Additive and idempotent: bypasses the dpo watermark for founder-bearing
+    sessions only, re-mines them under the relaxed gate, and stores any new pairs
+    (dedup drops what was already mined). Returns counts plus the ids of the
+    founder-provenance pairs that now exist. Founder identifiers are read from
+    LOCAL config and are never returned or logged.
+    """
+    cfg = cfg or load_config()
+    from ocbrain.dataset.transcripts import (
+        iter_transcript_files,
+        resolve_transcript_evidence,
+    )
+
+    founder = set(founder_ids(cfg))
+    base = {
+        "ok": True,
+        "dataset": "dpo",
+        "mode": "founder_rescan",
+        "files_scanned": 0,
+        "files_remined": 0,
+        "stored": 0,
+        "excluded": 0,
+        "founder_pairs": 0,
+        "founder_pair_ids": [],
+    }
+    if not founder:
+        base["reason"] = "no_founder_ids"
+        return base
+
+    search_roots = list(roots) if roots is not None else list(cfg.review.session_roots)
+    started = time.monotonic()
+    files_scanned = files_remined = stored = excluded = founder_pairs = 0
+    founder_pair_ids: list[str] = []
+
+    for path in iter_transcript_files(search_roots):
+        if (
+            time_budget_seconds is not None
+            and time.monotonic() - started > time_budget_seconds
+        ):
+            break
+        files_scanned += 1
+        # Cheap pre-filter: the raw file must mention a founder id before we pay to
+        # parse it. Parse then confirms a genuine founder-authored turn.
+        try:
+            raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not any(fid in raw for fid in founder):
+            continue
+        session = parse_transcript(
+            path,
+            author_ids=cfg.dataset.persona_author_ids,
+            direct_agents=cfg.dataset.persona_direct_agents,
+            tool_result_truncate=cfg.dataset.tool_result_truncate,
+            founder_ids=list(founder),
+        )
+        if session is None or not _session_has_founder_turn(session, founder):
+            continue
+        files_remined += 1
+        evidence_id, scope = resolve_transcript_evidence(conn, session)
+        for pair in find_transcript_pairs(session, cfg):
+            pair = DpoPair(
+                **{**pair.__dict__, "evidence_ids": (evidence_id,), "privacy_scope": scope}
+            )
+            result = _store_pair(conn, pair)
+            if result is None:
+                continue
+            if result["quality_label"] == "excluded":
+                excluded += 1
+            else:
+                stored += 1
+            # Founder-provenance pair: a relaxed-gate pair whose correction turn was
+            # authored by a founder (corrected_by is stamped only for weight != 1.0).
+            if (
+                pair.gate == "relaxed"
+                and pair.corrected_by in founder
+                and result["quality_label"] != "excluded"
+            ):
+                founder_pairs += 1
+                founder_pair_ids.append(result["id"])
+        if limit is not None and files_remined >= limit:
+            break
+
+    base.update(
+        {
+            "files_scanned": files_scanned,
+            "files_remined": files_remined,
+            "stored": stored,
+            "excluded": excluded,
+            "founder_pairs": founder_pairs,
+            "founder_pair_ids": founder_pair_ids,
+        }
+    )
+    return base
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """``python -m ocbrain.dataset.mine_dpo --founder-rescan`` entry point.
+
+    A deliberately narrow, one-time driver for the founder re-mine. Uses the live
+    DB/config paths from ``$OCBRAIN_DB`` / ``$OCBRAIN_CONFIG`` (same env the
+    autopilot wrapper exports). Never prints founder identifiers.
+    """
+    import argparse
+    import os
+
+    from ocbrain.db import connect, init_db
+
+    parser = argparse.ArgumentParser(prog="ocbrain.dataset.mine_dpo")
+    parser.add_argument(
+        "--founder-rescan",
+        action="store_true",
+        help="Re-mine watermarked founder-bearing sessions under the relaxed gate",
+    )
+    parser.add_argument("--db", default=os.environ.get("OCBRAIN_DB", "data/ocbrain.sqlite"))
+    parser.add_argument("--root", action="append", dest="roots", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--time-budget", type=float, default=None)
+    args = parser.parse_args(argv)
+
+    if not args.founder_rescan:
+        parser.error("no action requested; pass --founder-rescan")
+
+    cfg = load_config()
+    conn = connect(Path(args.db))
+    # The live brain is a busy, shared DB (launchd cycles + MCP servers write to
+    # it). Wait politely for the write lock rather than failing fast so init_db's
+    # migration and our writes don't lose a lock race under contention.
+    conn.execute("PRAGMA busy_timeout=120000")
+    init_db(conn)
+    try:
+        result = remine_founder_sessions(
+            conn,
+            cfg=cfg,
+            roots=args.roots,
+            limit=args.limit,
+            time_budget_seconds=args.time_budget,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # Never emit founder_pair ids' authorship; ids here are synthetic dsx_* stable
+    # ids, safe to print. corrected_by (a real id) is NOT included by the miner.
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - thin CLI shim
+    raise SystemExit(_main())

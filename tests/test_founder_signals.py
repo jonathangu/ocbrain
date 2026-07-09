@@ -20,10 +20,21 @@ from pathlib import Path
 
 from ocbrain.autolabel import label_from_signals
 from ocbrain.config import founder_ids, founder_weight, load_config
-from ocbrain.dataset.mine_dpo import find_transcript_pairs, mine_dpo
+from ocbrain.dataset.mine_dpo import (
+    find_transcript_pairs,
+    mine_dpo,
+    remine_founder_sessions,
+)
 from ocbrain.dataset.mine_persona import mine_persona, telegram_examples
-from ocbrain.dataset.transcripts import Session, Turn, classify_user_text, parse_openclaw_session
+from ocbrain.dataset.transcripts import (
+    Session,
+    Turn,
+    classify_user_text,
+    parse_openclaw_session,
+    record_source,
+)
 from ocbrain.db import connect, init_db, upsert_evidence
+from ocbrain.fsutil import file_fingerprint
 from ocbrain.review import review_session
 
 # --- synthetic identities (NOT real telegram ids) ---------------------------- #
@@ -240,6 +251,110 @@ def test_dpo_generic_correction_no_provenance(tmp_path: Path):
     pairs = find_transcript_pairs(_dpo_session(STRANGER), cfg)
     assert len(pairs) == 1
     assert pairs[0].corrector_weight == 1.0
+
+
+# --------------------------------------------------------------------------- #
+# DPO founder RE-MINE (Ruling 3): bypass the watermark for founder sessions
+# --------------------------------------------------------------------------- #
+# A founder correction that is the thread's LAST WORD (no accepted answer
+# follows) — the relaxed-gate case (a) that strict mining never emits.
+_REJECTED_A1 = "The answer is forty-two per my first and frankly hasty guess about the deploy."
+_FOUNDER_FIX = "No, fix that: the deploy is driven by scripts/run.sh; use that script instead."
+
+
+def _founder_lastword_file(tmp_path: Path, name: str = "fr1.jsonl") -> Path:
+    lines = [
+        {"type": "session", "id": name, "version": "1", "timestamp": "2026-07-01T00:00:00Z"},
+        {"type": "message", "message": {
+            "role": "user", "content": "please help me with the whole deploy process end to end"}},
+        {"type": "message", "message": {
+            "role": "assistant", "content": [{"type": "text", "text": _REJECTED_A1}]}},
+        # Founder's correction as a telegram envelope, and the thread's last word.
+        {"type": "message", "message": {
+            "role": "user", "content": _envelope(FOUNDER, _FOUNDER_FIX)}},
+    ]
+    root = tmp_path / "agents" / "main" / "sessions"
+    root.mkdir(parents=True)
+    path = root / name
+    path.write_text("\n".join(json.dumps(o) for o in lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _founder_relaxed_examples(conn):
+    """dataset_examples rows that are relaxed-gate founder-provenance pairs, live."""
+    rows = conn.execute(
+        "SELECT id, quality_label, example_json FROM dataset_examples WHERE dataset='dpo'"
+    ).fetchall()
+    out = []
+    for r in rows:
+        meta = json.loads(r["example_json"])["metadata"]
+        if meta.get("gate") == "relaxed" and meta.get("corrected_by") == FOUNDER:
+            out.append((r["id"], r["quality_label"], meta))
+    return out
+
+
+def test_founder_rescan_bypasses_watermark(tmp_path: Path):
+    conn = _conn(tmp_path)
+    cfg = _cfg(tmp_path)
+    path = _founder_lastword_file(tmp_path)
+    root = str(tmp_path / "agents")
+
+    # Watermark the file as already mined under the OLD gate.
+    record_source(conn, str(path), "dpo", file_fingerprint(path), emitted=0)
+
+    # A normal incremental mine SKIPS the watermarked file: nothing new lands.
+    normal = mine_dpo(conn, cfg=cfg, roots=[root], include_events=False)
+    assert normal["files_mined"] == 0
+    assert not _founder_relaxed_examples(conn)
+
+    # The re-mine BYPASSES the watermark and lands the founder-provenance pair.
+    res = remine_founder_sessions(conn, cfg=cfg, roots=[root])
+    assert res["files_remined"] == 1
+    assert res["founder_pairs"] >= 1
+    landed = _founder_relaxed_examples(conn)
+    good = [x for x in landed if x[1] != "excluded"]
+    assert len(good) >= 1
+    _id, _label, meta = good[0]
+    assert meta["gate"] == "relaxed"
+    assert meta["corrected_by"] == FOUNDER
+    assert meta["founder_correction"] is True
+    assert _id in res["founder_pair_ids"]
+
+    # The watermark ledger is UNTOUCHED (normal watermarking preserved).
+    fp = conn.execute(
+        "SELECT fingerprint FROM dataset_sources WHERE source_uri=? AND dataset='dpo'",
+        (str(path),),
+    ).fetchone()["fingerprint"]
+    assert fp == file_fingerprint(path)
+
+
+def test_founder_rescan_idempotent_no_duplicates(tmp_path: Path):
+    conn = _conn(tmp_path)
+    cfg = _cfg(tmp_path)
+    path = _founder_lastword_file(tmp_path)
+    root = str(tmp_path / "agents")
+    record_source(conn, str(path), "dpo", file_fingerprint(path), emitted=0)
+
+    first = remine_founder_sessions(conn, cfg=cfg, roots=[root])
+    assert first["founder_pairs"] >= 1
+    before = conn.execute("SELECT COUNT(*) FROM dataset_examples WHERE dataset='dpo'").fetchone()[0]
+
+    # Second run stores no NEW founder pair (content-hash + dedup-key idempotency).
+    second = remine_founder_sessions(conn, cfg=cfg, roots=[root])
+    assert second["founder_pairs"] == 0
+    after = conn.execute("SELECT COUNT(*) FROM dataset_examples WHERE dataset='dpo'").fetchone()[0]
+    assert after == before
+    # Exactly one non-excluded founder-provenance example exists.
+    good = [x for x in _founder_relaxed_examples(conn) if x[1] != "excluded"]
+    assert len(good) == 1
+
+
+def test_founder_rescan_noop_without_founder_ids(tmp_path: Path):
+    conn = _conn(tmp_path)
+    empty = load_config(tmp_path / "missing.json")  # no founder ids configured
+    res = remine_founder_sessions(conn, cfg=empty, roots=[str(tmp_path)])
+    assert res["founder_pairs"] == 0
+    assert res.get("reason") == "no_founder_ids"
 
 
 # --------------------------------------------------------------------------- #

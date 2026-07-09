@@ -60,6 +60,20 @@ _CONTENT_SKIP_EXACT = {"uv.lock", "src/ocbrain/publicsafety.py", DENYLIST_REL}
 _USERS_PATH_RE = re.compile(r"/Users/[^\s:\"'()\[\]<>|]+")
 _CONTAINER_RE = re.compile(r"/(?:workspace|code|repos|projects|git)/([A-Za-z0-9][A-Za-z0-9._-]*)")
 
+# ``assigned_secret`` (text.py) fires on keyword-assignment to an UNQUOTED RHS,
+# which is exactly the false-positive class the real tree proves out:
+# ``api_key = resolved_env.get(...)``, ``api_key: str``, ``api_key=api_key`` --
+# an env lookup, a type annotation, an identifier, never a secret. In the
+# tracked-tree guard we DISCARD text.py's assigned_secret hit and re-derive it
+# ourselves, firing ONLY when the RHS is a quoted string literal of plausible
+# secret length. This narrows false positives without weakening detection: the
+# format-anchored (sk-/ghp_/xox…) and high-entropy scanners still catch real
+# random secrets whether quoted or not, and this now ALSO catches a plausible
+# quoted literal the source pattern structurally could not.
+_QUOTED_SECRET_ASSIGN_RE = re.compile(
+    r"""(?i)(api[_-]?key|secret|token|password|credential)\s*[:=]\s*["'][^"']{8,}["']"""
+)
+
 
 # --- findings ------------------------------------------------------------- #
 
@@ -190,6 +204,28 @@ def content_scan_excluded(rel: str) -> bool:
     )
 
 
+def entropy_pathcheck_excluded(rel: str) -> bool:
+    """True for files exempt from ONLY the two heuristic content checks --
+    high_entropy (c) and private_path (d). launchd plists (``ops/*.plist``)
+    legitimately embed absolute wrapper/log path strings that read as long
+    high-entropy runs and workspace path segments. Placement (a) and denylist
+    (b) STILL apply to plists; only these two heuristics are relaxed."""
+
+    return rel.endswith(".plist")
+
+
+def refine_secret_leaks(content: str, leaks: list[str]) -> list[str]:
+    """Re-derive the heuristic ``assigned_secret`` finding under the guard's
+    stricter, quoted-literal rule. Every other (format/entropy-anchored) leak
+    name passes through untouched; ``assigned_secret`` is kept only when the
+    line carries a quoted secret literal of plausible length."""
+
+    refined = [name for name in leaks if name != "assigned_secret"]
+    if _QUOTED_SECRET_ASSIGN_RE.search(content):
+        refined.append("assigned_secret")
+    return refined
+
+
 # --- git plumbing --------------------------------------------------------- #
 
 
@@ -295,16 +331,18 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                             line=i,
                         )
                     )
-            # (d) private /Users/ path -- tree-wide.
-            for seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
-                result.findings.append(
-                    Finding(
-                        "private_path",
-                        rel,
-                        f"absolute /Users/ path reveals non-allowlisted segment '{seg}'",
-                        line=i,
+            # (d) private /Users/ path -- tree-wide, except plists (see
+            # entropy_pathcheck_excluded: wrapper/log paths are legitimate).
+            if not entropy_pathcheck_excluded(rel):
+                for seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
+                    result.findings.append(
+                        Finding(
+                            "private_path",
+                            rel,
+                            f"absolute /Users/ path reveals non-allowlisted segment '{seg}'",
+                            line=i,
+                        )
                     )
-                )
 
     # (c) new secrets -- diff-scoped, high false-positive tree-wide so added
     # lines only. Reuses the text.py secret/leak + entropy scanners.
@@ -312,7 +350,7 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
         for rel, lineno, content in git_added_lines(root, diff_range):
             if content_scan_excluded(rel):
                 continue
-            leaks = find_probable_secret_leaks(content)
+            leaks = refine_secret_leaks(content, find_probable_secret_leaks(content))
             if leaks:
                 result.findings.append(
                     Finding(
@@ -322,15 +360,18 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                         line=lineno,
                     )
                 )
-            spans = find_high_entropy_spans(content)
-            if spans:
-                result.findings.append(
-                    Finding(
-                        "high_entropy",
-                        rel,
-                        f"added line has high-entropy token (len {max(len(s) for s in spans)})",
-                        line=lineno,
+            # high_entropy (c) skips plists -- their absolute path strings read as
+            # long high-entropy runs (see entropy_pathcheck_excluded).
+            if not entropy_pathcheck_excluded(rel):
+                spans = find_high_entropy_spans(content)
+                if spans:
+                    result.findings.append(
+                        Finding(
+                            "high_entropy",
+                            rel,
+                            f"added line has high-entropy token (len {max(len(s) for s in spans)})",
+                            line=lineno,
+                        )
                     )
-                )
 
     return result
