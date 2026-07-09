@@ -426,6 +426,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dataset_stats_parser.set_defaults(func=cmd_dataset_stats)
 
+    # --- public-safety enforcement (tracked-tree scanner + hooks) ----------
+    public_safety_parser = subparsers.add_parser(
+        "public-safety-check",
+        help="Scan the tracked tree for private data before it reaches the public repo",
+    )
+    public_safety_parser.add_argument(
+        "--diff-range",
+        help="git range (e.g. origin/main..HEAD) to scan added lines for new secrets",
+    )
+    public_safety_parser.add_argument(
+        "--root", type=Path, help="repo root (default: git toplevel of the cwd)"
+    )
+    public_safety_parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    public_safety_parser.set_defaults(func=cmd_public_safety_check)
+
+    install_hooks_parser = subparsers.add_parser(
+        "install-hooks", help="Symlink tracked git hooks (ops/hooks) into .git/hooks"
+    )
+    install_hooks_parser.add_argument(
+        "--root", type=Path, help="repo root (default: git toplevel of the cwd)"
+    )
+    install_hooks_parser.set_defaults(func=cmd_install_hooks)
+
     parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
     return parser
 
@@ -1549,6 +1572,63 @@ def cmd_dataset_export(args: argparse.Namespace) -> int:
 def cmd_dataset_stats(args: argparse.Namespace) -> int:
     conn = open_db(args)
     output(args, dataset_stats(conn))
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# public-safety enforcement (keep private data out of the public repo)
+# --------------------------------------------------------------------------- #
+def _resolve_repo_root(explicit: Path | None) -> Path:
+    if explicit is not None:
+        return explicit
+    import subprocess
+
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return Path.cwd()
+    return Path(top) if top else Path.cwd()
+
+
+def cmd_public_safety_check(args: argparse.Namespace) -> int:
+    from ocbrain.publicsafety import scan
+
+    root = _resolve_repo_root(getattr(args, "root", None))
+    result = scan(root, diff_range=getattr(args, "diff_range", None))
+    if getattr(args, "json", False):
+        output(args, result.to_dict())
+    else:
+        print(result.report(), file=sys.stderr)
+    return 0 if result.ok else 1
+
+
+def cmd_install_hooks(args: argparse.Namespace) -> int:
+    import os
+
+    root = _resolve_repo_root(getattr(args, "root", None))
+    hooks_src = root / "ops" / "hooks"
+    hooks_dst = root / ".git" / "hooks"
+    if not hooks_src.is_dir():
+        raise ValueError(f"no tracked hooks directory at {hooks_src}")
+    if not hooks_dst.is_dir():
+        raise ValueError(f"no .git/hooks directory at {hooks_dst} (not a git working copy?)")
+    installed: list[dict[str, str]] = []
+    for hook in sorted(hooks_src.iterdir()):
+        if hook.name.startswith(".") or not hook.is_file():
+            continue
+        target = hooks_dst / hook.name
+        rel = os.path.relpath(hook, hooks_dst)
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.symlink_to(rel)
+        os.chmod(hook, 0o755)
+        installed.append({"hook": hook.name, "link": str(target), "points_to": rel})
+    output(args, {"installed": installed, "count": len(installed)})
     return 0
 
 

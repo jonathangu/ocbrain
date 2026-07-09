@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ocbrain public-safety pre-push hook.
+#
+# Enforces Jonathan's standing directive: anything safe to see may go to the
+# public repo, but private memories / private-repo material never may. This
+# hook scans the OUTGOING commit range for placement, denylist, private-path,
+# and new-secret violations and BLOCKS the push (nonzero exit) on any finding.
+#
+# It reads git only -- never the runtime brain DB. Installed via
+# `ocbrain install-hooks` (symlink into .git/hooks/pre-push).
+#
+# Bypass (human override, use sparingly): git push --no-verify
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PY="$(command -v python3 || true)"
+if [[ -z "${PY}" ]]; then
+  echo "pre-push: python3 not found on PATH; cannot run public-safety-check" >&2
+  exit 1
+fi
+
+run_check() {
+  local range="$1"
+  local args=(--root "${ROOT}")
+  if [[ -n "${range}" ]]; then
+    args+=(--diff-range "${range}")
+  fi
+  PYTHONPATH="${ROOT}/src" "${PY}" -m ocbrain.cli public-safety-check "${args[@]}"
+}
+
+zero="0000000000000000000000000000000000000000"
+status=0
+scanned_any=0
+
+# git feeds "<local ref> <local sha> <remote ref> <remote sha>" on stdin.
+while read -r local_ref local_sha remote_ref remote_sha; do
+  scanned_any=1
+  [[ "${local_sha}" == "${zero}" ]] && continue  # branch deletion, nothing to scan
+  if [[ "${remote_sha}" == "${zero}" ]]; then
+    # New remote branch: scan commits not already on origin/main when possible.
+    if git rev-parse --verify --quiet origin/main >/dev/null; then
+      range="origin/main..${local_sha}"
+    else
+      range=""
+    fi
+  else
+    range="${remote_sha}..${local_sha}"
+  fi
+  if ! run_check "${range}"; then
+    status=1
+  fi
+done
+
+# Direct invocation / no stdin refs: fall back to the default outgoing range.
+if [[ "${scanned_any}" -eq 0 ]]; then
+  if git rev-parse --verify --quiet origin/main >/dev/null; then
+    range="origin/main..HEAD"
+  else
+    range=""
+  fi
+  if ! run_check "${range}"; then
+    status=1
+  fi
+fi
+
+if [[ "${status}" -ne 0 ]]; then
+  echo "pre-push: BLOCKED by ocbrain public-safety-check. Fix findings or override with --no-verify." >&2
+fi
+exit "${status}"

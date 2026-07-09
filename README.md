@@ -292,6 +292,38 @@ writes correction evidence. `liveness-check` reads runner deadman rows and
 writes loop tripwire evidence such as `heartbeat_starved` or
 `no_ledger_writes`; it does not claim lanes or enqueue loop work.
 
+## Public safety
+
+This is a **public** repository. The default is enforced, not just intended:
+code, tests, and docs are public; runtime data is not. Nothing under `data/` or
+`logs/`, no `*.sqlite` / `*.jsonl` dataset artifact, and no private memories,
+transcripts, or local config may ever be tracked. `data/` is fully gitignored.
+
+A tracked-tree scanner enforces this. It reads git only (never the runtime
+brain DB) and checks the outgoing commit range for four violation classes:
+
+- **placement** — no tracked file under `data/` or `logs/`, no dataset artifact.
+- **denylist** — no hits against a local, gitignored list of private
+  identifiers (`data/public-safety-denylist.txt`). The list is never committed;
+  if it is absent the scanner warns and continues with built-in secret patterns.
+  Findings report counts and locations only — never the matched value.
+- **new secrets** — no high-entropy tokens or known secret patterns in
+  newly-added diff lines (reuses the shared `text.py` scanners).
+- **private paths** — no absolute `/Users/` paths that reveal a repo outside a
+  small allowlist (this repo plus orchestrator infra).
+
+```bash
+# scan the whole tracked tree
+uv run --with-editable . ocbrain public-safety-check
+# scan an outgoing range (what the pre-push hook runs)
+uv run --with-editable . ocbrain public-safety-check --diff-range origin/main..HEAD
+# install the pre-push hook (symlinks ops/hooks/pre-push into .git/hooks)
+uv run --with-editable . ocbrain install-hooks
+```
+
+The `pre-push` hook (tracked at `ops/hooks/`) runs the check on every push and
+blocks it on any finding; a human can override with `git push --no-verify`.
+
 ## Verification
 
 ```bash
