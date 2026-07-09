@@ -20,6 +20,7 @@ kill mid-run loses no committed progress, and is safe to run back-to-back.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -102,7 +103,7 @@ def _rotate_snapshots(snapshot_dir: Path, keep: int) -> list[str]:
 def stage_snapshot(ctx: AutopilotContext) -> dict[str, Any]:
     if ctx.db_path is None or str(ctx.db_path) == ":memory:":
         return {"action": "snapshot", "changed": 0, "skipped": "no_db_path"}
-    snapshot_dir = Path(ctx.cfg.autopilot.snapshot_dir).expanduser()
+    snapshot_dir = _anchor_side_path(ctx.cfg.autopilot.snapshot_dir, ctx.db_path)
     dest = snapshot_dir / f"ocbrain-{ctx.now.strftime('%Y%m%d')}.sqlite"
     if dest.exists():
         return {"action": "snapshot", "changed": 0, "skipped": "exists", "path": str(dest)}
@@ -314,7 +315,8 @@ def stage_dataset_export(ctx: AutopilotContext) -> dict[str, Any]:
         return {"action": "dataset-export", "changed": 0, "skipped": "dry_run"}
     from ocbrain.dataset.export import export_all
 
-    return export_all(ctx.conn, cfg=ctx.cfg, now=ctx.now)
+    out_dir = _anchor_side_path(ctx.cfg.dataset.export_dir, ctx.db_path)
+    return export_all(ctx.conn, cfg=ctx.cfg, now=ctx.now, export_dir=out_dir)
 
 
 STAGES: dict[str, Callable[[AutopilotContext], dict[str, Any]]] = {
@@ -331,6 +333,28 @@ STAGES: dict[str, Callable[[AutopilotContext], dict[str, Any]]] = {
     "dataset_mine": stage_dataset_mine,
     "dataset_export": stage_dataset_export,
 }
+
+
+# --------------------------------------------------------------------------- #
+# Side-path resolution
+# --------------------------------------------------------------------------- #
+def _anchor_side_path(cfg_value: str, db_path: Path | str | None) -> Path:
+    """Resolve a lock / snapshot / export side path for the run.
+
+    An *absolute* config value is an explicit override and is honored as-is. A
+    *relative* default (e.g. ``data/snapshots/``) is anchored beside the target
+    DB — its leaf name under the DB file's parent directory — so an autopilot
+    run against a copy DB writes its lock, snapshot, and dataset side-files next
+    to that copy and never pollutes the config-anchored (CWD) tree. The raw
+    relative value is used only when there is no real DB path (``:memory:`` /
+    ``None``), preserving the legacy CWD-relative behavior for in-memory runs.
+    """
+    p = Path(cfg_value).expanduser()
+    if p.is_absolute():
+        return p
+    if db_path is None or str(db_path) == ":memory:":
+        return p
+    return Path(db_path).expanduser().resolve().parent / p.name
 
 
 # --------------------------------------------------------------------------- #
@@ -367,7 +391,7 @@ def run_autopilot(
     another instance, returns ``{"status": "locked"}`` immediately (spec §4.1).
     """
     cfg = cfg or load_config()
-    lock_path = Path(cfg.autopilot.lock_path).expanduser()
+    lock_path = _anchor_side_path(cfg.autopilot.lock_path, db_path)
     with file_lock(lock_path) as acquired:
         if not acquired:
             return {"status": "locked", "stages": {}}
@@ -423,7 +447,10 @@ def _run_locked(
                 conn.commit()
         except Exception as exc:  # noqa: BLE001 - per-stage isolation (spec §4.2)
             if not dry_run:
-                conn.rollback()
+                # A failing stage may have left the connection unusable; a
+                # rollback that itself raises must not escape the isolation.
+                with contextlib.suppress(sqlite3.Error):
+                    conn.rollback()
             stage_results[name] = {
                 "action": name,
                 "error": str(exc),
@@ -438,10 +465,16 @@ def _run_locked(
     # compile stage already runs one rebuild internally; nothing extra here.
     finished_at = now_iso()
     if not dry_run:
-        _write_run_ledger(
-            conn, run_id, started_at, finished_at, status, stage_results, run_error
+        _write_run_ledger_resilient(
+            conn,
+            db_path,
+            run_id,
+            started_at,
+            finished_at,
+            status,
+            stage_results,
+            run_error,
         )
-        conn.commit()
 
     return {
         "status": status,
@@ -464,6 +497,43 @@ def _resolve_stages(stages: list[str] | None) -> list[str]:
     ordered = ["migrate"] if "migrate" not in stages else []
     ordered += [s for s in STAGE_NAMES if s in stages]
     return ordered
+
+
+def _write_run_ledger_resilient(
+    conn: sqlite3.Connection,
+    db_path: Path | None,
+    run_id: str,
+    started_at: str,
+    finished_at: str,
+    status: str,
+    stage_results: dict[str, Any],
+    error: str | None,
+) -> None:
+    """Write the run ledger durably (spec §4.2 — the run's only durable record).
+
+    The ledger is written after every stage on the shared connection. Because a
+    stage can leave that connection's SQLite handle in a bad state (e.g. a
+    ``file is not a database`` from an interrupted/torn snapshot or a poisoned
+    WAL), the ledger write must not be able to both crash the process *and* lose
+    the run record. Try the working connection first; on any :class:`sqlite3.Error`
+    fall back to a fresh short-lived connection to the DB path so the run is
+    still recorded (``INSERT OR REPLACE`` makes the retry idempotent). Only a
+    genuinely unwritable on-disk DB — where the fresh handle also fails — is
+    allowed to propagate.
+    """
+    try:
+        _write_run_ledger(conn, run_id, started_at, finished_at, status, stage_results, error)
+        conn.commit()
+        return
+    except sqlite3.Error:
+        if db_path is None or str(db_path) == ":memory:":
+            raise
+    fresh = sqlite3.connect(Path(db_path))
+    try:
+        _write_run_ledger(fresh, run_id, started_at, finished_at, status, stage_results, error)
+        fresh.commit()
+    finally:
+        fresh.close()
 
 
 def _write_run_ledger(

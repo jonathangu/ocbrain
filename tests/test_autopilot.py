@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 from ocbrain import autopilot
 from ocbrain.config import load_config
 from ocbrain.db import connect, init_db
-from ocbrain.fsutil import file_lock
+from ocbrain.fsutil import file_lock, snapshot_sqlite
 
 
 def _cfg(tmp_path: Path):
@@ -160,3 +161,103 @@ def test_dry_run_skips_snapshot_and_export_and_ledger(tmp_path):
     assert result["stages"]["dataset_export"]["skipped"] == "dry_run"
     # No ledger row committed on a dry run.
     assert conn.execute("SELECT COUNT(*) FROM autopilot_runs").fetchone()[0] == 0
+
+
+def test_side_paths_anchor_to_db_dir_no_cwd_pollution(tmp_path, monkeypatch):
+    """Lock/snapshot/export side-files derive from the *target DB* path, not the
+    config-anchored CWD tree — a run against a copy DB writes NOTHING outside the
+    copy's own directory (regression: copy runs polluted the live repo tree)."""
+    db_dir = tmp_path / "dbhome"
+    db_dir.mkdir()
+    path = db_dir / "ap.sqlite"
+    conn = connect(path)
+    init_db(conn)
+
+    base = _cfg(tmp_path)
+    # Restore the RELATIVE defaults so derivation (not an absolute override) runs.
+    cfg = dataclasses.replace(
+        base,
+        autopilot=dataclasses.replace(
+            base.autopilot,
+            lock_path="data/autopilot.lock",
+            snapshot_dir="data/snapshots/",
+        ),
+        dataset=dataclasses.replace(base.dataset, export_dir="data/datasets"),
+    )
+
+    # A pristine CWD that must stay untouched (no config-anchored 'data/' tree).
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+
+    now = datetime(2026, 7, 8, tzinfo=UTC)
+    result = autopilot.run_autopilot(conn, cfg, db_path=path, now=now)
+    assert result["status"] == "ok"
+
+    # Everything landed beside the DB…
+    assert (db_dir / "autopilot.lock").exists()
+    snap = db_dir / "snapshots" / "ocbrain-20260708.sqlite"
+    assert snap.exists()
+    assert (db_dir / "datasets" / "manifest.json").exists()
+    # …the snapshot is a valid standalone DB…
+    verify = sqlite3.connect(snap)
+    assert verify.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    verify.close()
+    # …and the CWD is pristine (nothing leaked to the config-anchored tree).
+    assert not (cwd / "data").exists()
+
+
+def test_snapshot_backup_is_valid_standalone_db(tmp_path):
+    """Snapshot uses the online backup API: a valid, self-contained copy even
+    with a live connection open on the source (no torn copy, source WAL intact)."""
+    src = tmp_path / "src.sqlite"
+    conn = connect(src)
+    init_db(conn)
+    conn.executemany(
+        "INSERT INTO retrieval_uses (id, served_at) VALUES (?, ?)",
+        [(f"r{i}", "2026-07-08T00:00:00Z") for i in range(500)],
+    )
+    conn.commit()
+
+    dest = tmp_path / "snap.sqlite"
+    # conn stays open (mimics autopilot's live connection during stage 1).
+    snapshot_sqlite(src, dest)
+
+    verify = sqlite3.connect(dest)
+    assert verify.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    n = verify.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
+    verify.close()
+    conn.close()
+    assert n == 500  # transactionally consistent committed image
+
+
+def test_poisoned_connection_still_records_ledger(tmp_path):
+    """A stage that leaves the shared connection raising ``file is not a
+    database`` must not both crash the run and lose the ledger — the run is
+    still recorded via a fresh connection (spec §4.2 durable record)."""
+    cfg = _cfg(tmp_path)
+    path = tmp_path / "ap.sqlite"
+
+    class _PoisonLedger(sqlite3.Connection):
+        def execute(self, sql, *args):  # type: ignore[override]
+            stripped = sql.strip().upper()
+            if "AUTOPILOT_RUNS" in stripped and stripped.startswith("INSERT"):
+                raise sqlite3.DatabaseError("file is not a database")
+            return super().execute(sql, *args)
+
+    conn = sqlite3.connect(path, factory=_PoisonLedger)
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+
+    # Must not raise even though the ledger INSERT poisons on the shared handle.
+    result = autopilot.run_autopilot(conn, cfg, db_path=path)
+    assert result["status"] in {"ok", "partial"}
+
+    # The run is durably recorded via the fresh-connection fallback.
+    verify = sqlite3.connect(path)
+    verify.row_factory = sqlite3.Row
+    row = verify.execute(
+        "SELECT status FROM autopilot_runs WHERE id = ?", (result["run_id"],)
+    ).fetchone()
+    verify.close()
+    assert row is not None
