@@ -5,6 +5,9 @@
 <dict>
   <key>Label</key><string>com.jonathangu.ocbrain.stallcheck</string>
   <!--
+    TEMPLATE: replace __OCBRAIN_STALLCHECK_WRAPPER__ and __OCBRAIN_LOG_DIR__
+    with absolute local paths before installing this plist.
+
     ocbrain STALL CHECKER — the passive progress watchdog, every 15 minutes
     (StartInterval 900). One pass scans the agent exhaust (Reader A: workflow
     passive-wait transcripts + zombie task .output files) and the runner sqlite
@@ -22,7 +25,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>/Users/guclaw/.openclaw/service-env/ocbrain-stallcheck-wrapper.sh</string>
+    <string>__OCBRAIN_STALLCHECK_WRAPPER__</string>
   </array>
   <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><false/>
@@ -30,8 +33,8 @@
   <key>LowPriorityBackgroundIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/stallcheck.log</string>
+  <string>__OCBRAIN_LOG_DIR__/stallcheck.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/stallcheck.err.log</string>
+  <string>__OCBRAIN_LOG_DIR__/stallcheck.err.log</string>
 </dict>
 </plist>

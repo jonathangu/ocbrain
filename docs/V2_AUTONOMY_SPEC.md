@@ -11,7 +11,7 @@
 
 **Non-negotiables (orchestrator constraints):**
 
-- Repo `/Users/guclaw/.openclaw/workspace/ocbrain`, Python 3.13, uv, stdlib-only style (plain `sqlite3`, `argparse`, frozen dataclasses, `MaintenanceResult`-shaped returns).
+- Repo `<ocbrain-root>`, Python 3.13, uv, stdlib-only style (plain `sqlite3`, `argparse`, frozen dataclasses, `MaintenanceResult`-shaped returns).
 - Live DB `data/ocbrain.sqlite` is 834 MB + 337 MB WAL. **Snapshot-first before any write run** (checkpoint or copy db+wal+shm together).
 - **Additive schema migration only.** Keep evidence / knowledge / knowledge_evidence / memory view / retrieval_uses / brain_events core.
 - Keep the hash-chained `brain_events` audit trail and the privacy scope composition ratchet (`private < workspace < project < public`). These are automatic invariants, not human gates.
@@ -559,14 +559,14 @@ Removed: `propose` (+ `cmd_propose`), `event-proposals --approval-packet`. Kept 
     <string>/opt/homebrew/bin/uv</string>
     <string>run</string>
     <string>--directory</string>
-    <string>/Users/guclaw/.openclaw/workspace/ocbrain</string>
+    <string>__OCBRAIN_ROOT__</string>
     <string>ocbrain</string>
     <string>autopilot</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>OCBRAIN_DB</key>
-    <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/ocbrain.sqlite</string>
+    <string>__OCBRAIN_DB__</string>
   </dict>
   <key>StartInterval</key><integer>1800</integer>
   <key>RunAtLoad</key><false/>
@@ -574,9 +574,9 @@ Removed: `propose` (+ `cmd_propose`), `event-proposals --approval-packet`. Kept 
   <key>LowPriorityBackgroundIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/logs/autopilot.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/data/logs/autopilot.err.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.err.log</string>
 </dict>
 </plist>
 ```

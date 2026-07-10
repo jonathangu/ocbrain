@@ -17,8 +17,8 @@ and a next-step pointer that survives context compaction.
 - Work in loops, not one giant closeout.
 - Keep `TASKS.md` as the principal truth for whether the build is active.
 - Keep this file as the repo-local loop contract.
-- Put worker outputs under `/Users/guclaw/.openclaw/workspace/task-artifacts/ocbrain-build-loop/`.
-- Put compact machine-readable status under `/Users/guclaw/.openclaw/workspace/task-status/ocbrain-build-loop.json`.
+- Put worker outputs in the operator-owned task-artifact directory outside this repo.
+- Put compact machine-readable status in the operator-owned task-status directory.
 - Prefer dry-run and proposal output until review quality is proven.
 - Do not create cron jobs, mutate live memory/wiki/skills/policy, or publish remotely without Jonathan's explicit approval.
 - Each loop must end with evidence: tests, corpus stats, sample audits, or integration proof.

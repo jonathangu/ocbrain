@@ -5,6 +5,9 @@
 <dict>
   <key>Label</key><string>com.jonathangu.ocbrain.autopilot.light</string>
   <!--
+    TEMPLATE: replace __OCBRAIN_AUTOPILOT_WRAPPER__ and __OCBRAIN_LOG_DIR__
+    with absolute local paths before installing this plist.
+
     v0.3 LIGHT profile — the fast cycle, every 15 minutes (StartInterval 900).
     Runs cfg.autopilot.profiles["light"]: migrate → review → autolabel → embed →
     tripwires → promote → maintain. Skips snapshot/harvest/compile/dataset so it
@@ -21,7 +24,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>/Users/guclaw/.openclaw/service-env/ocbrain-autopilot-env-wrapper.sh</string>
+    <string>__OCBRAIN_AUTOPILOT_WRAPPER__</string>
     <string>--profile</string>
     <string>light</string>
   </array>
@@ -31,8 +34,8 @@
   <key>LowPriorityBackgroundIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.light.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.light.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.light.err.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.light.err.log</string>
 </dict>
 </plist>

@@ -80,13 +80,14 @@ DEFAULT_SELF_INTERVAL_SECONDS = 900
 DEFAULT_MAX_PAGES_PER_RUN = 8
 MAX_MESSAGE_CHARS = 3900
 
+_HOME = Path.home()
 DEFAULT_WORKFLOW_GLOBS: tuple[str, ...] = (
-    "/Users/guclaw/.claude/projects/*/*/subagents/workflows/*/",
+    str(_HOME / ".claude/projects/*/*/subagents/workflows/*/"),
 )
 DEFAULT_TASK_OUTPUT_GLOBS: tuple[str, ...] = (
-    "/private/tmp/claude-501/*/*/tasks/",
+    f"/private/tmp/claude-{os.getuid()}/*/*/tasks/",
 )
-DEFAULT_RUNNER_DB = "/Users/guclaw/.openclaw/state/openclaw.sqlite"
+DEFAULT_RUNNER_DB = str(_HOME / ".openclaw/state/openclaw.sqlite")
 
 # Secondary signal. Case-insensitive REGEX families (not exact substrings), so
 # paraphrases like "waiting for the clean live run to land via the monitor" match

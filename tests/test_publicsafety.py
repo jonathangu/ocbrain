@@ -58,7 +58,7 @@ def test_private_path_flags_non_allowlisted_segment() -> None:
 
 
 def test_private_path_allowlists_this_repo() -> None:
-    text = "see /Users/guclaw/.openclaw/workspace/ocbrain/src/x.py"
+    text = "see /Users/example/.openclaw/workspace/ocbrain/src/x.py"
     assert ps.private_path_segments(text, ps.WORKSPACE_ALLOWLIST) == []
 
 

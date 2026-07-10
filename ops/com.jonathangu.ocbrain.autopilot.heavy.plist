@@ -5,6 +5,9 @@
 <dict>
   <key>Label</key><string>com.jonathangu.ocbrain.autopilot.heavy</string>
   <!--
+    TEMPLATE: replace __OCBRAIN_AUTOPILOT_WRAPPER__ and __OCBRAIN_LOG_DIR__
+    with absolute local paths before installing this plist.
+
     v0.3 HEAVY profile — the full cycle, hourly (StartInterval 3600).
     Runs cfg.autopilot.profiles["heavy"]: snapshot → migrate → harvest →
     injection_scan → review → compile → autolabel → embed → tripwires → promote →
@@ -22,7 +25,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>/Users/guclaw/.openclaw/service-env/ocbrain-autopilot-env-wrapper.sh</string>
+    <string>__OCBRAIN_AUTOPILOT_WRAPPER__</string>
     <string>--profile</string>
     <string>heavy</string>
   </array>
@@ -32,8 +35,8 @@
   <key>LowPriorityBackgroundIO</key><true/>
   <key>Nice</key><integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.heavy.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.heavy.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/guclaw/.openclaw/workspace/ocbrain/logs/autopilot.heavy.err.log</string>
+  <string>__OCBRAIN_LOG_DIR__/autopilot.heavy.err.log</string>
 </dict>
 </plist>
