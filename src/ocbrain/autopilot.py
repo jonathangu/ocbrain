@@ -199,6 +199,9 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         if result is None:
             skipped += 1
             continue
+        # Reading and normalizing the next history file can consume the whole
+        # stage budget. Close this file's import transaction first.
+        ctx.conn.commit()
         existing.add((result["path"], f"{result['runtime']}_history_file"))
         imported += 1
     mem = _harvest_memory_globs(ctx, deadline)
@@ -250,6 +253,8 @@ def _harvest_memory_globs(ctx: AutopilotContext, deadline: float | None) -> int:
             except (OSError, UnicodeError, ValueError):
                 continue
             if result is not None:
+                # Never hold the writer while the next doctrine file is read.
+                ctx.conn.commit()
                 imported += 1
     return imported
 

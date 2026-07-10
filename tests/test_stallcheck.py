@@ -469,6 +469,32 @@ def test_run_pages_once_then_dedups_and_heartbeats(tmp_path, monkeypatch):
     assert len(sent) == 1  # no second Telegram message
 
 
+def test_pager_network_call_never_holds_sqlite_writer_lock(tmp_path, monkeypatch):
+    wf = tmp_path / "wf_stall"
+    wf.mkdir()
+    agent = wf / "agent-stall01.jsonl"
+    _write_agent_jsonl(agent, last_text="Standing by, waiting on the monitor.")
+    _age(agent, minutes=90)
+    cfg = _cfg(
+        workflow_globs=(f"{tmp_path}/wf_*/",),
+        pager_chat_id="123",
+        pager_openclaw_json=str(tmp_path / "openclaw.json"),
+    )
+
+    def observing_send(_cfg, _text):
+        observer = sqlite3.connect(tmp_path / "brain.sqlite", timeout=0)
+        observer.execute("BEGIN IMMEDIATE")
+        assert observer.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] >= 1
+        observer.rollback()
+        observer.close()
+        return 200
+
+    monkeypatch.setattr(stallcheck, "send_telegram", observing_send)
+    brain = _brain(tmp_path)
+    report = stallcheck.run(cfg, brain, runner=None, now=datetime.now(UTC))
+    assert report.page_status == 200
+
+
 def test_digest_is_bounded_below_telegram_limit(tmp_path):
     findings = [
         stallcheck.Finding(

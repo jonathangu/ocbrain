@@ -191,6 +191,23 @@ def test_redaction_before_dispatch(tmp_path: Path) -> None:
     assert "[REDACTED]" in included[0]["text"]
 
 
+def test_hosted_call_never_holds_sqlite_writer_lock(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    _neutral_with_mass(conn, "network-window")
+
+    def observing_call(payload, *, api_key, model):
+        observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+        observer.execute("BEGIN IMMEDIATE")
+        assert observer.execute("SELECT COUNT(*) FROM egress_audits").fetchone()[0] == 1
+        observer.rollback()
+        observer.close()
+        return _stub_call()(payload, api_key=api_key, model=model)
+
+    result = judge_ambiguous(conn, cfg, call=observing_call, env=KEY_ENV)
+    assert result["changed"] >= 1
+
+
 def test_daily_budget_skip(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)

@@ -456,6 +456,8 @@ def judge_ambiguous(
         included, rejected = build_judge_batch(conn, batch)
 
         audit_id = _write_egress_audit(conn, included, rejected)
+        # Make the audit durable and release SQLite before hosted inference.
+        conn.commit()
         if not included:
             _record_run(
                 conn,
@@ -464,6 +466,7 @@ def judge_ambiguous(
                 item_count=0,
                 egress_audit_id=audit_id,
             )
+            conn.commit()
             continue
 
         payload = _build_payload(cfg, model, included)
@@ -488,6 +491,8 @@ def judge_ambiguous(
             ts=now_iso(),
         )
         fold_n, skip_n = _fold_verdicts(conn, cfg, verdicts)
+        # Bound the post-response write window to one judge batch.
+        conn.commit()
         folded += fold_n
         skipped_missing += skip_n
         batches += 1

@@ -430,9 +430,13 @@ def run_tripwires(
                     now=timestamp,
                 )
                 details.append({"id": row["id"], "tripwire": slug, "reason": reason})
+                # The next row may spend seconds in DB-backed predicates. Keep
+                # each quarantine atomic and release the writer before it.
+                conn.commit()
                 break
     if rows and max_watermark:
         _set_watermark(conn, "tripwires", "knowledge", max_watermark)
+        conn.commit()
     return MaintenanceResult("tripwires", len(details), details)
 
 

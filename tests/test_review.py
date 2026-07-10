@@ -197,3 +197,27 @@ def test_watermark_skips_unchanged_session(tmp_path: Path) -> None:
     second = review_sessions(conn, [session], cfg)
     assert first["changed"] == 1
     assert second["changed"] == 0
+
+
+def test_review_releases_writer_before_parsing_next_lazy_session(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    first = Session(
+        "s1", "/p/s1", turns=[Turn("assistant", "done"), *_tool_turns(5)], fingerprint="1"
+    )
+    second = Session(
+        "s2", "/p/s2", turns=[Turn("assistant", "done"), *_tool_turns(5)], fingerprint="2"
+    )
+
+    def lazy_sessions():
+        yield first
+        observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+        observer.execute("BEGIN IMMEDIATE")
+        observer.rollback()
+        observer.close()
+        yield second
+
+    result = review_sessions(conn, lazy_sessions(), cfg)
+    assert result["changed"] == 2
+    assert result["writer_lock"]["boundary"] == "session"
+    assert result["writer_lock"]["batches_committed"] == 2

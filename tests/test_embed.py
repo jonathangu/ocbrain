@@ -190,6 +190,25 @@ def test_egress_audit_written_per_batch(tmp_path: Path) -> None:
     assert conn.execute("SELECT COUNT(*) FROM egress_audits").fetchone()[0] == 2
 
 
+def test_network_call_never_holds_sqlite_writer_lock(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    kid = _know(conn, "network-window")
+    _set(conn, kid, inject=1)
+
+    def observing_call(payload, *, api_key, model):
+        observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+        observer.execute("BEGIN IMMEDIATE")
+        # The egress audit was committed before dispatch, not lost to unlock.
+        assert observer.execute("SELECT COUNT(*) FROM egress_audits").fetchone()[0] == 1
+        observer.rollback()
+        observer.close()
+        return _stub_embed()(payload, api_key=api_key, model=model)
+
+    result = embed_pending(conn, cfg, call=observing_call, env=KEY_ENV)
+    assert result["changed"] == 1
+
+
 # --------------------------------------------------------------------------- #
 # Inert / budget paths
 # --------------------------------------------------------------------------- #

@@ -952,6 +952,9 @@ def run(
         report.evidence_ids.append(
             _write_with_lock_retry(brain, feed_deadman, brain, finding, now)
         )
+    # Deadman evidence is durable before an optional Telegram request, and the
+    # pager's network latency never owns SQLite's writer slot.
+    _write_with_lock_retry(brain, brain.commit)
 
     backlog_cutoff = cfg.terminal_backlog_seconds
     new_findings = [f for f in findings if not already_paged(brain, f.fingerprint)]

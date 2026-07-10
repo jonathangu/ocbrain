@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -158,6 +159,31 @@ def test_tripwire_registry_has_all_six(tmp_path):
         "contradiction_thrash",
         "prescriptive_unverified_serving",
     ]
+
+
+def test_tripwires_release_writer_before_next_expensive_predicate(
+    tmp_path, monkeypatch
+):
+    conn = _db(tmp_path)
+    _seed_value(conn, subject="first")
+    _seed_value(conn, subject="second")
+    conn.commit()
+    calls = 0
+
+    def forced(_conn, _row, _cfg, _now):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+            observer.execute("BEGIN IMMEDIATE")
+            observer.rollback()
+            observer.close()
+        return "forced_tripwire"
+
+    monkeypatch.setattr("ocbrain.safeguards.TRIPWIRES", (("forced", forced),))
+    result = run_tripwires(conn)
+    assert result.changed == 2
+    assert calls == 2
 
 
 def test_tripwire_injection_suspected_body_flag(tmp_path):

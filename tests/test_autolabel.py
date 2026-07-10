@@ -282,6 +282,26 @@ def test_attribute_signals_skips_session_signals(tmp_path: Path) -> None:
     assert row["knowledge_id"] is None
 
 
+def test_attribute_signals_honors_zero_time_budget(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    _kid(conn)
+    record_signal(
+        conn,
+        Signal(
+            kind="learning_gate_rule",
+            polarity="bad",
+            weight=0.6,
+            source="learning_db",
+            source_ref="budget:0",
+            details={"content": "runtime fact"},
+        ),
+    )
+    assert attribute_signals(conn, time_budget_seconds=0) == set()
+    assert conn.execute(
+        "SELECT knowledge_id FROM signal_events WHERE source_ref='budget:0'"
+    ).fetchone()[0] is None
+
+
 def test_attribute_signals_releases_writer_before_next_fts_query(
     tmp_path: Path, monkeypatch
 ) -> None:

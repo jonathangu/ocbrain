@@ -80,6 +80,32 @@ def _good_row(
     return kid
 
 
+def test_promotion_finishes_scoring_before_opening_writer_transaction(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = _db(tmp_path)
+    _good_row(conn, "first")
+    _good_row(conn, "second")
+    conn.commit()
+    calls = 0
+    original = promote_score
+
+    def observing_score(inner_conn, row, cfg, *, now=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+            observer.execute("BEGIN IMMEDIATE")
+            observer.rollback()
+            observer.close()
+        return original(inner_conn, row, cfg, now=now)
+
+    monkeypatch.setattr("ocbrain.promote.promote_score", observing_score)
+    result = promote_to_memory(conn, _cfg(tmp_path))
+    assert calls == 2
+    assert result["writer_lock"]["batches_committed"] >= 1
+
+
 # --------------------------------------------------------------------------- #
 # Eligibility
 # --------------------------------------------------------------------------- #

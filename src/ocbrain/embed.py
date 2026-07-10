@@ -372,8 +372,12 @@ def embed_pending(
         included, rejected = build_embed_batch(conn, batch)
 
         audit_id = _write_egress_audit(conn, included, rejected)
+        # The audit is durable before any hosted call, and the single-writer
+        # slot is free for MCP feedback/stallcheck while network I/O waits.
+        conn.commit()
         if not included:
             _record_run(conn, status="skipped_egress", items=0, request_hash=audit_id)
+            conn.commit()
             continue
 
         payload = _build_payload(model, included)
@@ -393,6 +397,8 @@ def embed_pending(
             request_hash=request_hash,
             ts=ts,
         )
+        # Bound the second write window to one completed provider batch.
+        conn.commit()
         stored_total += stored
         batches += 1
         total_cost += cost

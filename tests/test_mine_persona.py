@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 from ocbrain.config import load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.dataset.mine_persona import (
     commit_examples,
     doc_examples,
@@ -123,6 +124,20 @@ def test_commit_mining_excludes_agent_authored(tmp_path: Path):
     assert len(rows) == 1
     assert rows[0]["source_uri"].startswith("git://myrepo#")
     assert examples[0]["evidence_ids"]
+
+
+def test_commit_mining_releases_writer_between_git_candidates(tmp_path: Path):
+    conn = _conn(tmp_path)
+    repo = tmp_path / "myrepo"
+    _init_repo(repo)
+    _commit(repo, "a.txt", "Document the first clear operator decision")
+    _commit(repo, "b.txt", "Explain the second verified system tradeoff")
+    batch = DatasetWriteBatch(conn, max_operations=50, max_seconds=60)
+
+    examples = commit_examples(conn, repo, CFG, write_batch=batch)
+    assert len(examples) == 2
+    assert conn.in_transaction is False
+    assert batch.metrics()["batches_committed"] == 2
 
 
 def test_docs_off_by_default(tmp_path: Path):

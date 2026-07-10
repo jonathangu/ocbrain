@@ -583,6 +583,7 @@ def attribute_signals(
     *,
     limit: int = 2000,
     write_batch: DatasetWriteBatch | None = None,
+    time_budget_seconds: float | None = None,
 ) -> set[str]:
     """Attach ``knowledge_id IS NULL`` signals to knowledge via claim_key + FTS.
 
@@ -603,7 +604,10 @@ def attribute_signals(
         (limit,),
     ).fetchall()
     attributed: set[str] = set()
+    deadline = _deadline(time_budget_seconds)
     for row in rows:
+        if _out_of_time(deadline):
+            break
         details = _loads(row["details"])
         text = _attribution_text(details)
         if not text:
@@ -782,16 +786,25 @@ def autolabel(
     raises into the pipeline. Returns a MaintenanceResult-shaped summary.
     """
     stages: dict[str, Any] = {}
+    started = time.monotonic()
+
+    def remaining_budget() -> float | None:
+        if time_budget_seconds is None:
+            return None
+        return max(0.0, time_budget_seconds - (time.monotonic() - started))
+
     stages["retrieval"] = mine_retrieval_signals(
-        conn, time_budget_seconds=time_budget_seconds
+        conn, time_budget_seconds=remaining_budget()
     )
     conn.commit()
-    stages["events"] = mine_event_signals(conn, time_budget_seconds=time_budget_seconds)
+    stages["events"] = mine_event_signals(
+        conn, time_budget_seconds=remaining_budget()
+    )
     conn.commit()
     stages["learning_db"] = mine_learning_db(
         conn,
         learning_db_path=cfg.dataset.learning_db,
-        time_budget_seconds=time_budget_seconds,
+        time_budget_seconds=remaining_budget(),
     )
     conn.commit()
     stages["commitments"] = mine_commitments(
@@ -806,7 +819,11 @@ def autolabel(
         max_operations=1,
         max_seconds=cfg.dataset.write_batch_seconds,
     )
-    attributed = attribute_signals(conn, write_batch=attribute_batch)
+    attributed = attribute_signals(
+        conn,
+        write_batch=attribute_batch,
+        time_budget_seconds=remaining_budget(),
+    )
     stages["attribute"] = {"action": "attribute", "changed": len(attributed)}
     fold_batch = DatasetWriteBatch(
         conn,

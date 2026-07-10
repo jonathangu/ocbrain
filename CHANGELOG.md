@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.1 — 2026-07-09
+
+- Commit post-turn review work at each fully processed session before the lazy
+  transcript iterator parses the next file.
+- Report review's per-session transaction count and conservative total/maximum
+  writer-lock upper bounds.
+- Add a concurrency regression test that acquires SQLite's writer slot between
+  two lazily yielded sessions.
+- Commit judge and embedding egress audits before hosted network I/O, then
+  commit verdict/vector results per completed provider batch.
+- Commit stall findings before optional Telegram paging so notification latency
+  never owns the brain database's writer slot.
+- Release persona-mining evidence writes before running the next Git subprocess.
+- Apply the shared autolabel stage budget to FTS attribution instead of letting
+  that substage overrun the light profile indefinitely.
+- Finish promotion scoring/eligibility reads before opening bounded score-update
+  batches, and commit each tripwire quarantine before evaluating the next row.
+- Commit history and doctrine harvests per imported file before reading the next.
+
 ## 0.3.0 — 2026-07-09
 
 This is the first licensed release of ocbrain. It turns the earlier public

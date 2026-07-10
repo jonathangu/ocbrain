@@ -444,6 +444,7 @@ def test_harvest_memory_globs_imports_doctrine(tmp_path):
     )
     ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
     assert autopilot._harvest_memory_globs(ctx, None) == 1
+    assert conn.in_transaction is False
     row = conn.execute(
         "SELECT source_uri FROM evidence WHERE source_type = 'memory_file'"
     ).fetchone()

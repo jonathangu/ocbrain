@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ocbrain.autolabel import USEFUL_OUTCOMES, Signal, record_signal
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import SCOPE_RANK, knowledge_evidence, now_iso
 from ocbrain.excerpt import build_excerpt
 from ocbrain.text import find_probable_injection, find_probable_secret_leaks
@@ -287,9 +288,6 @@ def promote_to_memory(
     for row in rows:
         score = promote_score(conn, row, cfg, now=now)
         scored[row["id"]] = score
-        conn.execute(
-            "UPDATE knowledge SET promote_score = ? WHERE id = ?", (score, row["id"])
-        )
 
     eligible = [row for row in rows if promotion_eligible(conn, row, cfg)]
     eligible.sort(key=lambda r: (scored[r["id"]], r["id"]), reverse=True)
@@ -301,6 +299,7 @@ def promote_to_memory(
     # score-ranked winners. Injection/secret scan + risky-class rules still hold;
     # the char budget below is the final arbiter.
     hb_enabled, hb_sources, hb_cap = _human_bootstrap_cfg(cfg)
+    bootstrap_origin_ids: set[str] = set()
     if hb_enabled and hb_cap > 0 and hb_sources:
         bootstrap = [
             row
@@ -315,19 +314,40 @@ def promote_to_memory(
             # Stamp the bootstrap pin so later demotion passes recognise it. Never
             # clobber a stronger ``human`` origin (or a pin already stamped).
             if row["origin"] not in PINNED_ORIGINS:
-                conn.execute(
-                    "UPDATE knowledge SET origin = ? WHERE id = ?",
-                    (BOOTSTRAP_ORIGIN, row["id"]),
-                )
+                bootstrap_origin_ids.add(row["id"])
+
+    # All expensive scoring/eligibility reads finished before the first write.
+    # The remaining updates are fast and commit under the shared bounded batch.
+    batch = DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
+    for row in rows:
+        batch.ensure()
+        conn.execute(
+            "UPDATE knowledge SET promote_score = ? WHERE id = ?",
+            (scored[row["id"]], row["id"]),
+        )
+        batch.operation()
+    for knowledge_id in sorted(bootstrap_origin_ids):
+        batch.ensure()
+        conn.execute(
+            "UPDATE knowledge SET origin = ? WHERE id = ?",
+            (BOOTSTRAP_ORIGIN, knowledge_id),
+        )
+        batch.operation()
 
     promoted = 0
     demoted = 0
     for row in selected:
         if row["inject"] != 1:
+            batch.ensure()
             conn.execute(
                 "UPDATE knowledge SET inject = 1, updated_at = ? WHERE id = ?",
                 (now_iso(), row["id"]),
             )
+            batch.operation()
             promoted += 1
     for row in rows:
         if (
@@ -335,22 +355,33 @@ def promote_to_memory(
             and row["id"] not in selected_ids
             and row["origin"] not in PINNED_ORIGINS
         ):
+            batch.ensure()
             conn.execute(
                 "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
                 (now_iso(), row["id"]),
             )
+            batch.operation()
             demoted += 1
 
-    overflow = _enforce_char_budget(conn, cfg, runtime)
+    batch.flush()
+    overflow = _enforce_char_budget(conn, cfg, runtime, write_batch=batch)
+    batch.flush()
     return {
         "action": "promote",
         "changed": promoted + demoted + overflow,
         "promoted": promoted,
         "demoted": demoted + overflow,
+        "writer_lock": batch.metrics(),
     }
 
 
-def _enforce_char_budget(conn: sqlite3.Connection, cfg: Any, runtime: str) -> int:
+def _enforce_char_budget(
+    conn: sqlite3.Connection,
+    cfg: Any,
+    runtime: str,
+    *,
+    write_batch: DatasetWriteBatch | None = None,
+) -> int:
     """Demote lowest-score non-human rows until the excerpt fits ``max_chars``."""
     demoted = 0
     while True:
@@ -368,10 +399,17 @@ def _enforce_char_budget(conn: sqlite3.Connection, cfg: Any, runtime: str) -> in
         ).fetchone()
         if victim is None:
             return demoted
+        if write_batch is not None:
+            write_batch.ensure()
         conn.execute(
             "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
             (now_iso(), victim["id"]),
         )
+        if write_batch is not None:
+            write_batch.operation()
+            # build_excerpt is the next operation; never hold the writer while
+            # it renders and records retrieval state.
+            write_batch.flush()
         demoted += 1
 
 
@@ -399,6 +437,7 @@ def demote_and_decay(
                     "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
                     (now_iso(), row["id"]),
                 )
+                conn.commit()
                 demoted += 1
                 continue
             soft_bad = row["quality_label"] in ("bad", "neutral") or (
@@ -407,6 +446,7 @@ def demote_and_decay(
             )
             if soft_bad:
                 _record_pin_exemption(conn, row)
+                conn.commit()
                 exempted += 1
             continue
         bad_label = row["quality_label"] in ("bad", "neutral")
@@ -416,6 +456,7 @@ def demote_and_decay(
                 "UPDATE knowledge SET inject = 0, updated_at = ? WHERE id = ?",
                 (now_iso(), row["id"]),
             )
+            conn.commit()
             demoted += 1
 
     decayed = 0
@@ -443,6 +484,7 @@ def demote_and_decay(
                 "UPDATE knowledge SET promote_score = ? WHERE id = ?",
                 (row["promote_score"] * 0.5, row["id"]),
             )
+            conn.commit()
             decayed += 1
 
     return {

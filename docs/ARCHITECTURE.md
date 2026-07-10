@@ -490,9 +490,22 @@ later stage assumes a snapshotted, migrated DB.
 - **Measured writer windows.** Dataset mining commits after 50 mutating units or
   two seconds, whichever comes first, and records writer-lock wait, total hold,
   and longest hold. Autolabel commits between source miners and before each FTS
-  attribution. Once dataset mining has committed, a WAL above 64 MiB is
+  attribution. Review commits each processed session and its watermark before
+  lazily parsing the next transcript. The hosted judge and embedding lanes
+  commit each egress audit before network I/O and their results after each
+  provider batch. Once dataset mining has committed, a WAL above 64 MiB is
   checkpointed with `TRUNCATE`; a blocking reader is reported as `busy` and is
   retried by a later run.
+- **Budget carries through substages.** Autolabel passes its remaining wall-clock
+  budget into FTS attribution, so the light profile can stop and resume instead
+  of overrunning its own timer on a large unattributed backlog.
+- **Network outside transactions.** Hosted judge/embedding audits and stall
+  findings are committed before provider or pager I/O. Verdicts, vectors, and
+  delivery status land in bounded follow-up transactions.
+- **Read first, write second.** Promotion finishes scoring and eligibility reads
+  before bounded score updates. Tripwires commit a fired quarantine before
+  evaluating the next row. Harvest commits each imported file before reading the
+  next source.
 
 ### 9.3 The stall watchdog (companion process, v0.3)
 

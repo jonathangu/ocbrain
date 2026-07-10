@@ -1,6 +1,6 @@
 # ocbrain
 
-Current release: **v0.3.0**. Licensed under Apache-2.0.
+Current release: **v0.3.1**. Licensed under Apache-2.0.
 
 Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
 runtimes.
@@ -218,7 +218,14 @@ longest hold. After mining has committed, autopilot truncates a WAL larger than
 64 MiB; a live reader produces an honest `busy` result for a later retry.
 Autolabel releases the writer slot between source miners and before every
 expensive FTS attribution query, then batches the fast label-fold updates under
-the same measured bounds.
+the same measured bounds. Post-turn review commits each complete session and
+its watermark before the lazy iterator parses the next transcript. Embedding
+and the hosted judge commit their egress audits before network dispatch, then
+store results in a second per-provider-batch transaction.
+The passive stall watcher also commits findings before optional Telegram paging.
+FTS attribution consumes the autolabel stage's remaining time budget.
+Tripwire and promotion scans do their expensive reads outside write transactions.
+The heavy harvester commits each imported file before reading the next one.
 
 To use the scoped event-sourced core directly:
 

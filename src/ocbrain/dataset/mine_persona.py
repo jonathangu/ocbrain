@@ -215,6 +215,9 @@ def commit_examples(
         )
         if write_batch is not None:
             write_batch.operation()
+            # The next commit candidate runs another git subprocess. Never
+            # hold SQLite's writer slot across that external work.
+            write_batch.flush()
         out.append(
             {
                 "messages": [
@@ -269,6 +272,8 @@ def doc_examples(
             )
             if write_batch is not None:
                 write_batch.operation()
+                # The next authored file is read after this point.
+                write_batch.flush()
             out.append(
                 {
                     "messages": [

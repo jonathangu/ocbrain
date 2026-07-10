@@ -97,6 +97,9 @@ def review_sessions(
     signals = 0
     candidates = 0
     reviewed = 0
+    writer_batches = 0
+    writer_seconds = 0.0
+    max_writer_seconds = 0.0
     for session in sessions:
         if not is_settled(session, cfg, now_ns=now_ns):
             continue
@@ -104,17 +107,35 @@ def review_sessions(
         stream = str(getattr(session, "path", "") or getattr(session, "session_key", ""))
         if stream and get_watermark(conn, REVIEW_DOMAIN, stream) == fingerprint:
             continue
+        # The session iterator may parse the next transcript lazily. Close this
+        # session's write transaction before advancing it so parsing never runs
+        # while SQLite's single-writer slot is held.
+        batch_started = time.monotonic()
         result = review_session(conn, session, cfg, now=now)
         signals += result["signals"]
         candidates += result["candidates"]
         reviewed += 1
         if stream:
             set_watermark(conn, REVIEW_DOMAIN, stream, fingerprint)
+        if conn.in_transaction:
+            conn.commit()
+            held_upper_bound = time.monotonic() - batch_started
+            writer_batches += 1
+            writer_seconds += held_upper_bound
+            max_writer_seconds = max(max_writer_seconds, held_upper_bound)
     return {
         "action": "review",
         "changed": reviewed,
         "signals": signals,
         "candidates": candidates,
+        "writer_lock": {
+            "boundary": "session",
+            "batches_committed": writer_batches,
+            # The implicit transaction can begin after review starts, so these
+            # are conservative upper bounds rather than fake-exact lock times.
+            "writer_lock_upper_bound_seconds": round(writer_seconds, 6),
+            "max_writer_lock_upper_bound_seconds": round(max_writer_seconds, 6),
+        },
     }
 
 
