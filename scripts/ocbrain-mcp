@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${OCBRAIN_ROOT:-/Users/guclaw/.openclaw/workspace/ocbrain}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${OCBRAIN_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 DB="${OCBRAIN_DB:-$ROOT/data/ocbrain.sqlite}"
-PYTHON="${OCBRAIN_PYTHON:-/opt/homebrew/bin/python3.13}"
+
+if [[ -n "${OCBRAIN_PYTHON:-}" ]]; then
+  PYTHON="$OCBRAIN_PYTHON"
+elif [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/.venv/bin/python"
+else
+  PYTHON="$(command -v python3)"
+fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON" -m ocbrain.cli --db "$DB" mcp "$@"

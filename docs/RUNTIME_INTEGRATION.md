@@ -44,8 +44,13 @@ ocbrain --db data/ocbrain.sqlite mcp
 Installed launcher:
 
 ```bash
-/Users/guclaw/.openclaw/workspace/ocbrain/scripts/ocbrain-mcp
+cd /absolute/path/to/ocbrain
+scripts/ocbrain-mcp
 ```
+
+The launcher finds the repository from its own location and prefers the
+repository's `.venv/bin/python`. It can still be pointed somewhere else with
+`OCBRAIN_ROOT`, `OCBRAIN_DB`, or `OCBRAIN_PYTHON`.
 
 Default tools:
 
@@ -86,14 +91,29 @@ ranking.
 
 ## Local Runtime Install
 
-Installed locations:
+From the repository root, register the same launcher with each runtime:
 
-- ChatGPT desktop / Codex: `/Users/guclaw/.codex/config.toml`; current rollout
-  history remains under `/Users/guclaw/.codex/sessions` after app migration.
-- Codex ACP home: `/Users/guclaw/.openclaw/acpx/codex-home/config.toml`
-- Claude Code: user-scoped MCP entry
-- OpenClaw: `mcp.servers.ocbrain` in `openclaw.json`; current OpenClaw provides
-  `mcp status`, `doctor`, `probe`, and `reload` for static and live verification.
+```bash
+LAUNCHER="$PWD/scripts/ocbrain-mcp"
+
+codex mcp add ocbrain -- "$LAUNCHER"
+claude mcp add --scope user ocbrain -- "$LAUNCHER"
+openclaw mcp add ocbrain --command "$LAUNCHER"
+```
+
+ChatGPT desktop's Codex mode reads the same user Codex configuration and writes
+its rollouts under `~/.codex/sessions`. Claude's `--scope user` entry is
+available across projects. OpenClaw's `mcp add` command probes the server before
+saving it in `mcp.servers`.
+
+Verify the saved entries instead of trusting configuration text:
+
+```bash
+codex mcp get ocbrain
+claude mcp list
+openclaw mcp doctor ocbrain
+openclaw mcp probe ocbrain
+```
 
 OpenClaw can also host isolated Codex homes below
 `~/.openclaw/agents/<agent>/agent/codex-home`. Their `rollout-*.jsonl` files are
@@ -126,9 +146,9 @@ row was recorded. During a long SQLite writer window, retrieval itself remains
 available and reports `retrieval_use_status=database_busy` with a null feedback
 handle instead of failing or encouraging retries.
 
-The production install also has separate launchd jobs for the light autopilot,
-heavy autopilot, and passive stallcheck. They are outside MCP: MCP never starts
-or claims loop work.
+A full local deployment can also install separate launchd jobs for the light
+autopilot, heavy autopilot, and passive stallcheck. They are outside MCP: MCP
+never starts or claims loop work.
 
 ## Proof Commands
 

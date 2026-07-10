@@ -1,8 +1,8 @@
 # ocbrain Agent Use Guide
 
 This guide is the operating contract for agents that can see `ocbrain` through
-MCP. It is written for Codex, Claude Code, OpenClaw, and compatible local
-runtimes.
+MCP. It is written for ChatGPT/Codex, Claude Code, OpenClaw, and compatible
+local runtimes.
 
 `ocbrain` is a local, source-backed memory and evidence layer. It is not an
 autopilot, scheduler, policy engine, skill installer, or hosted RAG service.
@@ -120,6 +120,10 @@ Use for source-backed lookup. Pass a context object so retrieval respects
 project, repo, task, client, and visibility scope. Prefer focused queries over
 broad fishing.
 
+Contextual search returns `retrieval_use_status`. During a long SQLite writer
+window, the read may succeed with `database_busy` and no retrieval handle. Use
+the result; do not retry merely to manufacture a feedback id.
+
 ### `brain.preview`
 
 Use before relying on a retrieved packet or before you need to understand what
@@ -200,6 +204,9 @@ brain.egress_preview(target="hosted_teacher", context={"project":"ocbrain"}, que
 
 A healthy install should return populated counts, scoped results, visible
 exclusion counts, and no hosted call unless explicitly approved elsewhere.
+When a retrieval handle exists, record feedback. When the read reports a busy
+audit window without a handle, do not call feedback and do not retry solely for
+the audit row.
 
 ## Agent Output
 

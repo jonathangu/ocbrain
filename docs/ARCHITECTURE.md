@@ -521,8 +521,8 @@ watchdog itself stops running.
 - [`docs/V2_AUTONOMY_SPEC.md`](V2_AUTONOMY_SPEC.md) — the approved v0.2
   implementation contract: exact schema migration, module inventory, config
   surface, signal-fold math, test plan, and lane breakdown.
-- [`docs/ULTIMATE_GUIDE.md`](ULTIMATE_GUIDE.md) — full product + engineering
-  walkthrough.
+- [`docs/ULTIMATE_GUIDE.md`](ULTIMATE_GUIDE.md) — historical pre-autonomy
+  product + engineering walkthrough.
 - [`docs/AGENT_USE_GUIDE.md`](AGENT_USE_GUIDE.md) — runtime behavior for agents.
 - [`README.md`](../README.md) — quick start, CLI, MCP surface, public-safety.
 - Public explainers: [how-it-works](https://openclawbrain.ai/how-it-works/) ·

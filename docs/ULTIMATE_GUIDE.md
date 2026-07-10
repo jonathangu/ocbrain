@@ -2,6 +2,13 @@
 
 Last updated: 2026-06-25
 
+> **Historical guide.** This describes the pre-autonomy source before the
+> light/heavy autopilot, automatic safeguards, targeted judge, embeddings,
+> stallcheck, local dataset grading, eval-before-train pilot, and current MCP
+> write surfaces. It is preserved as design history. Use
+> [`ARCHITECTURE.md`](ARCHITECTURE.md), [`AGENT_USE_GUIDE.md`](AGENT_USE_GUIDE.md),
+> and the top-level [`README.md`](../README.md) for current behavior.
+
 This is the coding and product guide for OCBrain as it exists in this repo.
 It is meant for humans and agents who need to understand, maintain, extend, or
 ship the product without accidentally turning it into an unsafe autopilot.

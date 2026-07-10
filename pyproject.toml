@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ocbrain"
 version = "0.2.0"
-description = "Lightweight shared memory for Codex, Claude, and OpenClaw"
+description = "Lightweight shared memory for ChatGPT/Codex, Claude Code, and OpenClaw"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "UNLICENSED" }

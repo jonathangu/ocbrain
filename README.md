@@ -1,6 +1,7 @@
 # ocbrain
 
-Lightweight shared brain for Codex, Claude Code, OpenClaw, and future runtimes.
+Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
+runtimes.
 It is one local/on-prem source-backed ledger with scope as a first-class
 dimension, not federated silos and not one undifferentiated memory pool.
 
@@ -10,8 +11,8 @@ work or pushes irreversible change. Separate local autopilot and stallcheck
 processes compile, maintain, export, and observe the store on bounded schedules.
 
 For a full architecture walkthrough — the two-plane store, the five-movement
-pipeline, the 14-stage autopilot, the signal taxonomy, the safeguards, the
-privacy model, and the dataset factory — read
+pipeline, the 14 dispatched autopilot stages plus lock/finalize, the signal
+taxonomy, the safeguards, the privacy model, and the dataset factory — read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Core Model
@@ -64,10 +65,13 @@ Current surfaces:
   `brain://loop/families`.
 
 For agent runtime behavior, read
-[`docs/AGENT_USE_GUIDE.md`](docs/AGENT_USE_GUIDE.md). For a full product and
-engineering walkthrough, read [`docs/ULTIMATE_GUIDE.md`](docs/ULTIMATE_GUIDE.md).
+[`docs/AGENT_USE_GUIDE.md`](docs/AGENT_USE_GUIDE.md). For the current product and
+engineering walkthrough, read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 For a pickup guide for another agent, read
 [`docs/AGENT_HANDOFF.md`](docs/AGENT_HANDOFF.md).
+
+For the public install, upgrade, and model-driven verification path, use
+[openclawbrain.ai/install](https://openclawbrain.ai/install/).
 
 ## Quick Start
 
@@ -267,6 +271,11 @@ Installed launcher:
 scripts/ocbrain-mcp
 ```
 
+The launcher is portable: it resolves the repository from its own location,
+uses `.venv/bin/python` when present, and falls back to `python3`. Override
+`OCBRAIN_ROOT`, `OCBRAIN_DB`, or `OCBRAIN_PYTHON` only when the default local
+layout is not the one you want.
+
 Routine MCP is read-first. Write-capable tools are hidden unless the server is
 launched with `--allow-writes`:
 
@@ -323,6 +332,11 @@ decision on a legacy candidate row:
 ```json
 { "id": "know_...", "decision": "approve", "actor": "jon" }
 ```
+
+During a long SQLite writer window, scoped retrieval remains available. If its
+audit row cannot be written, the response reports
+`retrieval_use_status=database_busy` with a null handle. Use the successful
+search result and do not retry solely to manufacture feedback evidence.
 
 ## Loop Ingest
 

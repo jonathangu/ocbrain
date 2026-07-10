@@ -1,67 +1,59 @@
-# ocbrain Design Notes
+# ocbrain design notes
 
-OCBrain has two primitives:
+This is the compact version of the current architecture. For the complete
+walkthrough, use [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-- Evidence: immutable claims with hashes, provenance, source runtime, artifacts,
-  verifier state, project, privacy scope, and optional loop tags.
-- Knowledge: compiled current belief with a `type`, lifecycle `status`, `gate`,
-  privacy scope, and evidence links.
+## Two planes, one brain
 
-Memory is a view over current injectable knowledge. Wiki/procedure pages are
-`knowledge type='doc'`; capabilities are `knowledge type='capability'`.
+The relational plane stores immutable `evidence`, compiled `knowledge`, their
+links, retrieval outcomes, run ledgers, embeddings, and the `memory` view. The
+event plane stores scoped evidence, corrections, compilation decisions, current
+belief projections, contradictions, and egress audits.
 
-## Non-Negotiables
+They are not separate runtime memories. ChatGPT/Codex, Claude Code, OpenClaw,
+repo, task, client, and session context act as lenses over one scope-aware
+ledger.
+
+## Non-negotiables
 
 - No knowledge without evidence.
-- No executable or prescriptive knowledge becomes current without a human gate.
-- Supersede/archive instead of overwriting.
-- Derived privacy scope is bounded by source privacy.
-- External/artifact content is data, never instructions.
-- The brain observes loops; it does not run or enqueue them.
+- No direct runtime write to durable belief.
+- Memory is a view over current injectable knowledge, not a second store.
+- Derived privacy scope can tighten but never widen.
+- External pages, transcripts, and artifacts are data, never instructions.
+- Automatic writes cannot clobber stronger first-party provenance.
+- Risky, prescriptive, or executable knowledge must satisfy the verifier and
+  safeguard path or carry an explicit approval signal.
+- The brain observes loop work; it does not enqueue or execute it.
+- Normal maintenance supersedes, quarantines, marks stale, or archives. It does
+  not destructively rewrite audit history.
 
-## Active Tables
+## Maintenance and autonomy
 
-- `evidence`
-- `knowledge`
-- `knowledge_evidence`
-- `retrieval_uses`
-- `loop_liveness`
-- `family_scores`
-- `memory` view
-- `search_index`
+The light and heavy autopilot profiles share one lock. The light profile keeps
+recent knowledge reviewed, labeled, embedded, quarantined, promoted, rendered,
+and maintained. The heavy profile adds snapshot, harvest, compilation, and
+dataset work. Snapshot or migration failure aborts; other stage failures make a
+run partial and allow independent later stages to continue.
 
-## Maintenance Surface
+The separate stallcheck process is passive. It detects a parked turn from
+transcripts and runner ledgers, writes liveness evidence, and may page through
+an operator-owned transport. It never claims the work itself.
 
-- `ocbrain prune`: marks unreferenced expired knowledge `stale`, and can archive
-  stale rows later without deleting them. Served-but-never-useful knowledge uses
-  a shorter decay window; useful retrieval feedback protects knowledge from that
-  accelerated stale transition.
-- `ocbrain heal`: detects conflicting current values for the same
-  `(subject, predicate, project)` and supersedes lower-confidence rows with
-  correction evidence.
-- `ocbrain liveness-check`: reads runner-owned `loop_liveness` rows, opens
-  loop tripwire evidence after missed deadman timestamps, and never executes or
-  enqueues loop work.
+## Retrieval and feedback
 
-## Loop Family Classification
+Scoped search returns source-backed context plus excluded-scope counts and
+visible contradictions. When the retrieval audit is recorded, the result
+includes a `retrieval_use_id` for `brain.feedback`. During a long SQLite writer
+window, the read can succeed with `retrieval_use_status=database_busy` and no
+handle. Callers must not retry merely to manufacture feedback evidence.
 
-Loop failures are classified on ingest as `approach`, `precondition`, `infra`,
-`safety`, or `unknown`. Only `approach` failures count toward an `exhausted`
-family. `precondition` and `infra` failures put the family in `blocked` and
-stage repair context; `safety` failures make the family `risky`. Forced
-exploration is recorded from `forced_exploration=true` or
-`exploration.forced=true` and summarized as attempts plus improvements found.
+## Dataset boundary
 
-## Privacy Composition
+SFT, DPO, and persona examples carry provenance, scope, label, and confidence.
+Local grading rejects non-loopback endpoints before reading an example. Export
+has no hosted target and excludes private scope. The eval-before-train pilot
+freezes held-out prompts, references, and rubric before training files exist,
+then keeps the blind key away from the rater until scoring.
 
-Evidence links tighten knowledge scope using the privacy lattice:
-`private < workspace < project < public`. A doc initially staged as `public`
-becomes `private` if any linked source evidence is private, so digest and
-resource rendering cannot accidentally publish private-source material.
-
-## Human Feedback Gate
-
-`brain.feedback` records retrieval usefulness by default. When the MCP server is
-started with `--allow-writes`, the same tool can approve or reject human-gated
-candidate knowledge. Approval moves a candidate to `current` and records
-`approved_by`; rejection archives the candidate with an invalidation reason.
+Pipeline completion and model-quality acceptance are separate claims.
