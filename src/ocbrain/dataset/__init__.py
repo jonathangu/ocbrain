@@ -88,4 +88,21 @@ def mine_all(
         time_budget_seconds=budget,
         parse_cache=cache,
     )
-    return {"ok": True, "sft": sft, "dpo": dpo, "persona": persona}
+    locks = [part["writer_lock"] for part in (sft, dpo, persona)]
+    writer_lock = {
+        "batch_max_operations": cfg.dataset.write_batch_size,
+        "batch_max_seconds": cfg.dataset.write_batch_seconds,
+        "operations": sum(item["operations"] for item in locks),
+        "batches_committed": sum(item["batches_committed"] for item in locks),
+        "lock_wait_seconds": round(sum(item["lock_wait_seconds"] for item in locks), 6),
+        "max_lock_wait_seconds": max(item["max_lock_wait_seconds"] for item in locks),
+        "writer_lock_seconds": round(sum(item["writer_lock_seconds"] for item in locks), 6),
+        "max_writer_lock_seconds": max(item["max_writer_lock_seconds"] for item in locks),
+    }
+    return {
+        "ok": True,
+        "sft": sft,
+        "dpo": dpo,
+        "persona": persona,
+        "writer_lock": writer_lock,
+    }

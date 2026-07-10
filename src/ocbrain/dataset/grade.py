@@ -181,6 +181,7 @@ def _candidate_rows(
     prompt_version: str,
     force: bool,
     limit: int,
+    source_uri_prefix: str | None = None,
 ) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in datasets)
     clauses = [
@@ -188,6 +189,10 @@ def _candidate_rows(
         "quality_label IN ('good','neutral')",
     ]
     params: list[Any] = list(datasets)
+    if source_uri_prefix:
+        escaped = source_uri_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append("source_uri LIKE ? ESCAPE '\\'")
+        params.append(f"{escaped}%")
     if not force:
         clauses.append(
             "(grade_model IS NULL OR grade_model != ? OR grade_prompt_version != ?)"
@@ -295,6 +300,7 @@ def _grade_examples_unlocked(
     force: bool = False,
     now: datetime | None = None,
     transport: GradeTransport | None = None,
+    source_uri_prefix: str | None = None,
 ) -> dict[str, Any]:
     """Grade a bounded batch and persist normalized metadata.
 
@@ -350,6 +356,7 @@ def _grade_examples_unlocked(
         prompt_version=grade_cfg.prompt_version,
         force=force,
         limit=batch_limit,
+        source_uri_prefix=source_uri_prefix,
     )
     if not rows:
         return {
@@ -369,6 +376,7 @@ def _grade_examples_unlocked(
                 "ids": [row["id"] for row in rows],
                 "model": model,
                 "prompt_version": grade_cfg.prompt_version,
+                "source_filter": bool(source_uri_prefix),
             }
         )
     )
@@ -493,6 +501,7 @@ def grade_examples(
     force: bool = False,
     now: datetime | None = None,
     transport: GradeTransport | None = None,
+    source_uri_prefix: str | None = None,
 ) -> dict[str, Any]:
     """Acquire the DB-adjacent single-grader lock, then grade a bounded batch."""
     lock_dir = db_side_dir(conn, "locks")
@@ -507,6 +516,7 @@ def grade_examples(
             force=force,
             now=now,
             transport=transport,
+            source_uri_prefix=source_uri_prefix,
         )
     with file_lock(lock_dir / "dataset-grade.lock") as acquired:
         if not acquired:
@@ -529,4 +539,5 @@ def grade_examples(
             force=force,
             now=now,
             transport=transport,
+            source_uri_prefix=source_uri_prefix,
         )

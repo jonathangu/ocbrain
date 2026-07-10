@@ -1,4 +1,4 @@
-"""ocbrain v0.2 configuration surface.
+"""ocbrain v0.3 configuration surface.
 
 One config module for every v0.2 tunable (spec §3, resolution R1). The public
 entry point is :func:`load_config`, which layers, in order:
@@ -73,6 +73,10 @@ class AutopilotConfig:
     # Locking discipline across profiles. ``shared`` == light and heavy runs
     # contend for the same autopilot lock so they never overlap.
     profile_locks: str = "shared"
+    # Reclaim a large WAL only after dataset mining has committed every bounded
+    # writer batch. Small WALs are left to SQLite's normal autocheckpoint path.
+    checkpoint_after_dataset_mine: bool = True
+    checkpoint_wal_min_bytes: int = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,11 @@ class DatasetConfig:
     # real founder corrections in the overnight run; when true, mining admits a
     # pair on softer structural evidence. Defaults on for v0.3.
     dpo_relaxed_gate: bool = True
+    # Mining never holds SQLite's single-writer lock across an entire corpus.
+    # Commit after either bound and record wait/hold telemetry in the stage
+    # result. Smaller batches make MCP feedback and stallcheck writes responsive.
+    write_batch_size: int = 50
+    write_batch_seconds: float = 2.0
 
 
 @dataclass(frozen=True)

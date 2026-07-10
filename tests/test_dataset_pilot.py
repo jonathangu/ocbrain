@@ -132,6 +132,58 @@ def test_eval_pack_exists_before_train_and_is_deterministic(tmp_path: Path):
     assert all("metadata" not in row for row in _read_jsonl(root / "train" / "sft.jsonl"))
 
 
+def test_second_pilot_reuses_frozen_eval_bytes_and_heldout_bar(tmp_path: Path):
+    conn = _db(tmp_path)
+    for i in range(25):
+        _store_chat(conn, "persona", i)
+    _store_chat(conn, "sft", 99)
+    _store_dpo(conn, 1)
+    conn.commit()
+    first = tmp_path / "pilot-v1"
+    prepare_pilot(conn, cfg=OcbrainConfig(), output_dir=first, min_grade=0.8)
+
+    for i in range(25, 35):
+        _store_chat(conn, "persona", i)
+    conn.commit()
+    second = tmp_path / "pilot-v2"
+    result = prepare_pilot(
+        conn,
+        cfg=OcbrainConfig(),
+        output_dir=second,
+        min_grade=0.8,
+        eval_from=first,
+        seed="ocbrain-voice-pilot-v2-training",
+        training_iterations=50,
+    )
+
+    assert result["eval_prompt_count"] == 20
+    for name in ("prompts.jsonl", "references.jsonl", "rubric.json"):
+        assert (second / "eval" / name).read_bytes() == (first / "eval" / name).read_bytes()
+    first_manifest = json.loads((first / "pilot-manifest.json").read_text())
+    second_manifest = json.loads((second / "pilot-manifest.json").read_text())
+    assert second_manifest["heldout_content_hash"] == first_manifest["heldout_content_hash"]
+    assert second_manifest["frozen_eval"]["reused"] is True
+    assert second_manifest["mlx"]["trainer_argv"][-1] == "50"
+
+    heldout_ids = {
+        row["source_example_id"] for row in _read_jsonl(first / "eval" / "references.jsonl")
+    }
+    heldout_hashes = {
+        row["content_hash"]
+        for row in conn.execute(
+            "SELECT id, content_hash FROM dataset_examples"
+        ).fetchall()
+        if row["id"] in heldout_ids
+    }
+    for split in ("sft", "dpo", "persona"):
+        for record in _read_jsonl(second / "train" / f"{split}.jsonl"):
+            # The exported body intentionally drops metadata, so compare its
+            # canonical body hash to the DB content hashes reserved by v1.
+            from ocbrain.ids import content_hash
+
+            assert content_hash(canonical_json(record)) not in heldout_hashes
+
+
 def test_blind_randomization_and_scoring(tmp_path: Path):
     conn = _db(tmp_path)
     for i in range(22):

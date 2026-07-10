@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ocbrain.config import OcbrainConfig, load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.dataset.quality import _REFUSAL_RE, store_example
 from ocbrain.dataset.transcripts import (
     Session,
@@ -207,6 +208,7 @@ def mine_sft(
     limit: int | None = None,
     time_budget_seconds: float | None = None,
     parse_cache: ParseCache | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any]:
     """Mine SFT examples from ``sessions`` (or discovered transcripts).
 
@@ -221,11 +223,18 @@ def mine_sft(
     excluded = 0
     examined = 0
     files_mined = 0
+    batch = write_batch or DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
 
     def _emit(session: Session) -> int:
         nonlocal stored, excluded, examined
         count = 0
+        batch.ensure()
         evidence_id, scope = resolve_transcript_evidence(conn, session)
+        batch.operation()
         for exchange in segment_exchanges(session, cfg):
             examined += 1
             label, confidence, reasons = label_exchange(
@@ -234,6 +243,7 @@ def mine_sft(
                 cfg,
                 retrieval_outcomes=retrieval_by_session.get(session.session_id, []),
             )
+            batch.ensure()
             result = store_example(
                 conn,
                 dataset="sft",
@@ -257,6 +267,7 @@ def mine_sft(
                 session_id=session.session_id,
                 occurred_at=exchange.occurred_at,
             )
+            batch.operation()
             if result is None:
                 continue
             if result["quality_label"] == "excluded":
@@ -271,6 +282,7 @@ def mine_sft(
             if limit is not None and examined >= limit:
                 break
             _emit(session)
+            batch.flush()
     elif roots is not None:
         ds = cfg.dataset
         # founder_ids=() here mirrors the SFT parse below; the tuple lets the
@@ -299,11 +311,17 @@ def mine_sft(
             else:
                 session = _load()
             emitted = 0 if session is None else _emit(session)
+            batch.ensure()
             record_source(conn, str(path), "sft", fingerprint, emitted)
+            batch.operation()
+            # A source watermark closes its file boundary. Partial earlier
+            # batches are safe: reruns deduplicate them if a later batch fails.
+            batch.flush()
             files_mined += 1
             if limit is not None and files_mined >= limit:
                 break
 
+    batch.flush()
     return {
         "ok": True,
         "dataset": "sft",
@@ -311,4 +329,5 @@ def mine_sft(
         "stored": stored,
         "excluded": excluded,
         "files_mined": files_mined,
+        "writer_lock": batch.metrics(),
     }

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from ocbrain.config import OcbrainConfig, founder_ids, founder_weight, load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.dataset.quality import store_example
 from ocbrain.dataset.transcripts import (
     Session,
@@ -549,6 +550,7 @@ def mine_dpo(
     include_events: bool = True,
     limit: int | None = None,
     time_budget_seconds: float | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or load_config()
     from ocbrain.dataset.transcripts import resolve_transcript_evidence
@@ -558,17 +560,26 @@ def mine_dpo(
     excluded = 0
     examined = 0
     files_mined = 0
+    batch = write_batch or DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
 
     def _emit_transcript(session: Session) -> int:
         nonlocal stored, excluded, examined
+        batch.ensure()
         evidence_id, scope = resolve_transcript_evidence(conn, session)
+        batch.operation()
         count = 0
         for pair in find_transcript_pairs(session, cfg):
             examined += 1
             pair = DpoPair(
                 **{**pair.__dict__, "evidence_ids": (evidence_id,), "privacy_scope": scope}
             )
+            batch.ensure()
             result = _store_pair(conn, pair)
+            batch.operation()
             if result is None:
                 continue
             count += 1
@@ -581,6 +592,7 @@ def mine_dpo(
     if sessions is not None:
         for session in sessions:
             _emit_transcript(session)
+            batch.flush()
     elif roots is not None:
         for path, fingerprint in iter_unmined_transcripts(conn, roots, "dpo"):
             if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
@@ -593,7 +605,10 @@ def mine_dpo(
                 founder_ids=founder_ids(cfg),
             )
             emitted = 0 if session is None else _emit_transcript(session)
+            batch.ensure()
             record_source(conn, str(path), "dpo", fingerprint, emitted)
+            batch.operation()
+            batch.flush()
             files_mined += 1
             if limit is not None and files_mined >= limit:
                 break
@@ -601,7 +616,9 @@ def mine_dpo(
     if include_events:
         for pair in find_event_pairs(conn, cfg):
             examined += 1
+            batch.ensure()
             result = _store_pair(conn, pair)
+            batch.operation()
             if result is None:
                 continue
             if result["quality_label"] == "excluded":
@@ -609,6 +626,7 @@ def mine_dpo(
             else:
                 stored += 1
 
+    batch.flush()
     return {
         "ok": True,
         "dataset": "dpo",
@@ -616,6 +634,7 @@ def mine_dpo(
         "stored": stored,
         "excluded": excluded,
         "files_mined": files_mined,
+        "writer_lock": batch.metrics(),
     }
 
 

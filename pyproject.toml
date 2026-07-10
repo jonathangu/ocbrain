@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain"
-version = "0.2.0"
+version = "0.3.0"
 description = "Lightweight shared memory for ChatGPT/Codex, Claude Code, and OpenClaw"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "UNLICENSED" }
+license = "Apache-2.0"
 authors = [{ name = "Jonathan Gu" }]
 dependencies = []
 

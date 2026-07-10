@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import pickle
 import sqlite3
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -111,6 +112,51 @@ def snapshot_sqlite(src: Path | str, dest: Path | str) -> Path:
         dst_conn.close()
         src_conn.close()
     return dest_path
+
+
+def checkpoint_sqlite_wal(
+    conn: sqlite3.Connection,
+    db_path: Path | str | None,
+    *,
+    minimum_bytes: int = 0,
+) -> dict[str, object]:
+    """Safely truncate a large WAL after the caller's writer transaction exits.
+
+    SQLite's checkpoint pragma is run only on a connection with no active
+    transaction.  Its three counters are reported verbatim and a busy result is
+    never presented as success.  The database remains valid if another reader
+    prevents truncation; a later run can retry after that reader exits.
+    """
+    if db_path is None or str(db_path) == ":memory:":
+        return {"status": "skipped", "reason": "no_db_path"}
+    if conn.in_transaction:
+        raise RuntimeError("WAL checkpoint requires a committed writer transaction")
+    path = Path(db_path)
+    wal_path = path.with_name(path.name + "-wal")
+    before = wal_path.stat().st_size if wal_path.exists() else 0
+    if before < max(0, minimum_bytes):
+        return {
+            "status": "skipped",
+            "reason": "below_threshold",
+            "wal_bytes_before": before,
+            "minimum_bytes": minimum_bytes,
+        }
+    began = time.monotonic()
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    elapsed = time.monotonic() - began
+    if row is None:
+        raise sqlite3.DatabaseError("WAL checkpoint returned no result")
+    busy, log_frames, checkpointed_frames = (int(row[0]), int(row[1]), int(row[2]))
+    after = wal_path.stat().st_size if wal_path.exists() else 0
+    return {
+        "status": "ok" if busy == 0 else "busy",
+        "busy": busy,
+        "log_frames": log_frames,
+        "checkpointed_frames": checkpointed_frames,
+        "wal_bytes_before": before,
+        "wal_bytes_after": after,
+        "elapsed_seconds": round(elapsed, 6),
+    }
 
 
 # --- run-shared transcript parse memo (v0.3 incremental mining) ---------------

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ocbrain import __version__
 from ocbrain.db import (
     PUBLIC_SCOPES,
     approve_knowledge,
@@ -86,7 +87,7 @@ def handle_request(
         if method == "initialize":
             result = {
                 "protocolVersion": "2025-11-25",
-                "serverInfo": {"name": "ocbrain", "version": "0.1.0"},
+                "serverInfo": {"name": "ocbrain", "version": __version__},
                 "instructions": INSTRUCTIONS,
                 "capabilities": {"tools": {}, "resources": {}},
             }

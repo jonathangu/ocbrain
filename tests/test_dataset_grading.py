@@ -121,6 +121,29 @@ def test_grade_persists_metadata_and_is_idempotent(tmp_path: Path):
     assert conn.execute("SELECT COUNT(*) FROM dataset_grade_runs").fetchone()[0] == 1
 
 
+def test_grade_can_target_a_private_curation_source_prefix(tmp_path: Path):
+    conn = _db(tmp_path)
+    wanted = _store(conn, "persona", 1)
+    _store(conn, "persona", 2)
+    conn.execute(
+        "UPDATE dataset_examples SET source_uri = ? WHERE id = ?",
+        ("curation://pack-a/1", wanted["id"]),
+    )
+    conn.commit()
+
+    result = grade_examples(
+        conn,
+        cfg=_cfg(),
+        transport=_transport,
+        source_uri_prefix="curation://pack-a/",
+    )
+    assert result["graded"] == 1
+    scores = conn.execute(
+        "SELECT id, grade_score FROM dataset_examples ORDER BY id"
+    ).fetchall()
+    assert {row["id"] for row in scores if row["grade_score"] is not None} == {wanted["id"]}
+
+
 def test_grade_caps_count_attempts_not_only_successes(tmp_path: Path):
     conn = _db(tmp_path)
     for i in range(4):

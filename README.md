@@ -1,5 +1,7 @@
 # ocbrain
 
+Current release: **v0.3.0**. Licensed under Apache-2.0.
+
 Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
 runtimes.
 It is one local/on-prem source-backed ledger with scope as a first-class
@@ -125,10 +127,12 @@ bounded `dataset_grade_runs` ledger row. The default transport is Ollama's local
 chat endpoint; provide the installed local model explicitly. A DB-adjacent file
 lock prevents two graders from running together. Grades and run progress commit
 per item, deterministic model/response failures stay skipped until `--force`,
-and SQLite infrastructure failures remain retryable. If the scheduled autopilot
-owns the long write lock, grading returns `blocked` instead of claiming success.
+and SQLite infrastructure failures remain retryable. If a scheduled writer is
+active, grading returns `blocked` instead of claiming success.
 
 ```bash
+uv run --with-editable . ocbrain dataset-persona-curate \
+  --input data/curation/private-voice-examples.jsonl
 uv run --with-editable . ocbrain dataset-grade \
   --model your-local-grader-model \
   --limit 100
@@ -161,6 +165,23 @@ uv run --with-editable . ocbrain dataset-pilot-score \
   --ratings "${PILOT}/eval/blind-ratings.jsonl"
 ```
 
+A later pilot can improve the training corpus without moving the evaluation
+bar. `--eval-from` copies the earlier prompts, references, and rubric
+byte-for-byte, verifies the held-out source hashes, and excludes those same
+examples again:
+
+```bash
+uv run --with-editable . ocbrain dataset-pilot-prepare \
+  --output-dir data/datasets/pilot-v2 \
+  --eval-from data/datasets/pilot-v1 \
+  --seed ocbrain-voice-pilot-v2-training \
+  --training-iterations 50 \
+  --min-grade 0.8 \
+  --base-model /absolute/path/to/local-4bit-model \
+  --base-model-source upstream/model-repo \
+  --base-model-revision pinned-commit
+```
+
 After verified local training is recorded, generate the candidate side with the
 same pinned MLX-LM environment used for training:
 
@@ -170,12 +191,18 @@ uvx --from 'mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@PIN' \
   --pilot-dir "${PILOT}"
 PYTHONPATH=src uv run python scripts/grade-pilot-blind.py \
   --pilot-dir "${PILOT}" \
+  --calibration data/curation/private-judge-calibration.jsonl \
   --model your-local-grader-model
 ```
 
-The rating helper refuses non-loopback endpoints before it opens the blind
-pair file, checkpoints each completed rating atomically, and never reads the
-separate A/B key. `dataset-pilot-score` is the only step that unblinds results.
+The rating helper refuses non-loopback endpoints, then requires at least six
+calibration cases and 80% agreement before it opens the blind pair file. It
+checkpoints each completed rating atomically and never reads the separate A/B
+key. `dataset-pilot-score` is the only step that unblinds results.
+
+The dated v0.3.0 second-pilot result is intentionally modest. Against the exact
+same 20-item blind set, the candidate improved from 2 preferences to 7; the
+reference still won 13. The pipeline passed. The model-quality bar did not.
 
 All generated corpus, reference, candidate, key, and rating files stay under
 the gitignored local dataset tree. The pilot also writes deterministic MLX-LM
@@ -183,6 +210,15 @@ the gitignored local dataset tree. The pilot also writes deterministic MLX-LM
 stays as a separate preference artifact because MLX-LM LoRA is the SFT trainer
 for this first pilot. The manifest records the exact pinned trainer argv; it
 does not claim training started until that command actually runs.
+
+Dataset mining also keeps the shared brain responsive. SFT, DPO, and persona
+writes commit after at most 50 mutating units or two seconds, whichever comes
+first, and each stage reports SQLite writer-lock wait, total hold time, and the
+longest hold. After mining has committed, autopilot truncates a WAL larger than
+64 MiB; a live reader produces an honest `busy` result for a later retry.
+Autolabel releases the writer slot between source miners and before every
+expensive FTS attribution query, then batches the fast label-fold updates under
+the same measured bounds.
 
 To use the scoped event-sourced core directly:
 
@@ -454,3 +490,7 @@ uv run --with-editable . python -m compileall src tests
 - Automatic safeguards before executable or prescriptive knowledge can serve.
 - Emit evidence; do not write durable knowledge directly from runtimes.
 - Watch loops closely enough to tell done from wedged, without running them.
+
+## License
+
+Apache License 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).

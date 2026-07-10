@@ -20,6 +20,7 @@ from ocbrain.autolabel import (
     record_signal,
 )
 from ocbrain.config import load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import (
     connect,
     get_knowledge,
@@ -279,6 +280,44 @@ def test_attribute_signals_skips_session_signals(tmp_path: Path) -> None:
         "SELECT knowledge_id FROM signal_events WHERE kind='user_correction'"
     ).fetchone()
     assert row["knowledge_id"] is None
+
+
+def test_attribute_signals_releases_writer_before_next_fts_query(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = _db(tmp_path)
+    kid = _kid(conn, predicate="rollback", value="documented rollback procedure")
+    for index in range(2):
+        record_signal(
+            conn,
+            Signal(
+                kind="learning_gate_rule",
+                polarity="bad",
+                weight=0.6,
+                source="learning_db",
+                source_ref=f"learning:{index}",
+                details={"content": "documented rollback procedure"},
+            ),
+        )
+    conn.commit()
+    calls = 0
+
+    def observed_search(_conn, text, limit):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+            observer.execute("BEGIN IMMEDIATE")
+            observer.rollback()
+            observer.close()
+        return [{"doc_id": kid, "title": text, "snippet": text}]
+
+    monkeypatch.setattr("ocbrain.autolabel.search", observed_search)
+    batch = DatasetWriteBatch(conn, max_operations=1, max_seconds=60)
+    attributed = attribute_signals(conn, write_batch=batch)
+    assert attributed == {kid}
+    assert calls == 2
+    assert batch.metrics()["batches_committed"] == 2
 
 
 # --------------------------------------------------------------------------- #

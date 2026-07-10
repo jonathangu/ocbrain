@@ -136,17 +136,92 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _calibrate(
+    endpoint: str,
+    model: str,
+    path: Path,
+    *,
+    timeout: int,
+    minimum_accuracy: float,
+    report_path: Path,
+) -> dict[str, Any]:
+    cases = _load_jsonl(path)
+    if len(cases) < 6:
+        raise ValueError("judge calibration requires at least six cases")
+    correct = 0
+    results: list[dict[str, Any]] = []
+    for case in cases:
+        expected = str(case.get("expected_winner") or "").lower()
+        if expected not in {"a", "b", "tie"}:
+            raise ValueError("calibration expected_winner must be a, b, or tie")
+        rating = _rate(endpoint, model, case, timeout=timeout)
+        matched = rating["winner"] == expected
+        correct += int(matched)
+        results.append(
+            {
+                "eval_id": case.get("eval_id"),
+                "expected_winner": expected,
+                "actual_winner": rating["winner"],
+                "correct": matched,
+            }
+        )
+    accuracy = correct / len(cases)
+    report = {
+        "action": "dataset-pilot-calibrate-judge",
+        "items": len(cases),
+        "correct": correct,
+        "accuracy": round(accuracy, 4),
+        "minimum_accuracy": minimum_accuracy,
+        "passed": accuracy >= minimum_accuracy,
+        "judge_model": model,
+        "local_only": True,
+        "results": results,
+    }
+    temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+    temporary.write_text(canonical_json(report) + "\n", encoding="utf-8")
+    temporary.replace(report_path)
+    if not report["passed"]:
+        raise RuntimeError(
+            f"judge calibration failed: {correct}/{len(cases)} "
+            f"({accuracy:.1%}) < {minimum_accuracy:.1%}"
+        )
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pilot-dir", type=Path, required=True)
     parser.add_argument("--endpoint", default="http://127.0.0.1:11434/api/chat")
     parser.add_argument("--model", default="qwen3.6:35b-a3b-q4_K_M")
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--min-calibration-accuracy", type=float, default=0.8)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     endpoint = require_loopback_endpoint(args.endpoint)
     root = args.pilot_dir.expanduser()
+    if not 0.0 <= args.min_calibration_accuracy <= 1.0:
+        raise ValueError("min calibration accuracy must be between 0 and 1")
+    calibration = _calibrate(
+        endpoint,
+        args.model,
+        args.calibration.expanduser(),
+        timeout=args.timeout,
+        minimum_accuracy=args.min_calibration_accuracy,
+        report_path=root / "eval" / "judge-calibration-report.json",
+    )
+    print(
+        canonical_json(
+            {
+                key: calibration[key]
+                for key in ("action", "items", "correct", "accuracy", "passed")
+            }
+        ),
+        flush=True,
+    )
+    # The blind material is deliberately not opened until the judge has passed
+    # calibration. A failed judge therefore cannot leave partial blind ratings.
     pairs = _load_jsonl(root / "eval" / "blind_pairs.jsonl")
     output = root / "eval" / "blind-ratings.jsonl"
     ratings = [] if args.force or not output.exists() else _load_jsonl(output)

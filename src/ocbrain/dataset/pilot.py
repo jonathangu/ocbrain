@@ -167,6 +167,8 @@ def prepare_pilot(
     base_model: str | None = None,
     base_model_source: str | None = None,
     base_model_revision: str | None = None,
+    eval_from: str | Path | None = None,
+    training_iterations: int = 25,
 ) -> dict[str, Any]:
     """Write a deterministic private pilot pack, refusing train-first states."""
     cfg = cfg or load_config()
@@ -179,54 +181,108 @@ def prepare_pilot(
         threshold = 0.8
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("min_grade must be between 0 and 1")
+    if training_iterations < 1:
+        raise ValueError("training_iterations must be positive")
 
     root = (
         Path(output_dir).expanduser()
         if output_dir is not None
         else _default_output_dir(conn, cfg)
     )
-    persona_rows = _eligible_rows(conn, "persona", min_grade=threshold)
-    eval_candidates: list[tuple[str, sqlite3.Row, list[dict[str, Any]], str]] = []
-    for row in persona_rows:
-        record = json.loads(row["example_json"])
-        parts = _persona_eval_parts(record)
-        if parts is None:
-            continue
-        prompt, reference = parts
-        rank = sha256_text(f"{seed}:{row['content_hash']}")
-        eval_candidates.append((rank, row, prompt, reference))
-    eval_candidates.sort(key=lambda item: item[0])
-    if len(eval_candidates) < eval_prompts:
-        raise RuntimeError(
-            f"eval-before-train gate: need {eval_prompts} graded persona prompts, "
-            f"found {len(eval_candidates)}"
-        )
+    frozen_eval: dict[str, Any] | None = None
+    if eval_from is not None:
+        source_root = Path(eval_from).expanduser()
+        source_eval = source_root / "eval"
+        source_payloads = {
+            "prompts": (source_eval / "prompts.jsonl").read_text(encoding="utf-8"),
+            "references": (source_eval / "references.jsonl").read_text(encoding="utf-8"),
+            "rubric": (source_eval / "rubric.json").read_text(encoding="utf-8"),
+        }
+        prompts = _load_jsonl(source_eval / "prompts.jsonl")
+        references = _load_jsonl(source_eval / "references.jsonl")
+        if len(prompts) < 20 or len(prompts) != len(references):
+            raise RuntimeError("frozen eval must contain at least 20 matched prompts/references")
+        if json.loads(source_payloads["rubric"]) != RUBRIC:
+            raise RuntimeError("frozen eval rubric does not match the unchanged pilot rubric")
+        prompt_ids = {row.get("eval_id") for row in prompts}
+        reference_ids = {row.get("eval_id") for row in references}
+        if None in prompt_ids or prompt_ids != reference_ids:
+            raise RuntimeError("frozen eval prompt/reference ids do not match")
+        source_ids = [row.get("source_example_id") for row in references]
+        if any(not isinstance(value, str) for value in source_ids):
+            raise RuntimeError("frozen references must retain source example ids")
+        placeholders = ",".join("?" for _ in source_ids)
+        heldout_rows = conn.execute(
+            f"SELECT id, content_hash FROM dataset_examples WHERE id IN ({placeholders})",
+            tuple(source_ids),
+        ).fetchall()
+        if len(heldout_rows) != len(set(source_ids)):
+            raise RuntimeError("frozen eval source examples are missing from the dataset")
+        heldout_hashes = {row["content_hash"] for row in heldout_rows}
+        source_manifest_path = source_root / "pilot-manifest.json"
+        if source_manifest_path.is_file():
+            source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+            expected = source_manifest.get("heldout_content_hash")
+            actual = sha256_text(canonical_json(sorted(heldout_hashes)))
+            if expected and expected != actual:
+                raise RuntimeError("frozen eval held-out hash no longer matches its manifest")
+        filenames = {
+            "prompts": "prompts.jsonl",
+            "references": "references.jsonl",
+            "rubric": "rubric.json",
+        }
+        eval_files = {
+            name: _atomic_write(root / "eval" / filenames[name], payload)
+            for name, payload in source_payloads.items()
+        }
+        frozen_eval = {
+            "reused": True,
+            "source_name": source_root.name,
+            "file_sha256": {name: value["sha256"] for name, value in eval_files.items()},
+        }
+    else:
+        persona_rows = _eligible_rows(conn, "persona", min_grade=threshold)
+        eval_candidates: list[tuple[str, sqlite3.Row, list[dict[str, Any]], str]] = []
+        for row in persona_rows:
+            record = json.loads(row["example_json"])
+            parts = _persona_eval_parts(record)
+            if parts is None:
+                continue
+            prompt, reference = parts
+            rank = sha256_text(f"{seed}:{row['content_hash']}")
+            eval_candidates.append((rank, row, prompt, reference))
+        eval_candidates.sort(key=lambda item: item[0])
+        if len(eval_candidates) < eval_prompts:
+            raise RuntimeError(
+                f"eval-before-train gate: need {eval_prompts} graded persona prompts, "
+                f"found {len(eval_candidates)}"
+            )
 
-    heldout = eval_candidates[:eval_prompts]
-    heldout_hashes = {row["content_hash"] for _, row, _, _ in heldout}
-    prompts: list[dict[str, Any]] = []
-    references: list[dict[str, Any]] = []
-    for _, row, prompt, reference in heldout:
-        eval_id = stable_id("eval", seed, row["id"])
-        prompts.append({"eval_id": eval_id, "messages": prompt})
-        references.append(
-            {
-                "eval_id": eval_id,
-                "reference_response": reference,
-                "source_example_id": row["id"],
-            }
-        )
+        heldout = eval_candidates[:eval_prompts]
+        heldout_hashes = {row["content_hash"] for _, row, _, _ in heldout}
+        prompts = []
+        references = []
+        for _, row, prompt, reference in heldout:
+            eval_id = stable_id("eval", seed, row["id"])
+            prompts.append({"eval_id": eval_id, "messages": prompt})
+            references.append(
+                {
+                    "eval_id": eval_id,
+                    "reference_response": reference,
+                    "source_example_id": row["id"],
+                }
+            )
 
-    # The heldout set exists in memory before any training path is opened.
-    eval_files = {
-        "prompts": _atomic_write(root / "eval" / "prompts.jsonl", _jsonl(prompts)),
-        "references": _atomic_write(
-            root / "eval" / "references.jsonl", _jsonl(references)
-        ),
-        "rubric": _atomic_write(
-            root / "eval" / "rubric.json", canonical_json(RUBRIC) + "\n"
-        ),
-    }
+        # The heldout set exists in memory before any training path is opened.
+        eval_files = {
+            "prompts": _atomic_write(root / "eval" / "prompts.jsonl", _jsonl(prompts)),
+            "references": _atomic_write(
+                root / "eval" / "references.jsonl", _jsonl(references)
+            ),
+            "rubric": _atomic_write(
+                root / "eval" / "rubric.json", canonical_json(RUBRIC) + "\n"
+            ),
+        }
 
     train_files: dict[str, dict[str, Any]] = {}
     train_counts: dict[str, int] = {}
@@ -336,10 +392,11 @@ def prepare_pilot(
                 "--seed",
                 "20260709",
                 "--iters",
-                "25",
+                str(training_iterations),
             ],
         },
         "eval_files": eval_files,
+        "frozen_eval": frozen_eval,
         "train_files": train_files,
         "blind_protocol": {
             "candidate_format": {"eval_id": "eval_...", "response": "model text"},

@@ -421,6 +421,13 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_mine_parser.add_argument("--verified-only", action="store_true")
     dataset_mine_parser.set_defaults(func=cmd_dataset_mine)
 
+    dataset_curate_parser = subparsers.add_parser(
+        "dataset-persona-curate",
+        help="Import explicit private persona prompt/response JSONL",
+    )
+    dataset_curate_parser.add_argument("--input", type=Path, required=True)
+    dataset_curate_parser.set_defaults(func=cmd_dataset_persona_curate)
+
     dataset_grade_parser = subparsers.add_parser(
         "dataset-grade", help="Grade examples with a loopback-only local LLM"
     )
@@ -428,6 +435,10 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_grade_parser.add_argument("--limit", type=int)
     dataset_grade_parser.add_argument("--endpoint")
     dataset_grade_parser.add_argument("--model")
+    dataset_grade_parser.add_argument(
+        "--source-uri-prefix",
+        help="Grade only examples whose local provenance URI begins with this value",
+    )
     dataset_grade_parser.add_argument("--force", action="store_true")
     dataset_grade_parser.set_defaults(func=cmd_dataset_grade)
 
@@ -457,6 +468,12 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_prepare_parser.add_argument("--base-model")
     pilot_prepare_parser.add_argument("--base-model-source")
     pilot_prepare_parser.add_argument("--base-model-revision")
+    pilot_prepare_parser.add_argument(
+        "--eval-from",
+        type=Path,
+        help="Reuse a prior pilot's prompts/references/rubric byte-for-byte",
+    )
+    pilot_prepare_parser.add_argument("--training-iterations", type=int, default=25)
     pilot_prepare_parser.set_defaults(func=cmd_dataset_pilot_prepare)
 
     pilot_blind_parser = subparsers.add_parser(
@@ -1607,6 +1624,25 @@ def cmd_dataset_mine(args: argparse.Namespace) -> int:
             time_budget_seconds=budget,
         )
     conn.commit()
+    if cfg.autopilot.checkpoint_after_dataset_mine:
+        from ocbrain.fsutil import checkpoint_sqlite_wal
+
+        db_path = getattr(args, "db", None)
+        result["wal_checkpoint"] = checkpoint_sqlite_wal(
+            conn,
+            db_path,
+            minimum_bytes=cfg.autopilot.checkpoint_wal_min_bytes,
+        )
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_persona_curate(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.curate import import_persona_curation
+
+    conn = open_db(args)
+    result = import_persona_curation(conn, args.input, cfg=load_config())
+    conn.commit()
     output(args, result)
     return 0
 
@@ -1644,6 +1680,7 @@ def cmd_dataset_grade(args: argparse.Namespace) -> int:
         endpoint=getattr(args, "endpoint", None),
         model=getattr(args, "model", None),
         force=getattr(args, "force", False),
+        source_uri_prefix=getattr(args, "source_uri_prefix", None),
     )
     conn.commit()
     output(args, result)
@@ -1671,6 +1708,8 @@ def cmd_dataset_pilot_prepare(args: argparse.Namespace) -> int:
             base_model=getattr(args, "base_model", None),
             base_model_source=getattr(args, "base_model_source", None),
             base_model_revision=getattr(args, "base_model_revision", None),
+            eval_from=getattr(args, "eval_from", None),
+            training_iterations=getattr(args, "training_iterations", 25),
         )
     except RuntimeError as exc:
         output(

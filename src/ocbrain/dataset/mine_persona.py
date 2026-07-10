@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from ocbrain.config import OcbrainConfig, founder_ids, load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.dataset.quality import store_example
 from ocbrain.dataset.transcripts import (
     Session,
@@ -160,6 +161,7 @@ def commit_examples(
     cfg: OcbrainConfig | None = None,
     *,
     limit: int | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> list[dict[str, Any]]:
     """Mine Jonathan's non-agent commits from one repo (upserts git_commit evidence)."""
     cfg = cfg or load_config()
@@ -200,6 +202,8 @@ def commit_examples(
             continue
         prompt = f"Write a commit message for these changes:\n{stat}"
         source_uri = f"git://{repo_path.name}#{sha}"
+        if write_batch is not None:
+            write_batch.ensure()
         evidence_id = upsert_evidence(
             conn,
             source_type="git_commit",
@@ -209,6 +213,8 @@ def commit_examples(
             claim=f"commit {sha[:12]}: {subject[:200]}",
             privacy_scope="workspace",
         )
+        if write_batch is not None:
+            write_batch.operation()
         out.append(
             {
                 "messages": [
@@ -232,7 +238,10 @@ def commit_examples(
 
 
 def doc_examples(
-    conn: sqlite3.Connection, cfg: OcbrainConfig | None = None
+    conn: sqlite3.Connection,
+    cfg: OcbrainConfig | None = None,
+    *,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> list[dict[str, Any]]:
     """Authored-doc persona targets — OFF unless ``persona_authored_globs`` set."""
     cfg = cfg or load_config()
@@ -247,6 +256,8 @@ def doc_examples(
             if not is_style_admissible(text):
                 continue
             source_uri = str(path)
+            if write_batch is not None:
+                write_batch.ensure()
             evidence_id = upsert_evidence(
                 conn,
                 source_type="authored_doc",
@@ -256,6 +267,8 @@ def doc_examples(
                 claim=f"authored doc {path.name}",
                 privacy_scope="workspace",
             )
+            if write_batch is not None:
+                write_batch.operation()
             out.append(
                 {
                     "messages": [
@@ -287,6 +300,7 @@ def mine_persona(
     limit: int | None = None,
     time_budget_seconds: float | None = None,
     parse_cache: ParseCache | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any]:
     cfg = cfg or load_config()
     from ocbrain.dataset.transcripts import record_source, resolve_transcript_evidence
@@ -296,11 +310,17 @@ def mine_persona(
     excluded = 0
     examined = 0
     files_mined = 0
+    batch = write_batch or DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
 
     def _store(candidate: dict[str, Any], *, evidence_ids: list[str], scope: str,
                source_kind: str, source_uri: str | None, session_id: str | None) -> None:
         nonlocal stored, excluded, examined
         examined += 1
+        batch.ensure()
         result = store_example(
             conn,
             dataset="persona",
@@ -323,6 +343,7 @@ def mine_persona(
             session_id=session_id,
             occurred_at=candidate.get("occurred_at"),
         )
+        batch.operation()
         if result is None:
             return
         if result["quality_label"] == "excluded":
@@ -332,7 +353,9 @@ def mine_persona(
 
     # Telegram (from provided sessions or discovered transcripts).
     def _emit_session(session: Session) -> None:
+        batch.ensure()
         evidence_id, scope = resolve_transcript_evidence(conn, session)
+        batch.operation()
         for candidate in telegram_examples(session, cfg, verified_only=verified_only):
             _store(
                 candidate,
@@ -346,6 +369,7 @@ def mine_persona(
     if sessions is not None:
         for session in sessions:
             _emit_session(session)
+            batch.flush()
     elif roots is not None:
         # STRICTLY INCREMENTAL: iter_unmined_transcripts skips files whose
         # fingerprint already matches the persona watermark, so an unchanged
@@ -382,7 +406,10 @@ def mine_persona(
                 before = examined
                 _emit_session(session)
                 emitted = examined - before
+            batch.ensure()
             record_source(conn, str(path), "persona", fingerprint, emitted)
+            batch.operation()
+            batch.flush()
             files_mined += 1
             if limit is not None and files_mined >= limit:
                 break
@@ -396,7 +423,9 @@ def mine_persona(
     else:
         repo_list = discover_git_repos("~/.openclaw/workspace")
     for repo in repo_list:
-        for candidate in commit_examples(conn, repo, cfg, limit=limit):
+        for candidate in commit_examples(
+            conn, repo, cfg, limit=limit, write_batch=batch
+        ):
             _store(
                 candidate,
                 evidence_ids=candidate["evidence_ids"],
@@ -405,9 +434,10 @@ def mine_persona(
                 source_uri=candidate["source_uri"],
                 session_id=None,
             )
+        batch.flush()
 
     # Authored docs (off by default).
-    for candidate in doc_examples(conn, cfg):
+    for candidate in doc_examples(conn, cfg, write_batch=batch):
         _store(
             candidate,
             evidence_ids=candidate["evidence_ids"],
@@ -416,6 +446,7 @@ def mine_persona(
             source_uri=candidate["source_uri"],
             session_id=None,
         )
+    batch.flush()
 
     return {
         "ok": True,
@@ -424,4 +455,5 @@ def mine_persona(
         "stored": stored,
         "excluded": excluded,
         "files_mined": files_mined,
+        "writer_lock": batch.metrics(),
     }

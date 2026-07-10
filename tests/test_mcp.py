@@ -1,6 +1,7 @@
 import json
 import sqlite3
 
+from ocbrain import __version__
 from ocbrain.db import (
     connect,
     init_db,
@@ -21,6 +22,7 @@ def test_mcp_initialize_includes_agent_conduct_guardrails(tmp_path):
     )
 
     instructions = response["result"]["instructions"]
+    assert response["result"]["serverInfo"]["version"] == __version__ == "0.3.0"
     assert "Surface assumptions or ambiguity before acting" in instructions
     assert "smallest change that satisfies the verified goal" in instructions
     assert "do not refactor unrelated code" in instructions

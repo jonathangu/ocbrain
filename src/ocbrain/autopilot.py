@@ -44,7 +44,12 @@ from ocbrain.autolabel import autolabel
 from ocbrain.config import OcbrainConfig, load_config
 from ocbrain.db import DB_BUSY_TIMEOUT_MS, now_iso
 from ocbrain.events import canonical_json, rebuild_projection
-from ocbrain.fsutil import file_fingerprint, file_lock, snapshot_sqlite
+from ocbrain.fsutil import (
+    checkpoint_sqlite_wal,
+    file_fingerprint,
+    file_lock,
+    snapshot_sqlite,
+)
 from ocbrain.ids import stable_id
 from ocbrain.maintenance import (
     archive_unreferenced_catalog,
@@ -628,9 +633,15 @@ def _run_locked(
         try:
             result = stage_fn(ctx)
             result["elapsed_seconds"] = round(time.monotonic() - began, 4)
-            stage_results[name] = result
             if not dry_run:
                 conn.commit()
+                if name == "dataset_mine" and cfg.autopilot.checkpoint_after_dataset_mine:
+                    result["wal_checkpoint"] = checkpoint_sqlite_wal(
+                        conn,
+                        db_path,
+                        minimum_bytes=cfg.autopilot.checkpoint_wal_min_bytes,
+                    )
+            stage_results[name] = result
         except Exception as exc:  # noqa: BLE001 - per-stage isolation (spec §4.2)
             if not dry_run:
                 # A failing stage may have left the connection unusable; a

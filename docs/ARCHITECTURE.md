@@ -350,7 +350,7 @@ remembered for that model/prompt version; SQLite lock failures are retryable.
 An autopilot overlap returns `blocked`, and the next owned invocation repairs a
 run row left `running` by an interrupted process.
 
-`dataset-pilot-prepare` creates the first private training pack only after it
+`dataset-pilot-prepare` creates a private training pack only after it
 has deterministically reserved at least twenty graded persona prompts. It writes
 prompts, private references, and the voice/taste rubric before any training
 file, then removes the held-out content hashes from every training stream. The
@@ -361,6 +361,11 @@ the separate blind key. The supplied local rating helper rejects non-loopback
 endpoints before opening the pair file, checkpoints each rating, and never reads
 that key. Verified adapter weights and losses are recorded separately by
 `dataset-pilot-record-training`; a trainer exit alone is not accepted as proof.
+For a later pilot, `--eval-from` reuses the prior prompts, references, and rubric
+byte-for-byte, verifies the original held-out hash, and excludes those same
+source examples from training. The local judge must pass an explicit calibration
+set before the rating helper opens any blind pair; the default gate is 80% across
+at least six cases.
 The pack also writes MLX-LM chat `train.jsonl` plus an optional deterministic
 validation split from eligible SFT and persona rows. DPO remains separate: the
 first local LoRA pilot is supervised chat tuning, while preference training
@@ -446,7 +451,7 @@ fire finds the lock held and exits cleanly instead of double-running.
 | 9 | **promote** | re-score, promote trustworthy rows into memory, demote what slipped, enforce the budget | deterministic re-rank |
 | 9b | **excerpt_render** (v0.3) | render the just-promoted injectable set into the `BEGIN/END OCBRAIN MANAGED BLOCK` of each configured runtime memory file — content outside the markers is untouched, and an unchanged block is not rewritten | idempotent block write; unchanged block skipped |
 | 10 | **maintain** | prune stale knowledge, heal conflicts (emitting supersession signals), and **archive never-referenced stale catalog docs** (v0.3) out of the working set | existing TTL logic + reversible status flip |
-| 11 | **dataset-mine** | mine SFT/DPO/persona from newly-settled history, time-budgeted | `dataset_sources` fingerprints + `UNIQUE` |
+| 11 | **dataset-mine** | mine SFT/DPO/persona from newly-settled history in bounded, measured writer batches; checkpoint a large WAL after commit | `dataset_sources` fingerprints + `UNIQUE` |
 | 12 | **dataset-export** | deterministically write the JSONL corpora + manifest, skipping if unchanged | `payload_hash` |
 | 13 | **finalize** | record the run in `autopilot_runs` (per-stage results or errors), release the lock | — |
 
@@ -466,8 +471,9 @@ later stage assumes a snapshotted, migrated DB.
 ### 9.2 Budgets, flock, snapshot-first
 
 - **Snapshot-first.** Before any write run, autopilot takes a daily rotated
-  SQLite snapshot via the online-backup path (checkpoint then copy), rotating to
-  keep a small number. If snapshot or migrate fails, nothing downstream runs.
+  SQLite snapshot through the online backup API, with no source-WAL checkpoint,
+  rotating to keep a small number. If snapshot or migrate fails, nothing
+  downstream runs.
 - **Per-stage time budgets.** Each stage carries a wall-clock budget; miners
   accept a `time_budget_seconds` and return early with their watermark advanced
   only past *fully-processed* items, so a cycle fits its timer. The `light`/`heavy`
@@ -481,6 +487,12 @@ later stage assumes a snapshotted, migrated DB.
 - **Watermarks in-transaction.** Each watermark is written in the same
   transaction as the work it covers, so a kill mid-run loses no committed
   progress and re-runs resume cleanly.
+- **Measured writer windows.** Dataset mining commits after 50 mutating units or
+  two seconds, whichever comes first, and records writer-lock wait, total hold,
+  and longest hold. Autolabel commits between source miners and before each FTS
+  attribution. Once dataset mining has committed, a WAL above 64 MiB is
+  checkpointed with `TRUNCATE`; a blocking reader is reported as `busy` and is
+  retried by a later run.
 
 ### 9.3 The stall watchdog (companion process, v0.3)
 

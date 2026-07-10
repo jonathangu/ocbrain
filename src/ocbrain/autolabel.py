@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import now_iso, search
 from ocbrain.events import canonical_json
 from ocbrain.ids import content_hash, stable_id
@@ -577,7 +578,12 @@ def mine_cron_state(
 # --------------------------------------------------------------------------- #
 # Attribution
 # --------------------------------------------------------------------------- #
-def attribute_signals(conn: sqlite3.Connection, *, limit: int = 2000) -> set[str]:
+def attribute_signals(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 2000,
+    write_batch: DatasetWriteBatch | None = None,
+) -> set[str]:
     """Attach ``knowledge_id IS NULL`` signals to knowledge via claim_key + FTS.
 
     Session-only signals (source='session') are intentionally left unattributed —
@@ -613,10 +619,17 @@ def attribute_signals(conn: sqlite3.Connection, *, limit: int = 2000) -> set[str
         matched_text = f"{hits[0]['title']} {hits[0]['snippet']}"
         if not _tokens_overlap(claim_key(text), claim_key(matched_text)):
             continue
+        if write_batch is not None:
+            write_batch.ensure()
         conn.execute(
             "UPDATE signal_events SET knowledge_id = ? WHERE id = ?",
             (doc_id, row["id"]),
         )
+        if write_batch is not None:
+            write_batch.operation()
+            # The next operation is another potentially expensive FTS query.
+            # Release SQLite's writer slot before doing that read.
+            write_batch.flush()
         attributed.add(doc_id)
     return attributed
 
@@ -678,6 +691,7 @@ def fold_labels(
     *,
     now: datetime | None = None,
     extra_knowledge_ids: set[str] | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any]:
     """Recompute ``quality_label`` for knowledge touched by new signals (§5.3).
 
@@ -722,6 +736,8 @@ def fold_labels(
             and krow["inject"] == 1
             and krow["origin"] != "human"
         )
+        if write_batch is not None:
+            write_batch.ensure()
         conn.execute(
             """
             UPDATE knowledge
@@ -733,10 +749,18 @@ def fold_labels(
             """,
             (label, confidence, now_iso(), 1 if drop_inject else 0, knowledge_id),
         )
+        if write_batch is not None:
+            write_batch.operation()
         changed += 1
 
     if max_rowid is not None and max_rowid > watermark:
+        if write_batch is not None:
+            write_batch.ensure()
         set_watermark(conn, DOMAIN, stream, str(max_rowid))
+        if write_batch is not None:
+            write_batch.operation()
+    if write_batch is not None:
+        write_batch.flush()
     return {"action": "fold_labels", "changed": changed}
 
 
@@ -761,21 +785,40 @@ def autolabel(
     stages["retrieval"] = mine_retrieval_signals(
         conn, time_budget_seconds=time_budget_seconds
     )
+    conn.commit()
     stages["events"] = mine_event_signals(conn, time_budget_seconds=time_budget_seconds)
+    conn.commit()
     stages["learning_db"] = mine_learning_db(
         conn,
         learning_db_path=cfg.dataset.learning_db,
         time_budget_seconds=time_budget_seconds,
     )
+    conn.commit()
     stages["commitments"] = mine_commitments(
         conn, commitments_path=cfg.dataset.commitments_path
     )
+    conn.commit()
     stages["cron"] = mine_cron_state(conn, cron_state_path=cfg.dataset.cron_state_path)
+    conn.commit()
 
-    attributed = attribute_signals(conn)
+    attribute_batch = DatasetWriteBatch(
+        conn,
+        max_operations=1,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
+    attributed = attribute_signals(conn, write_batch=attribute_batch)
     stages["attribute"] = {"action": "attribute", "changed": len(attributed)}
+    fold_batch = DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
     stages["fold"] = fold_labels(
-        conn, cfg, now=now, extra_knowledge_ids=attributed
+        conn,
+        cfg,
+        now=now,
+        extra_knowledge_ids=attributed,
+        write_batch=fold_batch,
     )
 
     if run_judge:
@@ -786,12 +829,34 @@ def autolabel(
             if judge_call is not None:
                 kwargs["call"] = judge_call
             stages["judge"] = judge_ambiguous(conn, cfg, **kwargs)
-            stages["fold2"] = fold_labels(conn, cfg, now=now)
+            fold2_batch = DatasetWriteBatch(
+                conn,
+                max_operations=cfg.dataset.write_batch_size,
+                max_seconds=cfg.dataset.write_batch_seconds,
+            )
+            stages["fold2"] = fold_labels(conn, cfg, now=now, write_batch=fold2_batch)
         except Exception as exc:  # noqa: BLE001 - judge must never break the stage
             stages["judge"] = {"action": "judge", "error": str(exc)}
 
     changed = sum(int(s.get("changed", 0)) for s in stages.values() if isinstance(s, dict))
-    return {"action": "autolabel", "changed": changed, "stages": stages}
+    batches = [attribute_batch, fold_batch]
+    if "fold2_batch" in locals():
+        batches.append(fold2_batch)
+    metrics = [batch.metrics() for batch in batches]
+    writer_lock = {
+        "operations": sum(item["operations"] for item in metrics),
+        "batches_committed": sum(item["batches_committed"] for item in metrics),
+        "lock_wait_seconds": round(sum(item["lock_wait_seconds"] for item in metrics), 6),
+        "max_lock_wait_seconds": max(item["max_lock_wait_seconds"] for item in metrics),
+        "writer_lock_seconds": round(sum(item["writer_lock_seconds"] for item in metrics), 6),
+        "max_writer_lock_seconds": max(item["max_writer_lock_seconds"] for item in metrics),
+    }
+    return {
+        "action": "autolabel",
+        "changed": changed,
+        "stages": stages,
+        "writer_lock": writer_lock,
+    }
 
 
 # --------------------------------------------------------------------------- #
