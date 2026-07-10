@@ -136,6 +136,37 @@ def _call_tool_with_lock_retry(conn, params: dict[str, Any]) -> dict[str, Any]:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def _log_retrieval_if_available(
+    conn: sqlite3.Connection,
+    knowledge_id: str | None,
+    *,
+    task_ref: str,
+    note: str | None = None,
+) -> tuple[str | None, str]:
+    """Log a read without making it unavailable behind a long DB writer.
+
+    WAL readers remain available while the autopilot owns SQLite's single
+    writer slot. A retrieval-audit INSERT must not turn that successful read
+    into an MCP failure.
+    """
+    try:
+        retrieval_use_id = log_retrieval_use(
+            conn,
+            knowledge_id,
+            runtime="mcp",
+            task_ref=task_ref,
+            outcome="served",
+            note=note,
+        )
+        conn.commit()
+        return retrieval_use_id, "recorded"
+    except sqlite3.OperationalError as exc:
+        if "database is locked" not in str(exc).lower():
+            raise
+        conn.rollback()
+        return None, "database_busy"
+
+
 def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
     arguments = params.get("arguments", {})
@@ -153,31 +184,28 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
                 cross_scope=bool(arguments.get("cross_scope")),
                 at_ts=optional_string(arguments, "at_ts"),
             )
-            log_retrieval_use(
+            retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
                 conn,
                 None,
-                runtime="mcp",
                 task_ref=f"brain.search:{query}",
-                outcome="served",
                 note=f"scoped=true;limit={limit}",
             )
-            conn.commit()
+            payload["retrieval_use_id"] = retrieval_use_id
+            payload["retrieval_use_status"] = retrieval_use_status
             return text_result(payload)
         rows = search(conn, query, limit, scopes=PUBLIC_SCOPES, filters=filters)
         result_rows = []
         for row in rows:
             row_dict = dict(row)
-            retrieval_use_id = log_retrieval_use(
+            retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
                 conn,
                 row["doc_id"] if row["kind"].startswith("knowledge:") else None,
-                runtime="mcp",
                 task_ref=f"brain.search:{query}",
-                outcome="served",
                 note=f"limit={limit};filters={json.dumps(filters, sort_keys=True)}",
             )
             row_dict["retrieval_use_id"] = retrieval_use_id
+            row_dict["retrieval_use_status"] = retrieval_use_status
             result_rows.append(row_dict)
-        conn.commit()
         return text_result(result_rows)
     if name == "brain.preview":
         query = require_string(arguments, "query")
@@ -190,15 +218,14 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
             cross_scope=bool(arguments.get("cross_scope")),
             at_ts=optional_string(arguments, "at_ts"),
         )
-        log_retrieval_use(
+        retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
             conn,
             None,
-            runtime="mcp",
             task_ref=f"brain.preview:{query}",
-            outcome="served",
             note=f"limit={limit}",
         )
-        conn.commit()
+        payload["retrieval_use_id"] = retrieval_use_id
+        payload["retrieval_use_status"] = retrieval_use_status
         return text_result(payload)
     if name == "brain.egress_preview":
         target = optional_string(arguments, "target") or "hosted_teacher"
@@ -230,14 +257,11 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
         limit = min(max(int(arguments.get("limit", 12)), 1), 50)
         context = context_from_arguments(arguments)
         since_ts = optional_string(arguments, "since")
-        log_retrieval_use(
+        retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
             conn,
             None,
-            runtime="mcp",
             task_ref="brain.digest",
-            outcome="served",
         )
-        conn.commit()
         payload = knowledge_digest(conn, project=project, limit=limit)
         if context.to_dict() or since_ts or arguments.get("event_core"):
             payload = {
@@ -249,21 +273,27 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
                     limit=limit,
                 ),
             }
+        payload["retrieval_use_id"] = retrieval_use_id
+        payload["retrieval_use_status"] = retrieval_use_status
         return text_result(payload)
     if name == "brain.get":
         requested_id = require_string(arguments, "id")
         belief = get_current_belief(conn, requested_id)
         if belief is not None:
-            log_retrieval_use(
+            retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
                 conn,
                 None,
-                runtime="mcp",
                 task_ref="brain.get",
-                outcome="served",
                 note=f"object=belief;status={belief['status']};scope={belief['scope']['scope_id']}",
             )
-            conn.commit()
-            return text_result(belief)
+            return text_result(
+                {
+                    **belief,
+                    "object_kind": "belief",
+                    "retrieval_use_id": retrieval_use_id,
+                    "retrieval_use_status": retrieval_use_status,
+                }
+            )
         row = get_knowledge(conn, requested_id)
         if row is None:
             raise ValueError(f"knowledge not found: {requested_id}")
@@ -271,18 +301,16 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
             raise PermissionError("private knowledge requires explicit include_private")
         if row["status"] != "current" and not arguments.get("include_candidate"):
             raise PermissionError("candidate knowledge requires explicit include_candidate")
-        retrieval_use_id = log_retrieval_use(
+        retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
             conn,
             row["id"],
-            runtime="mcp",
             task_ref="brain.get",
-            outcome="served",
             note=f"status={row['status']};scope={row['privacy_scope']}",
         )
-        conn.commit()
         row_dict = dict(row)
         row_dict["object_kind"] = "knowledge"
         row_dict["retrieval_use_id"] = retrieval_use_id
+        row_dict["retrieval_use_status"] = retrieval_use_status
         return text_result(row_dict)
     if name == "brain.feedback":
         if "retrieval_use_id" in arguments:
@@ -451,7 +479,11 @@ def tool_list() -> list[dict[str, Any]]:
     tools = [
         {
             "name": "brain.search",
-            "description": "Search source-backed ocbrain knowledge and evidence.",
+            "description": (
+                "Search source-backed ocbrain knowledge and evidence. Feedback handles are "
+                "best-effort during a database writer window; do not retry a successful search "
+                "solely when retrieval_use_status is database_busy."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -707,6 +739,40 @@ def tool_list() -> list[dict[str, Any]]:
             },
         ]
     )
+    read_only = {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    local_write = {
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    destructive_write = {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    read_only_names = {
+        "brain.search",
+        "brain.preview",
+        "brain.digest",
+        "brain.get",
+        "brain.proposals",
+    }
+    destructive_names = {"brain.forget", "brain.mark_stale"}
+    for tool in tools:
+        name = tool["name"]
+        if name in read_only_names:
+            tool["annotations"] = dict(read_only)
+        elif name in destructive_names:
+            tool["annotations"] = dict(destructive_write)
+        else:
+            tool["annotations"] = dict(local_write)
     return tools
 
 

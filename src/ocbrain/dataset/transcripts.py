@@ -15,14 +15,15 @@ DTOs that the whole dataset factory (and lane-3's ``review.py``) consumes:
 * **codex** rollouts ``rollout-*.jsonl`` — ``{"type":"response_item",
   "payload": {...}}`` lines whose payload is a ``message`` (roles
   ``user``/``assistant``/``developer``, content blocks ``input_text`` /
-  ``output_text``), a ``reasoning`` block (dropped), or a tool call/output.
+  ``output_text``), an inter-agent ``agent_message`` (injected context), a
+  ``reasoning`` block (dropped), or a tool call/output.
 
-Normalization rules (spec §7.1): consecutive same-role turns collapse;
+Normalization rules (spec §7.1): compatible consecutive same-role turns collapse;
 ``thinking``/``reasoning`` blocks NEVER enter text (other models' CoT is not
 Jonathan-agent signal); tool results become ``role='tool'`` turns truncated to
 ``cfg.tool_result_truncate`` chars with an ``ERROR_RESULT_RE`` error flag; user
-turns are classified (telegram-envelope / injected / media / bare) with
-config-driven author verification.
+turns with different authors or classifications stay separate and are classified
+(telegram-envelope / injected / media / bare) with config-driven author verification.
 """
 
 from __future__ import annotations
@@ -303,6 +304,23 @@ def _tool_result_text(content: object, truncate: int) -> str:
     return text[:truncate]
 
 
+def _explicit_tool_error(*values: object) -> bool:
+    """Read structured tool error flags without interpreting arbitrary text."""
+    for value in values:
+        if isinstance(value, list):
+            if _explicit_tool_error(*value):
+                return True
+            continue
+        if not isinstance(value, dict):
+            continue
+        if value.get("isError") is True or value.get("is_error") is True:
+            return True
+        status = value.get("status")
+        if isinstance(status, str) and status.lower() in {"error", "failed", "failure"}:
+            return True
+    return False
+
+
 def _distinct_authors(a: Turn, b: Turn) -> bool:
     """True when two turns carry different identified authors (multi-user group).
 
@@ -314,6 +332,11 @@ def _distinct_authors(a: Turn, b: Turn) -> bool:
     return bool(a.authored_by and b.authored_by and a.authored_by != b.authored_by)
 
 
+def _distinct_user_kinds(a: Turn, b: Turn) -> bool:
+    """Keep injected/media/human boundaries from inheriting each other's class."""
+    return a.role == "user" and b.role == "user" and a.kind != b.kind
+
+
 def _collapse(turns: list[Turn]) -> tuple[Turn, ...]:
     """Collapse consecutive same-role turns (spec §7.1).
 
@@ -323,7 +346,12 @@ def _collapse(turns: list[Turn]) -> tuple[Turn, ...]:
     """
     out: list[Turn] = []
     for turn in turns:
-        if out and out[-1].role == turn.role and not _distinct_authors(out[-1], turn):
+        if (
+            out
+            and out[-1].role == turn.role
+            and not _distinct_authors(out[-1], turn)
+            and not _distinct_user_kinds(out[-1], turn)
+        ):
             prev = out[-1]
             merged_text = "\n".join(t for t in (prev.text, turn.text) if t)
             out[-1] = replace(
@@ -431,7 +459,10 @@ def parse_openclaw_session(
                     text=result,
                     ts=ts,
                     tool_name=message.get("toolName") or message.get("name"),
-                    tool_error=bool(ERROR_RESULT_RE.search(result)),
+                    tool_error=(
+                        _explicit_tool_error(message, content)
+                        or bool(ERROR_RESULT_RE.search(result))
+                    ),
                 )
             )
     return Session(
@@ -487,7 +518,10 @@ def parse_claude_session(
                         role="tool",
                         text=result,
                         ts=ts,
-                        tool_error=bool(ERROR_RESULT_RE.search(result)),
+                        tool_error=(
+                            _explicit_tool_error(message, content)
+                            or bool(ERROR_RESULT_RE.search(result))
+                        ),
                     )
                 )
                 continue
@@ -591,6 +625,13 @@ def parse_codex_session(
                         sender_verified=cls.sender_verified,
                     )
                 )
+        elif ptype == "agent_message":
+            # Current Codex/ChatGPT rollouts persist cross-agent messages as
+            # response items. Preserve the plaintext context but never treat an
+            # agent's words as operator-authored/persona training signal.
+            text = _text_from_blocks(payload.get("content"), text_keys=("text",))
+            if text:
+                raw.append(Turn(role="user", text=text, kind="injected", ts=ts))
         elif ptype in _CODEX_TOOL_CALL_TYPES:
             raw.append(
                 Turn(
@@ -608,7 +649,10 @@ def parse_codex_session(
                     role="tool",
                     text=result,
                     ts=ts,
-                    tool_error=bool(ERROR_RESULT_RE.search(result)),
+                    tool_error=(
+                        _explicit_tool_error(payload, payload.get("output"))
+                        or bool(ERROR_RESULT_RE.search(result))
+                    ),
                 )
             )
     return Session(

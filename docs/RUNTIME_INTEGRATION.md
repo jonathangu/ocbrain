@@ -92,16 +92,39 @@ Installed locations:
   history remains under `/Users/guclaw/.codex/sessions` after app migration.
 - Codex ACP home: `/Users/guclaw/.openclaw/acpx/codex-home/config.toml`
 - Claude Code: user-scoped MCP entry
-- OpenClaw: provider-safe MCP tools in `openclaw.json`
+- OpenClaw: `mcp.servers.ocbrain` in `openclaw.json`; current OpenClaw provides
+  `mcp status`, `doctor`, `probe`, and `reload` for static and live verification.
+
+OpenClaw can also host isolated Codex homes below
+`~/.openclaw/agents/<agent>/agent/codex-home`. Their `rollout-*.jsonl` files are
+Codex transcripts, not native OpenClaw transcripts; ocbrain detects and
+attributes them to Codex before the outer `.openclaw` path. Current Codex
+`agent_message` items are injected inter-agent context and cannot become
+operator/persona voice. Native OpenClaw and Claude Code structured tool-error
+flags are preserved even when the result text itself does not contain an error
+word.
 
 OpenClaw provider-safe tool names:
 
 - `ocbrain__brain-search`
 - `ocbrain__brain-preview`
-- `ocbrain__brain-egress-preview`
+- `ocbrain__brain-egress_preview`
 - `ocbrain__brain-digest`
 - `ocbrain__brain-get`
 - `ocbrain__brain-feedback`
+- `ocbrain__brain-teacher_request`
+- `ocbrain__brain-ingest`
+- `ocbrain__brain-proposals`
+- `ocbrain__brain-forget`
+- `ocbrain__brain-mark_stale`
+
+The server publishes standard MCP safety annotations: search/preview/digest/get
+and proposal listing are read-only; feedback and evidence ingest are
+non-destructive local writes; forget and mark-stale are destructive writes.
+Contextual retrieval responses always expose `retrieval_use_id` when the audit
+row was recorded. During a long SQLite writer window, retrieval itself remains
+available and reports `retrieval_use_status=database_busy` with a null feedback
+handle instead of failing or encouraging retries.
 
 The production install also has separate launchd jobs for the light autopilot,
 heavy autopilot, and passive stallcheck. They are outside MCP: MCP never starts
@@ -113,6 +136,11 @@ or claims loop work.
 PYTHONPATH=. uv run --with pytest --with ruff --with-editable . pytest -q
 PYTHONPATH=. uv run --with pytest --with ruff --with-editable . ruff check .
 uv run --with-editable . python -m compileall src tests
+openclaw config validate
+openclaw mcp doctor ocbrain
+openclaw mcp probe ocbrain
+claude mcp list
+codex mcp list
 ```
 
 Scoped event-core smoke:

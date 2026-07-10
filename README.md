@@ -103,7 +103,14 @@ bounded redacted head/tail text window so large transcript trees stay usable.
 Repeated imports skip already-harvested source paths before reading excerpts.
 The ChatGPT desktop app's Codex mode continues to write conversation rollouts
 under `~/.codex/sessions`; `session_index.jsonl` and `history.jsonl` are treated
-as bookkeeping rather than conversations.
+as bookkeeping rather than conversations. OpenClaw's current Codex/ACP agents
+also keep isolated rollouts below
+`~/.openclaw/agents/<agent>/agent/codex-home/sessions`; those are detected and
+attributed to the producing Codex runtime even though the outer container is
+OpenClaw. Current Codex `agent_message` records are retained only as injected
+inter-agent context, never persona voice. Structured OpenClaw `isError` and
+Claude Code `is_error` tool-result flags are honored in addition to text-based
+error detection.
 
 ## Dataset grading and eval-first pilot
 

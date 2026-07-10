@@ -16,6 +16,7 @@ from ocbrain.dataset.transcripts import (
     strip_timestamp_prefix,
 )
 from ocbrain.db import connect, init_db
+from ocbrain.fsutil import history_runtime
 
 AUTHOR_IDS = ["1000000001", "persona_user"]
 
@@ -61,6 +62,22 @@ def test_parse_openclaw_session(tmp_path: Path):
     # tool call counted, tool result truncated to 500 chars
     assert session.turns[1].n_tool_calls == 1
     assert len(session.turns[2].text) == 500
+
+
+def test_structured_tool_error_flags_survive_without_error_text(tmp_path: Path):
+    openclaw = _openclaw_lines()
+    openclaw[-1]["message"]["content"] = "command stopped cleanly"
+    openclaw[-1]["message"]["isError"] = True
+    oc_path = _write_jsonl(tmp_path / "oc-error.jsonl", openclaw)
+    assert parse_openclaw_session(oc_path).turns[-1].tool_error is True
+
+    claude = [
+        {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "command stopped", "is_error": True}
+        ]}}
+    ]
+    claude_path = _write_jsonl(tmp_path / "claude-error.jsonl", claude)
+    assert parse_claude_session(claude_path).turns[-1].tool_error is True
 
 
 def test_openclaw_agent_from_path(tmp_path: Path):
@@ -117,6 +134,8 @@ def test_parse_codex_session(tmp_path: Path):
     assert session.session_id == "cx1"
     # developer -> injected user turn; reasoning dropped; function_call -> assistant tool call
     assert session.turns[0].role == "user" and session.turns[0].kind == "injected"
+    assert session.turns[1].role == "user" and session.turns[1].kind == "bare"
+    assert session.turns[1].text == "please compute the sum"
     assert all("SECRET_COT" not in t.text for t in session.turns)
     tool_turns = [t for t in session.turns if t.role == "tool"]
     assert tool_turns and tool_turns[0].tool_error is True
@@ -148,6 +167,12 @@ def test_parse_migrated_chatgpt_codex_rollout(tmp_path: Path):
         {"type": "event_msg", "timestamp": "2026-07-09T20:00:03Z",
          "payload": {"type": "user_message", "message": "duplicate bookkeeping"}},
         {"type": "response_item", "timestamp": "2026-07-09T20:00:03Z",
+         "payload": {"type": "agent_message", "author": "worker", "recipient": "root",
+                     "content": [
+                         {"type": "input_text", "text": "bounded inter-agent context"},
+                         {"type": "encrypted_content", "encrypted_content": "AGENT_SECRET"},
+                     ]}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:03Z",
          "payload": {"type": "message", "role": "user",
                      "content": [{"type": "input_text", "text": "inspect the repo"}]}},
         {"type": "response_item", "timestamp": "2026-07-09T20:00:04Z",
@@ -165,10 +190,28 @@ def test_parse_migrated_chatgpt_codex_rollout(tmp_path: Path):
     path = _write_jsonl(tmp_path / "rollout-migrated.jsonl", lines)
     session = parse_codex_session(path)
     assert session.session_id == "migrated-1"
-    assert [turn.role for turn in session.turns] == ["user", "assistant", "tool", "assistant"]
-    assert session.turns[1].n_tool_calls == 1
+    assert [turn.role for turn in session.turns] == [
+        "user", "user", "assistant", "tool", "assistant"
+    ]
+    assert session.turns[0].kind == "injected"
+    assert session.turns[0].text == "bounded inter-agent context"
+    assert session.turns[1].kind == "bare"
+    assert session.turns[2].n_tool_calls == 1
     assert all("NEVER_TRAIN" not in turn.text for turn in session.turns)
+    assert all("AGENT_SECRET" not in turn.text for turn in session.turns)
     assert all("duplicate bookkeeping" not in turn.text for turn in session.turns)
+
+
+def test_embedded_openclaw_harness_runtime_attribution(tmp_path: Path):
+    codex = tmp_path / ".openclaw" / "agents" / "work" / "agent" / "codex-home"
+    codex_path = codex / "sessions" / "rollout-current.jsonl"
+    assert history_runtime(codex_path) == "codex"
+
+    claude_path = (
+        tmp_path / ".openclaw" / "agents" / "work" / "agent" / "claude-home"
+        / "projects" / "current.jsonl"
+    )
+    assert history_runtime(claude_path) == "claude"
 
 
 def test_telegram_envelope_author_verification():

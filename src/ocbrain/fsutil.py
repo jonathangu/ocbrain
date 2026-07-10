@@ -38,10 +38,14 @@ def file_fingerprint(path: Path) -> str:
 
 def history_runtime(path: Path) -> str:
     """Infer the runtime that produced a transcript from its path components."""
-    parts = set(path.parts)
-    if ".codex" in parts:
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    # OpenClaw ACP agents keep isolated harness homes below ``.openclaw``.
+    # Prefer the producing harness over the outer container path so embedded
+    # Codex/Claude transcripts retain their real runtime attribution.
+    if ".codex" in parts or "codex-home" in parts or name.startswith("rollout-"):
         return "codex"
-    if ".claude" in parts:
+    if ".claude" in parts or "claude-home" in parts:
         return "claude"
     if ".openclaw" in parts:
         return "openclaw"

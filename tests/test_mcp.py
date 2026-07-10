@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 from ocbrain.db import (
     connect,
@@ -32,12 +33,22 @@ def test_mcp_tools_are_knowledge_first(tmp_path):
 
     response = handle_request(conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     names = {tool["name"] for tool in response["result"]["tools"]}
+    by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
 
     assert {"brain.search", "brain.get", "brain.digest", "brain.feedback"} <= names
     # brain.propose is deleted in v0.2 (spec §5.1-4).
     assert "brain.propose" not in names
     # v0.2 §5.1-7: write tools are ungated — always listed, no --allow-writes needed.
     assert "brain.mark_stale" in names
+    assert by_name["brain.search"]["annotations"] == {
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+        "readOnlyHint": True,
+    }
+    assert by_name["brain.feedback"]["annotations"]["destructiveHint"] is False
+    assert by_name["brain.feedback"]["annotations"]["readOnlyHint"] is False
+    assert by_name["brain.forget"]["annotations"]["destructiveHint"] is True
 
 
 def test_mcp_write_tools_are_opt_in(tmp_path):
@@ -94,6 +105,7 @@ def test_mcp_get_current_knowledge_by_default_and_candidate_with_flag(tmp_path):
     payload = json.loads(current["result"]["content"][0]["text"])
     assert payload["object_kind"] == "knowledge"
     assert payload["retrieval_use_id"].startswith("ret_")
+    assert payload["retrieval_use_status"] == "recorded"
 
     denied = handle_request(
         conn,
@@ -149,6 +161,8 @@ def test_mcp_digest_search_feedback_and_filters(tmp_path):
     )
     digest_payload = json.loads(digest["result"]["content"][0]["text"])
     assert digest_payload["memory"][0]["predicate"] == "typecheck_errors"
+    assert digest_payload["retrieval_use_id"].startswith("ret_")
+    assert digest_payload["retrieval_use_status"] == "recorded"
 
     search = handle_request(
         conn,
@@ -183,6 +197,92 @@ def test_mcp_digest_search_feedback_and_filters(tmp_path):
     assert "result" in feedback
     row = conn.execute("SELECT outcome FROM retrieval_uses WHERE id = ?", (retrieval_use_id,))
     assert row.fetchone()["outcome"] == "helpful"
+
+
+def test_mcp_contextual_search_returns_feedback_handle(tmp_path):
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+
+    search = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.search",
+                "arguments": {
+                    "query": "connector acceptance",
+                    "context": {
+                        "runtime": "codex",
+                        "project": "ocbrain",
+                        "repo": "ocbrain",
+                    },
+                    "limit": 1,
+                },
+            },
+        },
+    )
+    payload = json.loads(search["result"]["content"][0]["text"])
+    retrieval_use_id = payload["retrieval_use_id"]
+    assert retrieval_use_id.startswith("ret_")
+    assert payload["retrieval_use_status"] == "recorded"
+
+    feedback = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {
+                    "retrieval_use_id": retrieval_use_id,
+                    "outcome": "irrelevant",
+                },
+            },
+        },
+    )
+    feedback_payload = json.loads(feedback["result"]["content"][0]["text"])
+    assert feedback_payload == {
+        "outcome": "irrelevant",
+        "retrieval_use_id": retrieval_use_id,
+    }
+
+
+def test_mcp_contextual_search_survives_busy_retrieval_log(tmp_path):
+    path = tmp_path / "ocbrain.sqlite"
+    reader = connect(path)
+    init_db(reader)
+    reader.execute("PRAGMA busy_timeout=1")
+    locker = sqlite3.connect(path)
+    locker.execute("PRAGMA busy_timeout=1")
+    locker.execute("BEGIN IMMEDIATE")
+    try:
+        search = handle_request(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "brain.search",
+                    "arguments": {
+                        "query": "available while writer is active",
+                        "context": {"runtime": "codex", "project": "ocbrain"},
+                        "limit": 1,
+                    },
+                },
+            },
+        )
+    finally:
+        locker.rollback()
+        locker.close()
+
+    payload = json.loads(search["result"]["content"][0]["text"])
+    assert payload["query"] == "available while writer is active"
+    assert payload["retrieval_use_id"] is None
+    assert payload["retrieval_use_status"] == "database_busy"
 
 
 def test_mcp_wiki_resource_renders_evidence(tmp_path):
