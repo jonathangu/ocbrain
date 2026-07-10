@@ -421,12 +421,24 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_mine_parser.add_argument("--verified-only", action="store_true")
     dataset_mine_parser.set_defaults(func=cmd_dataset_mine)
 
+    dataset_grade_parser = subparsers.add_parser(
+        "dataset-grade", help="Grade examples with a loopback-only local LLM"
+    )
+    dataset_grade_parser.add_argument("--dataset", choices=["sft", "dpo", "persona"])
+    dataset_grade_parser.add_argument("--limit", type=int)
+    dataset_grade_parser.add_argument("--endpoint")
+    dataset_grade_parser.add_argument("--model")
+    dataset_grade_parser.add_argument("--force", action="store_true")
+    dataset_grade_parser.set_defaults(func=cmd_dataset_grade)
+
     dataset_export_parser = subparsers.add_parser(
         "dataset-export", help="Export deterministic JSONL datasets + manifest"
     )
     dataset_export_parser.add_argument("--dataset", choices=["sft", "dpo", "persona"])
     dataset_export_parser.add_argument("--min-scope", dest="min_scope")
     dataset_export_parser.add_argument("--min-label", dest="min_label")
+    dataset_export_parser.add_argument("--min-grade", type=float, dest="min_grade")
+    dataset_export_parser.add_argument("--output-dir", type=Path, dest="output_dir")
     dataset_export_parser.add_argument("--verified-only", action="store_true")
     dataset_export_parser.set_defaults(func=cmd_dataset_export)
 
@@ -434,6 +446,43 @@ def build_parser() -> argparse.ArgumentParser:
         "dataset-stats", help="Report dataset growth by label/scope/source/week"
     )
     dataset_stats_parser.set_defaults(func=cmd_dataset_stats)
+
+    pilot_prepare_parser = subparsers.add_parser(
+        "dataset-pilot-prepare", help="Build the eval-first local fine-tune pilot pack"
+    )
+    pilot_prepare_parser.add_argument("--output-dir", type=Path)
+    pilot_prepare_parser.add_argument("--min-grade", type=float)
+    pilot_prepare_parser.add_argument("--eval-prompts", type=int, default=20)
+    pilot_prepare_parser.add_argument("--seed", default="ocbrain-voice-pilot-v1")
+    pilot_prepare_parser.add_argument("--base-model")
+    pilot_prepare_parser.add_argument("--base-model-source")
+    pilot_prepare_parser.add_argument("--base-model-revision")
+    pilot_prepare_parser.set_defaults(func=cmd_dataset_pilot_prepare)
+
+    pilot_blind_parser = subparsers.add_parser(
+        "dataset-pilot-blind", help="Randomize reference/model answers for blind scoring"
+    )
+    pilot_blind_parser.add_argument("--pilot-dir", type=Path, required=True)
+    pilot_blind_parser.add_argument("--candidate-responses", type=Path, required=True)
+    pilot_blind_parser.add_argument("--seed", default="ocbrain-blind-v1")
+    pilot_blind_parser.set_defaults(func=cmd_dataset_pilot_blind)
+
+    pilot_score_parser = subparsers.add_parser(
+        "dataset-pilot-score", help="Score completed blind voice/taste ratings"
+    )
+    pilot_score_parser.add_argument("--pilot-dir", type=Path, required=True)
+    pilot_score_parser.add_argument("--ratings", type=Path, required=True)
+    pilot_score_parser.set_defaults(func=cmd_dataset_pilot_score)
+
+    pilot_record_parser = subparsers.add_parser(
+        "dataset-pilot-record-training", help="Record verified local adapter evidence"
+    )
+    pilot_record_parser.add_argument("--pilot-dir", type=Path, required=True)
+    pilot_record_parser.add_argument("--iterations", type=int, required=True)
+    pilot_record_parser.add_argument("--train-loss", type=float, required=True)
+    pilot_record_parser.add_argument("--validation-loss", type=float, required=True)
+    pilot_record_parser.add_argument("--exit-code", type=int, required=True)
+    pilot_record_parser.set_defaults(func=cmd_dataset_pilot_record_training)
 
     # --- public-safety enforcement (tracked-tree scanner + hooks) ----------
     public_safety_parser = subparsers.add_parser(
@@ -1572,16 +1621,103 @@ def cmd_dataset_export(args: argparse.Namespace) -> int:
         datasets=[dataset] if dataset else None,
         min_scope=getattr(args, "min_scope", None),
         min_label=getattr(args, "min_label", None),
+        min_grade=getattr(args, "min_grade", None),
         verified_only=getattr(args, "verified_only", False),
+        export_dir=getattr(args, "output_dir", None),
     )
     conn.commit()
     output(args, result)
     return 0
 
 
+def cmd_dataset_grade(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.grade import grade_examples
+
+    conn = open_db(args)
+    cfg = load_config()
+    dataset = getattr(args, "dataset", None)
+    result = grade_examples(
+        conn,
+        cfg=cfg,
+        datasets=[dataset] if dataset else None,
+        limit=getattr(args, "limit", None),
+        endpoint=getattr(args, "endpoint", None),
+        model=getattr(args, "model", None),
+        force=getattr(args, "force", False),
+    )
+    conn.commit()
+    output(args, result)
+    return 1 if result.get("status") in {"error", "blocked", "locked"} else 0
+
+
 def cmd_dataset_stats(args: argparse.Namespace) -> int:
     conn = open_db(args)
     output(args, dataset_stats(conn))
+    return 0
+
+
+def cmd_dataset_pilot_prepare(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import prepare_pilot
+
+    conn = open_db(args)
+    try:
+        result = prepare_pilot(
+            conn,
+            cfg=load_config(),
+            output_dir=getattr(args, "output_dir", None),
+            min_grade=getattr(args, "min_grade", None),
+            eval_prompts=getattr(args, "eval_prompts", 20),
+            seed=getattr(args, "seed", "ocbrain-voice-pilot-v1"),
+            base_model=getattr(args, "base_model", None),
+            base_model_source=getattr(args, "base_model_source", None),
+            base_model_revision=getattr(args, "base_model_revision", None),
+        )
+    except RuntimeError as exc:
+        output(
+            args,
+            {
+                "action": "dataset-pilot-prepare",
+                "changed": 0,
+                "status": "blocked",
+                "error": str(exc),
+            },
+        )
+        return 1
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pilot_blind(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import prepare_blind_pairs
+
+    result = prepare_blind_pairs(
+        args.pilot_dir,
+        args.candidate_responses,
+        seed=args.seed,
+    )
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pilot_score(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import score_blind_ratings
+
+    result = score_blind_ratings(args.pilot_dir, args.ratings)
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pilot_record_training(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import record_training_result
+
+    result = record_training_result(
+        args.pilot_dir,
+        iterations=args.iterations,
+        train_loss=args.train_loss,
+        validation_loss=args.validation_loss,
+        exit_code=args.exit_code,
+    )
+    output(args, result)
     return 0
 
 

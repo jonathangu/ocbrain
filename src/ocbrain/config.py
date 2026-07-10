@@ -184,6 +184,10 @@ class DatasetConfig:
     export_dir: str = "data/datasets"
     export_min_scope: str = "workspace"
     export_min_label: str = "good"
+    # Optional local-LLM grade threshold. ``None`` preserves the v0.3 export
+    # behavior; when set, ungraded rows and rows below the threshold stay local
+    # but are withheld from the training export.
+    export_min_grade: float | None = None
     learning_db: str = "~/.openclaw/learning.db"
     commitments_path: str = "~/.openclaw/commitments/commitments.json"
     cron_state_path: str = "~/.openclaw/cron/jobs-state.json"
@@ -197,6 +201,23 @@ class DatasetConfig:
     # real founder corrections in the overnight run; when true, mining admits a
     # pair on softer structural evidence. Defaults on for v0.3.
     dpo_relaxed_gate: bool = True
+
+
+@dataclass(frozen=True)
+class DatasetGradingConfig:
+    """Privacy-preserving local LLM grading.
+
+    Dataset text is more sensitive than ordinary knowledge metadata and the
+    corpus is contractually local-only. The grader therefore accepts loopback
+    HTTP endpoints only; remote/hosted URLs are rejected in code.
+    """
+
+    endpoint: str = "http://127.0.0.1:11434/api/chat"
+    model: str = ""
+    timeout_seconds: int = 180
+    per_run_item_cap: int = 100
+    daily_item_cap: int = 500
+    prompt_version: str = "dataset-rubric-v1"
 
 
 @dataclass(frozen=True)
@@ -250,6 +271,7 @@ class OcbrainConfig:
     promote: PromoteConfig = field(default_factory=PromoteConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    dataset_grading: DatasetGradingConfig = field(default_factory=DatasetGradingConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     embed: EmbedConfig = field(default_factory=EmbedConfig)
     excerpt_render: ExcerptRenderConfig = field(default_factory=ExcerptRenderConfig)

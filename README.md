@@ -5,9 +5,9 @@ It is one local/on-prem source-backed ledger with scope as a first-class
 dimension, not federated silos and not one undifferentiated memory pool.
 
 `ocbrain` follows the final OpenClawBrain spec: immutable evidence goes in,
-compiled current knowledge comes out. It is a librarian/compiler, not an
-autopilot. It never runs loops, enqueues work, applies policy, installs skills,
-or pushes irreversible change.
+compiled current knowledge comes out. The brain itself never enqueues agent
+work or pushes irreversible change. Separate local autopilot and stallcheck
+processes compile, maintain, export, and observe the store on bounded schedules.
 
 For a full architecture walkthrough — the two-plane store, the five-movement
 pipeline, the 14-stage autopilot, the signal taxonomy, the safeguards, the
@@ -29,8 +29,9 @@ Knowledge types:
 - `capability`: executable or loadable skills/procedures.
 
 The bright line is readable versus executable or prescriptive. Capabilities,
-high-risk knowledge, and prescriptive constraints are human-gated and
-proposal-first.
+high-risk knowledge, and prescriptive constraints pass automatic tripwires,
+quarantine, provenance, and verifier checks before they can become injectable;
+there is no human approval queue in the autonomous knowledge path.
 
 The scope line is just as important. Default ingest uses the narrowest known
 runtime/repo/task context. Global doctrine can surface everywhere, but promotion
@@ -52,8 +53,9 @@ Current surfaces:
   `event-proposals`, `event-decide`, `event-digest`, `event-teacher-request`,
   `event-backfill`, `digest`, `loop-ingest`, `mark-stale`, `prune`, `heal`,
   `liveness-check`, `mcp`, `autopilot`, `quarantine`, `label`, `dataset-mine`,
-  `dataset-export`, `dataset-stats`, `public-safety-check`, and
-  `install-hooks`.
+  `dataset-grade`, `dataset-export`, `dataset-stats`, `dataset-pilot-prepare`,
+  `dataset-pilot-record-training`, `dataset-pilot-blind`,
+  `dataset-pilot-score`, `public-safety-check`, and `install-hooks`.
 - MCP: `brain.search`, `brain.preview`, `brain.egress_preview`, `brain.get`,
   `brain.teacher_request`, `brain.digest`, `brain.feedback`, write-gated
   `brain.ingest`, write-gated `brain.proposals`, write-gated `brain.forget`,
@@ -99,6 +101,76 @@ uv run --with-editable . ocbrain import-history \
 `doc` knowledge. It records a source path, file-size/mtime fingerprint, and a
 bounded redacted head/tail text window so large transcript trees stay usable.
 Repeated imports skip already-harvested source paths before reading excerpts.
+The ChatGPT desktop app's Codex mode continues to write conversation rollouts
+under `~/.codex/sessions`; `session_index.jsonl` and `history.jsonl` are treated
+as bookkeeping rather than conversations.
+
+## Dataset grading and eval-first pilot
+
+Dataset grading is deliberately local-only. The command rejects every
+non-loopback endpoint before reading an example, applies stream-specific
+rubrics, stores the normalized grade in `metadata.llm_grade`, and records a
+bounded `dataset_grade_runs` ledger row. The default transport is Ollama's local
+chat endpoint; provide the installed local model explicitly. A DB-adjacent file
+lock prevents two graders from running together. Grades and run progress commit
+per item, deterministic model/response failures stay skipped until `--force`,
+and SQLite infrastructure failures remain retryable. If the scheduled autopilot
+owns the long write lock, grading returns `blocked` instead of claiming success.
+
+```bash
+uv run --with-editable . ocbrain dataset-grade \
+  --model your-local-grader-model \
+  --limit 100
+uv run --with-editable . ocbrain dataset-export --min-grade 0.8
+```
+
+The first pilot is eval-before-train by construction. Preparation refuses to
+write training files unless it can first reserve at least twenty graded persona
+prompts, writes the prompts/references/rubric, and excludes every held-out
+content hash from all training streams:
+
+```bash
+uv run --with-editable . ocbrain dataset-pilot-prepare \
+  --min-grade 0.8 \
+  --base-model /absolute/path/to/local-4bit-model \
+  --base-model-source upstream/model-repo \
+  --base-model-revision pinned-commit
+uv run --with-editable . ocbrain dataset-pilot-record-training \
+  --pilot-dir data/datasets/pilot-v1 \
+  --iterations 25 \
+  --train-loss 2.218 \
+  --validation-loss 4.592 \
+  --exit-code 0
+uv run --with-editable . ocbrain dataset-pilot-blind \
+  --pilot-dir data/datasets/pilot-v1 \
+  --candidate-responses data/datasets/pilot-v1/eval/candidate-responses.jsonl
+uv run --with-editable . ocbrain dataset-pilot-score \
+  --pilot-dir data/datasets/pilot-v1 \
+  --ratings data/datasets/pilot-v1/eval/blind-ratings.jsonl
+```
+
+After verified local training is recorded, generate the candidate side with the
+same pinned MLX-LM environment used for training:
+
+```bash
+uvx --from 'mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@PIN' \
+  python scripts/generate-pilot-candidates.py \
+  --pilot-dir data/datasets/pilot-v1
+PYTHONPATH=src uv run python scripts/grade-pilot-blind.py \
+  --pilot-dir data/datasets/pilot-v1 \
+  --model your-local-grader-model
+```
+
+The rating helper refuses non-loopback endpoints before it opens the blind
+pair file, checkpoints each completed rating atomically, and never reads the
+separate A/B key. `dataset-pilot-score` is the only step that unblinds results.
+
+All generated corpus, reference, candidate, key, and rating files stay under
+the gitignored local dataset tree. The pilot also writes deterministic MLX-LM
+`train.jsonl`/optional `valid.jsonl` chat files from SFT + persona rows. DPO
+stays as a separate preference artifact because MLX-LM LoRA is the SFT trainer
+for this first pilot. The manifest records the exact pinned trainer argv; it
+does not claim training started until that command actually runs.
 
 To use the scoped event-sourced core directly:
 
@@ -237,8 +309,8 @@ transport availability.
 
 `brain.search` and legacy `brain.get` rows return `retrieval_use_id` values. Call
 `brain.feedback` with `helpful`, `used`, `irrelevant`, `ignored`, or `harmful`
-to record usefulness. With `--allow-writes`, `brain.feedback` can also approve
-or reject human-gated candidate knowledge:
+to record usefulness. With `--allow-writes`, `brain.feedback` can also record a
+decision on a legacy candidate row:
 
 ```json
 { "id": "know_...", "decision": "approve", "actor": "jon" }
@@ -357,6 +429,6 @@ uv run --with-editable . python -m compileall src tests
 - Memory is a view, not a store.
 - Supersede/archive; do not overwrite in place.
 - A derived object's privacy scope is the most restrictive linked source scope.
-- Human gate before executable or prescriptive knowledge.
+- Automatic safeguards before executable or prescriptive knowledge can serve.
 - Emit evidence; do not write durable knowledge directly from runtimes.
 - Watch loops closely enough to tell done from wedged, without running them.

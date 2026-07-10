@@ -335,6 +335,38 @@ sha256, label/scope breakdowns, excluded count) plus an egress-audit row.
 Sources are tracked incrementally in `dataset_sources` (path+size+mtime
 fingerprints), so re-runs only re-parse changed files.
 
+### 7.3 Local LLM grading and the eval-before-train pilot
+
+`dataset-grade` grades SFT, DPO, and persona examples against different rubrics.
+The transport boundary accepts loopback HTTP only, so corpus text cannot be sent
+to a hosted endpoint through this lane. Runs are capped by per-run and daily
+item budgets, recorded in `dataset_grade_runs`, and normalized grades live both
+in additive columns and `example_json.metadata.llm_grade`. Export can require a
+minimum grade; when it does, ungraded examples fail closed.
+One DB-adjacent file lock admits a single grader. Each successful example and
+its progress counter commit before the next local inference call, so inference
+does not hold a SQLite write transaction. Deterministic response failures are
+remembered for that model/prompt version; SQLite lock failures are retryable.
+An autopilot overlap returns `blocked`, and the next owned invocation repairs a
+run row left `running` by an interrupted process.
+
+`dataset-pilot-prepare` creates the first private training pack only after it
+has deterministically reserved at least twenty graded persona prompts. It writes
+prompts, private references, and the voice/taste rubric before any training
+file, then removes the held-out content hashes from every training stream. The
+manifest records `eval_built_before_train=true` and `training_started=false`.
+Candidate responses are randomized against the real references by
+`dataset-pilot-blind`; `dataset-pilot-score` resolves completed ratings through
+the separate blind key. The supplied local rating helper rejects non-loopback
+endpoints before opening the pair file, checkpoints each rating, and never reads
+that key. Verified adapter weights and losses are recorded separately by
+`dataset-pilot-record-training`; a trainer exit alone is not accepted as proof.
+The pack also writes MLX-LM chat `train.jsonl` plus an optional deterministic
+validation split from eligible SFT and persona rows. DPO remains separate: the
+first local LoRA pilot is supervised chat tuning, while preference training
+needs a DPO-capable trainer. The manifest contains an argv array pinned to a
+verified MLX-LM Git commit and keeps `training_started=false` until execution.
+
 ---
 
 ## 8. Privacy model
@@ -402,7 +434,7 @@ fire finds the lock held and exits cleanly instead of double-running.
 | # | Stage | What it does | Idempotency |
 |---|---|---|---|
 | 0 | **lock** | `fcntl.flock` single-instance; a slow run never collides with the next tick — the second invocation just exits | single-instance |
-| 1 | **snapshot** | daily rotated copy of the DB (checkpoint + copy) before anything is touched | date-named file |
+| 1 | **snapshot** | daily rotated copy through SQLite's online backup API before anything is touched | date-named file |
 | 2 | **migrate** | additive-only schema migration (`IF NOT EXISTS` / `_ensure_column`) — never a destructive rebuild; self-heals drift | conditional DDL |
 | 3 | **harvest** | fingerprint-gated import of new history into evidence rows | source fingerprints |
 | 4 | **injection-scan** | scan new third-party evidence before it can reach anything injectable | rowid watermark |
@@ -495,5 +527,3 @@ watchdog itself stops running.
 - [`README.md`](../README.md) — quick start, CLI, MCP surface, public-safety.
 - Public explainers: [how-it-works](https://openclawbrain.ai/how-it-works/) ·
   [proof](https://openclawbrain.ai/proof/).
-</content>
-</invoke>

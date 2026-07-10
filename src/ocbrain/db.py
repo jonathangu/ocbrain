@@ -285,6 +285,11 @@ CREATE TABLE IF NOT EXISTS dataset_examples (
   example_json TEXT NOT NULL,
   session_id TEXT,
   occurred_at TEXT,
+  grade_score REAL,
+  grade_json TEXT,
+  grade_model TEXT,
+  grade_prompt_version TEXT,
+  graded_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(dataset, content_hash)
@@ -303,6 +308,20 @@ CREATE TABLE IF NOT EXISTS dataset_sources (
   detail TEXT,
   PRIMARY KEY (source_uri, dataset)
 );
+
+CREATE TABLE IF NOT EXISTS dataset_grade_runs (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  item_count INTEGER NOT NULL DEFAULT 0,
+  error_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  request_hash TEXT,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_dataset_grade_runs_ts ON dataset_grade_runs(ts);
 
 -- v0.3 additive tables. CREATE ... IF NOT EXISTS keeps init_db idempotent.
 -- embed_runs: one row per embedding batch, for daily-cap accounting + auditing.
@@ -331,6 +350,7 @@ CREATE TABLE IF NOT EXISTS dataset_exports (
   path TEXT NOT NULL,
   min_scope TEXT NOT NULL,
   min_label TEXT NOT NULL,
+  min_grade REAL,
   format TEXT NOT NULL,
   example_count INTEGER NOT NULL,
   excluded_count INTEGER NOT NULL,
@@ -382,6 +402,17 @@ _V3_KNOWLEDGE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("embedded_at", "TEXT"),
 )
 
+# Dataset-grading additions. Kept additive so the live corpus migrates without
+# rebuilding or rewriting the large ``dataset_examples`` table.
+_V4_DATASET_EXAMPLE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("grade_score", "REAL"),
+    ("grade_json", "TEXT"),
+    ("grade_model", "TEXT"),
+    ("grade_prompt_version", "TEXT"),
+    ("graded_at", "TEXT"),
+)
+_V4_DATASET_EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (("min_grade", "REAL"),)
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
     """Add ``column`` to ``table`` if absent. Additive-only; never rebuilds."""
@@ -390,20 +421,34 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
-def _rebuild_memory_view(conn: sqlite3.Connection) -> None:
-    """Rebuild the injectable ``memory`` view to exclude quarantined rows (§1.3).
+_MEMORY_VIEW_SQL = """
+CREATE VIEW memory AS
+  SELECT * FROM knowledge
+  WHERE status = 'current' AND inject = 1 AND quarantine_reason IS NULL
+"""
 
-    Views hold no data, so DROP + CREATE is additive-safe. Runs after the v0.2
-    columns exist so the ``quarantine_reason`` predicate always resolves.
+
+def _normalized_sql(sql: str) -> str:
+    return re.sub(r"\s+", "", sql).lower().rstrip(";")
+
+
+def _rebuild_memory_view(conn: sqlite3.Connection) -> bool:
+    """Ensure the injectable ``memory`` view excludes quarantined rows (§1.3).
+
+    Views hold no data, so DROP + CREATE is additive-safe when migration is
+    actually needed. A current definition is left untouched: unconditional DDL
+    made every read-oriented CLI startup contend as a schema writer.
     """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'memory'"
+    ).fetchone()
+    if row is not None and _normalized_sql(row["sql"] or "") == _normalized_sql(
+        _MEMORY_VIEW_SQL
+    ):
+        return False
     conn.execute("DROP VIEW IF EXISTS memory")
-    conn.execute(
-        """
-        CREATE VIEW memory AS
-          SELECT * FROM knowledge
-          WHERE status = 'current' AND inject = 1 AND quarantine_reason IS NULL
-        """
-    )
+    conn.execute(_MEMORY_VIEW_SQL)
+    return True
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -421,6 +466,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "knowledge", column, decl)
     for column, decl in _V2_EVIDENCE_COLUMNS:
         _ensure_column(conn, "evidence", column, decl)
+    for column, decl in _V4_DATASET_EXAMPLE_COLUMNS:
+        _ensure_column(conn, "dataset_examples", column, decl)
+    for column, decl in _V4_DATASET_EXPORT_COLUMNS:
+        _ensure_column(conn, "dataset_exports", column, decl)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dsx_grade "
+        "ON dataset_examples(dataset, grade_score)"
+    )
     _rebuild_memory_view(conn)
 
 

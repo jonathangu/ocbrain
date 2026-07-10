@@ -12,7 +12,8 @@ Every export writes a ``dataset_exports`` ledger row and an ``egress_audits``
 row (target ``local_model`` — there is no hosted export path; the dataset never
 leaves the machine, spec R6/§7.6). Filters: ``min_label`` (default ``good``),
 ``min_scope`` (default ``workspace``; ``private`` rows NEVER export regardless
-of the flag), and ``--verified-only`` for persona.
+of the flag), optional ``min_grade`` (ungraded rows fail when enabled), and
+``--verified-only`` for persona.
 """
 
 from __future__ import annotations
@@ -63,18 +64,25 @@ def _passes_label(label: str, min_label: str) -> bool:
     return _LABEL_RANK[label] >= _LABEL_RANK.get(min_label, 2)
 
 
+def _passes_grade(score: float | None, min_grade: float | None) -> bool:
+    if min_grade is None:
+        return True
+    return score is not None and float(score) >= min_grade
+
+
 def _selected_rows(
     conn: sqlite3.Connection,
     dataset: str,
     *,
     min_scope: str,
     min_label: str,
+    min_grade: float | None = None,
     verified_only: bool,
 ) -> list[str]:
     """Return the ordered list of ``example_json`` blobs that pass the filters."""
     rows = conn.execute(
         """
-        SELECT example_json, quality_label, privacy_scope
+        SELECT example_json, quality_label, privacy_scope, grade_score
         FROM dataset_examples
         WHERE dataset = ?
         ORDER BY COALESCE(occurred_at, ''), id
@@ -86,6 +94,8 @@ def _selected_rows(
         if not _passes_label(row["quality_label"], min_label):
             continue
         if not _passes_scope(row["privacy_scope"], min_scope):
+            continue
+        if not _passes_grade(row["grade_score"], min_grade):
             continue
         if verified_only and dataset == "persona":
             try:
@@ -106,8 +116,9 @@ def _corpus_stats(conn: sqlite3.Connection, dataset: str) -> dict[str, Any]:
     # quarantine is the enforcement layer — but the manifest reports how many
     # carry the injection_flagged advisory reason, per stream.
     injection_flags = 0
+    graded_count = 0
     for row in conn.execute(
-        "SELECT quality_label, privacy_scope, quality_reasons "
+        "SELECT quality_label, privacy_scope, quality_reasons, grade_score "
         "FROM dataset_examples WHERE dataset = ?",
         (dataset,),
     ):
@@ -116,11 +127,15 @@ def _corpus_stats(conn: sqlite3.Connection, dataset: str) -> dict[str, Any]:
         reasons = row["quality_reasons"]
         if reasons and "injection_flagged" in reasons:
             injection_flags += 1
+        if row["grade_score"] is not None:
+            graded_count += 1
     return {
         "label_counts": dict(sorted(label_counts.items())),
         "scope_counts": dict(sorted(scope_counts.items())),
         "excluded_count": label_counts.get("excluded", 0),
         "injection_flags": injection_flags,
+        "graded_count": graded_count,
+        "ungraded_count": sum(label_counts.values()) - graded_count,
     }
 
 
@@ -141,6 +156,7 @@ def export_dataset(
     export_dir: Path,
     min_scope: str,
     min_label: str,
+    min_grade: float | None = None,
     verified_only: bool,
     ts: str,
 ) -> dict[str, Any]:
@@ -152,6 +168,7 @@ def export_dataset(
         dataset,
         min_scope=min_scope,
         min_label=min_label,
+        min_grade=min_grade,
         verified_only=verified_only,
     )
     # Trailing newline keeps the file POSIX-clean and the byte layout stable.
@@ -172,6 +189,7 @@ def export_dataset(
         "bytes": len(payload_bytes),
         "sha256": payload_hash,
         "skipped": unchanged,
+        "min_grade": min_grade,
         **stats,
     }
     if unchanged:
@@ -194,10 +212,10 @@ def export_dataset(
     conn.execute(
         """
         INSERT OR IGNORE INTO dataset_exports (
-          id, ts, dataset, path, min_scope, min_label, format,
+          id, ts, dataset, path, min_scope, min_label, min_grade, format,
           example_count, excluded_count, bytes, payload_hash, manifest_json,
           egress_audit_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             export_id,
@@ -206,6 +224,7 @@ def export_dataset(
             str(path),
             min_scope,
             min_label,
+            min_grade,
             fmt,
             len(lines),
             stats["excluded_count"],
@@ -227,6 +246,7 @@ def export_all(
     datasets: list[str] | None = None,
     min_scope: str | None = None,
     min_label: str | None = None,
+    min_grade: float | None = None,
     verified_only: bool = False,
     export_dir: str | Path | None = None,
     now: datetime | None = None,
@@ -236,6 +256,10 @@ def export_all(
     wanted = datasets if datasets is not None else list(DATASETS)
     min_scope = min_scope or cfg.dataset.export_min_scope
     min_label = min_label or cfg.dataset.export_min_label
+    if min_grade is None:
+        min_grade = cfg.dataset.export_min_grade
+    if min_grade is not None and not 0.0 <= min_grade <= 1.0:
+        raise ValueError("min_grade must be between 0 and 1")
     out_dir = Path(export_dir or cfg.dataset.export_dir).expanduser()
     ts = (now or datetime.now(UTC)).isoformat(timespec="microseconds")
 
@@ -250,6 +274,7 @@ def export_all(
             export_dir=out_dir,
             min_scope=min_scope,
             min_label=min_label,
+            min_grade=min_grade,
             verified_only=verified_only,
             ts=ts,
         )
@@ -259,6 +284,7 @@ def export_all(
         "config_hash": _config_hash(cfg),
         "min_scope": min_scope,
         "min_label": min_label,
+        "min_grade": min_grade,
         "verified_only": verified_only,
         "datasets": {
             name: {
@@ -271,6 +297,8 @@ def export_all(
                 "scope_counts": d["scope_counts"],
                 "excluded_count": d["excluded_count"],
                 "injection_flags": d["injection_flags"],
+                "graded_count": d["graded_count"],
+                "ungraded_count": d["ungraded_count"],
             }
             for name, d in per_dataset.items()
         },

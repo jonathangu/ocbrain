@@ -130,8 +130,45 @@ def test_sidecar_and_junk_predicate(tmp_path: Path):
     assert not is_conversation_transcript(tmp_path / "y.trajectory-path.json")
     assert not is_conversation_transcript(tmp_path / "z.jsonl.codex-app-server.json")
     assert not is_conversation_transcript(tmp_path / "sessions.json")
+    assert not is_conversation_transcript(tmp_path / "session_index.jsonl")
+    assert not is_conversation_transcript(tmp_path / "history.jsonl")
     assert not is_conversation_transcript(tmp_path / "codex-home" / ".tmp" / "a.jsonl")
     assert not is_conversation_transcript(tmp_path / "plugin-config.json")
+
+
+def test_parse_migrated_chatgpt_codex_rollout(tmp_path: Path):
+    """Current ChatGPT desktop rollouts keep Codex response items plus new
+    bookkeeping records. Tool pairs must survive; reasoning/world state must not.
+    """
+    lines = [
+        {"type": "session_meta", "timestamp": "2026-07-09T20:00:00Z",
+         "payload": {"id": "migrated-1", "cwd": "/workspace"}},
+        {"type": "world_state", "timestamp": "2026-07-09T20:00:01Z", "payload": {}},
+        {"type": "turn_context", "timestamp": "2026-07-09T20:00:02Z", "payload": {}},
+        {"type": "event_msg", "timestamp": "2026-07-09T20:00:03Z",
+         "payload": {"type": "user_message", "message": "duplicate bookkeeping"}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:03Z",
+         "payload": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "inspect the repo"}]}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:04Z",
+         "payload": {"type": "reasoning", "encrypted_content": "NEVER_TRAIN"}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:05Z",
+         "payload": {"type": "custom_tool_call", "name": "exec_command",
+                     "call_id": "c1", "input": "{}"}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:06Z",
+         "payload": {"type": "custom_tool_call_output", "call_id": "c1",
+                     "output": "repository status is clean"}},
+        {"type": "response_item", "timestamp": "2026-07-09T20:00:07Z",
+         "payload": {"type": "message", "role": "assistant",
+                     "content": [{"type": "output_text", "text": "Inspection complete."}]}},
+    ]
+    path = _write_jsonl(tmp_path / "rollout-migrated.jsonl", lines)
+    session = parse_codex_session(path)
+    assert session.session_id == "migrated-1"
+    assert [turn.role for turn in session.turns] == ["user", "assistant", "tool", "assistant"]
+    assert session.turns[1].n_tool_calls == 1
+    assert all("NEVER_TRAIN" not in turn.text for turn in session.turns)
+    assert all("duplicate bookkeeping" not in turn.text for turn in session.turns)
 
 
 def test_telegram_envelope_author_verification():

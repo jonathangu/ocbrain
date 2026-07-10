@@ -77,6 +77,17 @@ def dataset_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         total = sum(label_counts.values())
         excluded = label_counts.get("excluded", 0)
         good = label_counts.get("good", 0)
+        graded = conn.execute(
+            "SELECT COUNT(*) AS n FROM dataset_examples "
+            "WHERE dataset = ? AND grade_score IS NOT NULL",
+            (dataset,),
+        ).fetchone()["n"]
+        grade_row = conn.execute(
+            "SELECT AVG(grade_score) AS avg_score, MIN(grade_score) AS min_score, "
+            "MAX(grade_score) AS max_score FROM dataset_examples "
+            "WHERE dataset = ? AND grade_score IS NOT NULL",
+            (dataset,),
+        ).fetchone()
         datasets[dataset] = {
             "total": total,
             "by_label": label_counts,
@@ -87,6 +98,15 @@ def dataset_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "exclusion_rate": round(excluded / total, 4) if total else 0.0,
             "good": good,
             "good_rate": round(good / total, 4) if total else 0.0,
+            "graded": int(graded),
+            "grade_coverage": round(int(graded) / total, 4) if total else 0.0,
+            "grade_score": {
+                "average": round(float(grade_row["avg_score"]), 4)
+                if grade_row["avg_score"] is not None
+                else None,
+                "minimum": grade_row["min_score"],
+                "maximum": grade_row["max_score"],
+            },
             "export_history": _export_history(conn, dataset),
         }
         totals["total"] += total

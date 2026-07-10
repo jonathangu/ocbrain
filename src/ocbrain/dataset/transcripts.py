@@ -98,7 +98,13 @@ _SIDECAR_SUFFIXES = (
     ".codex-app-server.json",
     ".jsonl.codex-app-server.json",
 )
-_SIDECAR_NAMES = ("sessions.json",)
+_SIDECAR_NAMES = (
+    "sessions.json",
+    # ChatGPT desktop / Codex migration bookkeeping. These are indexes or
+    # prompt-history ledgers, not paired conversation rollouts.
+    "session_index.jsonl",
+    "history.jsonl",
+)
 
 _THINKING_BLOCK_TYPES = {"thinking", "reasoning", "redacted_thinking"}
 

@@ -1,7 +1,5 @@
-"""Regression: the core connect() factory must set PRAGMA busy_timeout so the
-migrate path (init_db -> _migrate_schema -> _rebuild_memory_view -> DROP VIEW)
-waits on a concurrent writer's lock instead of crashing with
-sqlite3.OperationalError('database is locked').
+"""Regression: current-schema startup is read-only, while a real migration uses
+the core busy_timeout instead of crashing immediately on a concurrent writer.
 
 The heavy autopilot fire crashed exit-1 here: the core connect path set no
 busy_timeout while concurrent writers (light cycles, stallcheck, MCP feedback)
@@ -49,7 +47,15 @@ def test_migrate_path_waits_out_a_held_lock(tmp_path):
     """A writer holds the lock briefly; a second connection's migrate path
     (init_db) must wait and succeed within a short busy_timeout."""
     db_path = tmp_path / "brain.sqlite"
-    init_db(connect(db_path))
+    seeded = connect(db_path)
+    init_db(seeded)
+    seeded.execute("DROP VIEW memory")
+    seeded.execute(
+        "CREATE VIEW memory AS SELECT * FROM knowledge "
+        "WHERE status = 'current' AND inject = 1"
+    )
+    seeded.commit()
+    seeded.close()
 
     result: dict[str, object] = {}
     barrier = threading.Barrier(2)
@@ -78,3 +84,21 @@ def test_migrate_path_waits_out_a_held_lock(tmp_path):
     worker.join(timeout=10)
     assert not worker.is_alive()
     assert result.get("ok") is True, result.get("error")
+
+
+def test_current_schema_reinit_does_not_need_writer_lock(tmp_path):
+    db_path = tmp_path / "brain.sqlite"
+    initialized = connect(db_path)
+    init_db(initialized)
+    initialized.close()
+
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        reader = connect(db_path)
+        reader.execute("PRAGMA busy_timeout=0")
+        init_db(reader)
+        reader.close()
+    finally:
+        holder.rollback()
+        holder.close()
