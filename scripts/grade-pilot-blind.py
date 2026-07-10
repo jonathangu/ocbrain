@@ -25,6 +25,25 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _load_human_labels(path: Path, eval_ids: set[str]) -> dict[str, str]:
+    rows = _load_jsonl(path)
+    labels: dict[str, str] = {}
+    for row in rows:
+        eval_id = str(row.get("eval_id") or "")
+        winner = str(row.get("winner") or "").lower()
+        labeled_by = str(row.get("labeled_by") or "").strip()
+        if not eval_id or winner not in {"a", "b", "tie"}:
+            raise ValueError("human calibration labels require eval_id and winner a, b, or tie")
+        if not labeled_by:
+            raise ValueError("human calibration labels require labeled_by provenance")
+        if eval_id in labels:
+            raise ValueError(f"duplicate human calibration label: {eval_id}")
+        labels[eval_id] = winner
+    if set(labels) != eval_ids:
+        raise ValueError("human calibration labels must exactly match calibration cases")
+    return labels
+
+
 def _score(value: Any, label: str) -> float:
     try:
         score = float(value)
@@ -76,8 +95,7 @@ def _rate(
     schema = {
         "winner": "a|b|tie",
         "scores": {
-            side: {dimension: "number 1..5" for dimension in dimensions}
-            for side in ("a", "b")
+            side: {dimension: "number 1..5" for dimension in dimensions} for side in ("a", "b")
         },
         "explanation": "short string",
     }
@@ -88,7 +106,14 @@ def _rate(
                 "You are a strict blind evaluator of voice and taste fidelity. "
                 "The two responses are anonymized. Do not guess authorship. Score A and B "
                 "independently against the prompt and rubric, then choose A, B, or tie. "
-                "Prefer concise, specific judgment over generic assistant prose. Return JSON only."
+                "Use this priority order: truth and privacy, sound judgment, specificity, then "
+                "style. Concision must never make a boastful, fabricated, or privacy-unsafe answer "
+                "win. Prefer concise, specific judgment over padded assistant prose, while keeping "
+                "one useful reason. For a list or summary, a compact answer is the better editable "
+                "base when its missing reason can be added in one line. Under noisy evidence, "
+                "preserve optionality; communicate uncertainty with the best supported estimate "
+                "or range instead of fake precision or evasiveness. If neither response is ideal, "
+                "choose the closer editable base. Return JSON only."
             ),
         },
         {
@@ -140,6 +165,7 @@ def _calibrate(
     endpoint: str,
     model: str,
     path: Path,
+    labels_path: Path,
     *,
     timeout: int,
     minimum_accuracy: float,
@@ -148,21 +174,25 @@ def _calibrate(
     cases = _load_jsonl(path)
     if len(cases) < 6:
         raise ValueError("judge calibration requires at least six cases")
+    eval_ids = {str(case.get("eval_id") or "") for case in cases}
+    if "" in eval_ids or len(eval_ids) != len(cases):
+        raise ValueError("calibration cases require unique eval_id values")
+    labels = _load_human_labels(labels_path, eval_ids)
     correct = 0
     results: list[dict[str, Any]] = []
     for case in cases:
-        expected = str(case.get("expected_winner") or "").lower()
-        if expected not in {"a", "b", "tie"}:
-            raise ValueError("calibration expected_winner must be a, b, or tie")
+        eval_id = str(case["eval_id"])
+        human_winner = labels[eval_id]
         rating = _rate(endpoint, model, case, timeout=timeout)
-        matched = rating["winner"] == expected
+        matched = rating["winner"] == human_winner
         correct += int(matched)
         results.append(
             {
-                "eval_id": case.get("eval_id"),
-                "expected_winner": expected,
-                "actual_winner": rating["winner"],
+                "eval_id": eval_id,
+                "human_winner": human_winner,
+                "judge_winner": rating["winner"],
                 "correct": matched,
+                "explanation": rating.get("explanation", ""),
             }
         )
     accuracy = correct / len(cases)
@@ -175,6 +205,8 @@ def _calibrate(
         "passed": accuracy >= minimum_accuracy,
         "judge_model": model,
         "local_only": True,
+        "human_labeled": True,
+        "label_source": str(labels_path),
         "results": results,
     }
     temporary = report_path.with_suffix(report_path.suffix + ".tmp")
@@ -195,7 +227,13 @@ def main() -> int:
     parser.add_argument("--model", default="qwen3.6:35b-a3b-q4_K_M")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--calibration", type=Path, required=True)
+    parser.add_argument("--calibration-labels", type=Path, required=True)
     parser.add_argument("--min-calibration-accuracy", type=float, default=0.8)
+    parser.add_argument(
+        "--calibration-only",
+        action="store_true",
+        help="stop after the human-grounded judge gate without opening blind pairs",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -207,19 +245,19 @@ def main() -> int:
         endpoint,
         args.model,
         args.calibration.expanduser(),
+        args.calibration_labels.expanduser(),
         timeout=args.timeout,
         minimum_accuracy=args.min_calibration_accuracy,
         report_path=root / "eval" / "judge-calibration-report.json",
     )
     print(
         canonical_json(
-            {
-                key: calibration[key]
-                for key in ("action", "items", "correct", "accuracy", "passed")
-            }
+            {key: calibration[key] for key in ("action", "items", "correct", "accuracy", "passed")}
         ),
         flush=True,
     )
+    if args.calibration_only:
+        return 0
     # The blind material is deliberately not opened until the judge has passed
     # calibration. A failed judge therefore cannot leave partial blind ratings.
     pairs = _load_jsonl(root / "eval" / "blind_pairs.jsonl")

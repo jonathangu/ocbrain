@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import sqlite3
 from pathlib import Path
 
+import ocbrain.dataset.quality as quality_module
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.dataset.quality import scrub_reasons, store_example
 from ocbrain.db import connect, init_db
 
@@ -23,8 +26,9 @@ def _store(conn, target, *, dataset="sft", label="good"):
         source_uri="/x/s.jsonl",
         evidence_ids=["evd_1"],
         privacy_scope="workspace",
-        body={"messages": [{"role": "user", "content": "q"},
-                           {"role": "assistant", "content": target}]},
+        body={
+            "messages": [{"role": "user", "content": "q"}, {"role": "assistant", "content": target}]
+        },
         metadata={"session_id": "s1"},
         target_text=target,
         base_label=label,
@@ -55,14 +59,12 @@ def test_refusal_only_rule():
 
 
 def test_error_dump_rule():
-    target = "Traceback (most recent call last):\n  File \"a.py\", line 3\nValueError: boom"
+    target = 'Traceback (most recent call last):\n  File "a.py", line 3\nValueError: boom'
     assert "error_dump" in scrub_reasons(target, target)
 
 
 def test_managed_block_envelope_injection_rules():
-    assert "managed_block_leak" in scrub_reasons(
-        "text BEGIN OCBRAIN MANAGED BLOCK more", "x"
-    )
+    assert "managed_block_leak" in scrub_reasons("text BEGIN OCBRAIN MANAGED BLOCK more", "x")
     assert "envelope_residue" in scrub_reasons(
         "leftover Conversation info (untrusted metadata) fragment", "x"
     )
@@ -103,6 +105,50 @@ def test_store_near_dup_keeps_first(tmp_path: Path):
     second = _store(conn, CLEAN_TARGET + " !!!")
     assert second["quality_label"] == "excluded"
     assert "near_dup" in second["quality_reasons"]
+
+
+def test_store_prepares_example_before_acquiring_writer_lock(tmp_path: Path, monkeypatch) -> None:
+    conn = _conn(tmp_path)
+    batch = DatasetWriteBatch(conn, max_operations=50, max_seconds=2.0)
+    original = quality_module._existing_dedup
+    observed = False
+
+    def observe_dedup(read_conn, dataset, dedup_key):
+        nonlocal observed
+        # Dedup is the last potentially expensive preparation step before the
+        # final INSERT. A separate writer must still be able to acquire here.
+        observer = sqlite3.connect(tmp_path / "db.sqlite", timeout=0)
+        observer.execute("BEGIN IMMEDIATE")
+        observer.rollback()
+        observer.close()
+        observed = True
+        return original(read_conn, dataset, dedup_key)
+
+    monkeypatch.setattr(quality_module, "_existing_dedup", observe_dedup)
+    result = store_example(
+        conn,
+        dataset="persona",
+        source_kind="openclaw_session",
+        source_uri="/x/persona.jsonl",
+        evidence_ids=["evd_1"],
+        privacy_scope="workspace",
+        body={
+            "messages": [
+                {"role": "user", "content": "Give me the concise decision."},
+                {"role": "assistant", "content": CLEAN_TARGET},
+            ]
+        },
+        metadata={"session_id": "s1"},
+        target_text=CLEAN_TARGET,
+        base_label="good",
+        base_confidence=0.9,
+        write_batch=batch,
+    )
+    assert result is not None
+    assert observed is True
+    assert conn.in_transaction is False
+    assert batch.metrics()["operations"] == 1
+    assert batch.metrics()["batches_committed"] == 1
 
 
 # --- ParseCache / DB-anchored side dir (v0.3 incremental mining) --------------

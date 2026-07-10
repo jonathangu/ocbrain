@@ -35,6 +35,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.fsutil import file_fingerprint, history_runtime
 
 # --- normalization constants -------------------------------------------------
@@ -766,7 +767,10 @@ def iter_transcript_files(roots: Iterable[str | Path]) -> Iterator[Path]:
 
 
 def resolve_transcript_evidence(
-    conn: sqlite3.Connection, session: Session
+    conn: sqlite3.Connection,
+    session: Session,
+    *,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> tuple[str, str]:
     """Return ``(evidence_id, privacy_scope)`` for a session's transcript.
 
@@ -791,6 +795,8 @@ def resolve_transcript_evidence(
         digest = file_fingerprint(path)
     except OSError:
         digest = session.session_id
+    if write_batch is not None:
+        write_batch.ensure()
     evidence_id = upsert_evidence(
         conn,
         source_type=f"{session.runtime}_history_file",
@@ -801,6 +807,11 @@ def resolve_transcript_evidence(
         privacy_scope="workspace",
         occurred_at=session.occurred_at,
     )
+    if write_batch is not None:
+        write_batch.operation()
+        # The caller parses and scores transcript examples next; never carry
+        # this evidence transaction into that CPU-heavy work.
+        write_batch.flush()
     return evidence_id, "workspace"
 
 

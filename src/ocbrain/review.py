@@ -37,6 +37,7 @@ from ocbrain.autolabel import (
     set_watermark,
 )
 from ocbrain.config import founder_weight
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import link_knowledge_evidence, upsert_knowledge
 from ocbrain.schema import Candidate, Risk, Scope, Target
 from ocbrain.text import (
@@ -48,6 +49,8 @@ from ocbrain.text import (
 )
 
 REVIEW_DOMAIN = "review"
+REVIEW_BATCH_MAX_OPERATIONS = 50
+REVIEW_BATCH_MAX_SECONDS = 2.0
 
 APPROVAL_RE = re.compile(
     r"(?i)\b(yes|approved|lgtm|go ahead|do it|please do|sounds good|proceed)\b"
@@ -97,45 +100,44 @@ def review_sessions(
     signals = 0
     candidates = 0
     reviewed = 0
-    writer_batches = 0
-    writer_seconds = 0.0
-    max_writer_seconds = 0.0
-    for session in sessions:
-        if not is_settled(session, cfg, now_ns=now_ns):
-            continue
-        fingerprint = str(getattr(session, "fingerprint", None) or _session_fingerprint(session))
-        stream = str(getattr(session, "path", "") or getattr(session, "session_key", ""))
-        if stream and get_watermark(conn, REVIEW_DOMAIN, stream) == fingerprint:
-            continue
-        # The session iterator may parse the next transcript lazily. Close this
-        # session's write transaction before advancing it so parsing never runs
-        # while SQLite's single-writer slot is held.
-        batch_started = time.monotonic()
-        result = review_session(conn, session, cfg, now=now)
-        signals += result["signals"]
-        candidates += result["candidates"]
-        reviewed += 1
-        if stream:
-            set_watermark(conn, REVIEW_DOMAIN, stream, fingerprint)
-        if conn.in_transaction:
-            conn.commit()
-            held_upper_bound = time.monotonic() - batch_started
-            writer_batches += 1
-            writer_seconds += held_upper_bound
-            max_writer_seconds = max(max_writer_seconds, held_upper_bound)
+    batch = DatasetWriteBatch(
+        conn,
+        max_operations=REVIEW_BATCH_MAX_OPERATIONS,
+        max_seconds=REVIEW_BATCH_MAX_SECONDS,
+    )
+    try:
+        for session in sessions:
+            if not is_settled(session, cfg, now_ns=now_ns):
+                continue
+            fingerprint = str(
+                getattr(session, "fingerprint", None) or _session_fingerprint(session)
+            )
+            stream = str(getattr(session, "path", "") or getattr(session, "session_key", ""))
+            if stream and get_watermark(conn, REVIEW_DOMAIN, stream) == fingerprint:
+                continue
+            result = review_session(conn, session, cfg, now=now, write_batch=batch)
+            signals += result["signals"]
+            candidates += result["candidates"]
+            reviewed += 1
+            if stream:
+                batch.ensure()
+                set_watermark(conn, REVIEW_DOMAIN, stream, fingerprint)
+                batch.operation()
+            # A lazy iterator may parse the next transcript on advancement.
+            # Preserve the session boundary even when neither operation nor
+            # elapsed-time limits were reached inside this session.
+            batch.flush()
+    except Exception:
+        batch.rollback()
+        raise
+    writer_lock = batch.metrics()
+    writer_lock["boundary"] = "50 operations/2 seconds/session"
     return {
         "action": "review",
         "changed": reviewed,
         "signals": signals,
         "candidates": candidates,
-        "writer_lock": {
-            "boundary": "session",
-            "batches_committed": writer_batches,
-            # The implicit transaction can begin after review starts, so these
-            # are conservative upper bounds rather than fake-exact lock times.
-            "writer_lock_upper_bound_seconds": round(writer_seconds, 6),
-            "max_writer_lock_upper_bound_seconds": round(max_writer_seconds, 6),
-        },
+        "writer_lock": writer_lock,
     }
 
 
@@ -145,6 +147,7 @@ def review_session(
     cfg: Any,
     *,
     now: datetime | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any]:
     """Fire the four triggers over one session's turns (§6)."""
     del now
@@ -155,6 +158,22 @@ def review_session(
 
     signal_count = 0
     candidate_count = 0
+
+    def emit(*args: Any) -> int:
+        if write_batch is not None:
+            write_batch.ensure()
+        changed = _emit(conn, *args)
+        if write_batch is not None:
+            write_batch.operation()
+        return changed
+
+    def upsert(candidate: Candidate, *, marker: str) -> int:
+        if write_batch is not None:
+            write_batch.ensure()
+        changed = _upsert_candidate(conn, session, candidate, marker=marker)
+        if write_batch is not None:
+            write_batch.operation()
+        return changed
 
     tool_turns = [t for t in turns if _role(t) == "tool"]
     tool_successes = [t for t in tool_turns if not _is_error(t)]
@@ -172,61 +191,62 @@ def review_session(
             author = _author(turn)
             weight_mult = founder_weight(cfg, author)
             if correction_score(text) >= threshold and _assistant_within(turns, index, 3):
-                signal_count += _emit(
-                    conn, "user_correction", "bad", 0.8 * weight_mult, session_key, ref,
+                signal_count += emit(
+                    "user_correction",
+                    "bad",
+                    0.8 * weight_mult,
+                    session_key,
+                    ref,
                     occurred,
                     _author_details(author, weight_mult, {"snippet": summarize_text(text, 200)}),
                 )
                 has_correction = True
             elif AFFIRMATION_RE.search(text):
-                signal_count += _emit(
-                    conn, "user_thanks", "good", 0.6 * weight_mult, session_key, ref, occurred,
+                signal_count += emit(
+                    "user_thanks",
+                    "good",
+                    0.6 * weight_mult,
+                    session_key,
+                    ref,
+                    occurred,
                     _author_details(author, weight_mult, {}),
                 )
-            if (
-                APPROVAL_RE.search(text)
-                and index > 0
-                and _role(turns[index - 1]) == "assistant"
-            ):
-                signal_count += _emit(
-                    conn, "user_approval", "good", 0.5 * weight_mult, session_key, ref, occurred,
+            if APPROVAL_RE.search(text) and index > 0 and _role(turns[index - 1]) == "assistant":
+                signal_count += emit(
+                    "user_approval",
+                    "good",
+                    0.5 * weight_mult,
+                    session_key,
+                    ref,
+                    occurred,
                     _author_details(author, weight_mult, {}),
                 )
 
         if role == "tool" and text:
             if TEST_PASS_RE.search(text):
-                signal_count += _emit(
-                    conn, "test_pass", "good", 0.4, session_key, ref, occurred, {}
-                )
+                signal_count += emit("test_pass", "good", 0.4, session_key, ref, occurred, {})
             if TEST_FAIL_RE.search(text):
-                signal_count += _emit(
-                    conn, "test_fail", "bad", 0.6, session_key, ref, occurred, {}
-                )
+                signal_count += emit("test_fail", "bad", 0.6, session_key, ref, occurred, {})
             if DEPLOY_OK_RE.search(text):
-                signal_count += _emit(
-                    conn, "deploy_success", "good", 0.6, session_key, ref, occurred, {}
-                )
+                signal_count += emit("deploy_success", "good", 0.6, session_key, ref, occurred, {})
             if DEPLOY_FAIL_RE.search(text):
-                signal_count += _emit(
-                    conn, "deploy_failure", "bad", 0.6, session_key, ref, occurred, {}
-                )
+                signal_count += emit("deploy_failure", "bad", 0.6, session_key, ref, occurred, {})
 
         if REVERT_RE.search(text):
-            signal_count += _emit(
-                conn, "revert", "bad", 0.7, session_key, ref, occurred, {}
-            )
+            signal_count += emit("revert", "bad", 0.7, session_key, ref, occurred, {})
 
     # Error-recovery arc: an error followed later by a success, ending clean.
-    recovered = bool(tool_errors) and bool(tool_successes) and not trailing_error and (
-        _last_index(tool_turns, error=False) > _first_index(tool_turns, error=True)
+    recovered = (
+        bool(tool_errors)
+        and bool(tool_successes)
+        and not trailing_error
+        and (_last_index(tool_turns, error=False) > _first_index(tool_turns, error=True))
     )
     if recovered:
-        signal_count += _emit(
-            conn, "error_recovery", "good", 0.6, session_key, f"{path}#recovery", None, {}
+        signal_count += emit(
+            "error_recovery", "good", 0.6, session_key, f"{path}#recovery", None, {}
         )
-        candidate_count += _upsert_candidate(
-            conn,
-            session,
+        candidate_count += upsert(
             Candidate(
                 target=Target.SKILL,
                 title=_recovery_title(turns),
@@ -244,13 +264,16 @@ def review_session(
         and not trailing_error
         and not has_correction
     ):
-        signal_count += _emit(
-            conn, "task_closeout_success", "good", 0.7, session_key, f"{path}#closeout", None,
+        signal_count += emit(
+            "task_closeout_success",
+            "good",
+            0.7,
+            session_key,
+            f"{path}#closeout",
+            None,
             {"tool_successes": len(tool_successes)},
         )
-        candidate_count += _upsert_candidate(
-            conn,
-            session,
+        candidate_count += upsert(
             Candidate(
                 target=Target.SKILL,
                 title=_closeout_title(session, turns),
@@ -264,12 +287,10 @@ def review_session(
 
     # Novel workflow: a tool sequence not seen before for this session.
     if len(tool_successes) >= 3 and _is_novel_workflow(conn, session_key):
-        signal_count += _emit(
-            conn, "novel_workflow", "neutral", 0.2, session_key, f"{path}#novel", None, {}
+        signal_count += emit(
+            "novel_workflow", "neutral", 0.2, session_key, f"{path}#novel", None, {}
         )
-        candidate_count += _upsert_candidate(
-            conn,
-            session,
+        candidate_count += upsert(
             Candidate(
                 target=Target.WIKI,
                 title=_closeout_title(session, turns),
@@ -368,9 +389,7 @@ def _upsert_candidate(
     return 1
 
 
-def _link_session_evidence(
-    conn: sqlite3.Connection, knowledge_id: str, session: Any
-) -> None:
+def _link_session_evidence(conn: sqlite3.Connection, knowledge_id: str, session: Any) -> None:
     """Link the harvested candidate to the session's evidence rows if present.
 
     Evidence rows are created by the harvest stage keyed on ``source_uri`` = the
@@ -409,9 +428,7 @@ def _author(turn: Any) -> str | None:
     return str(value) if value else None
 
 
-def _author_details(
-    author: str | None, weight_mult: float, base: dict[str, Any]
-) -> dict[str, Any]:
+def _author_details(author: str | None, weight_mult: float, base: dict[str, Any]) -> dict[str, Any]:
     """Fold author provenance into a signal's details when a founder authored it.
 
     A generic (weight 1.0) author adds nothing, keeping stable signal ids and the

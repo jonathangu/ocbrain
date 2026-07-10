@@ -14,6 +14,7 @@ import re
 import sqlite3
 from typing import Any
 
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import now_iso
 from ocbrain.events import canonical_json
 from ocbrain.ids import content_hash, stable_id
@@ -124,6 +125,7 @@ def store_example(
     n_turns: int | None = None,
     session_id: str | None = None,
     occurred_at: str | None = None,
+    write_batch: DatasetWriteBatch | None = None,
 ) -> dict[str, Any] | None:
     """Scrub, dedup, and idempotently upsert one example. Returns the stored dict.
 
@@ -136,6 +138,12 @@ def store_example(
         raise ValueError("every dataset example needs >=1 evidence id (provenance)")
     if dataset not in ("sft", "dpo", "persona"):
         raise ValueError(f"unknown dataset: {dataset}")
+
+    if write_batch is not None:
+        # A previous evidence/example write may still be inside a valid bounded
+        # batch. Close it before any redaction, serialization, quality scoring,
+        # or dedup reads for this example.
+        write_batch.flush()
 
     # Final secret redaction pass over the target AND the stored body, so no raw
     # secret survives in the exported record (spec §7.4 rule 1). Redaction is
@@ -190,6 +198,11 @@ def store_example(
     n_chars = len(example_json)
     ts = now_iso()
 
+    # Redaction, serialization, scrub rules, and dedup lookup can be expensive
+    # for long persona examples. Do all of that before acquiring SQLite's
+    # single-writer slot; the transaction owns only the final INSERT.
+    if write_batch is not None:
+        write_batch.ensure()
     conn.execute(
         """
         INSERT INTO dataset_examples (
@@ -223,6 +236,11 @@ def store_example(
             ts,
         ),
     )
+    if write_batch is not None:
+        write_batch.operation()
+        # Callers may parse/score the next candidate after this returns. Commit
+        # the INSERT now so that external work cannot inherit this writer lock.
+        write_batch.flush()
     return {
         "id": example_id,
         "dataset": dataset,

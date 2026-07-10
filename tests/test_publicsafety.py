@@ -190,20 +190,16 @@ def test_assigned_secret_ignores_identifier_and_annotation(repo: Path) -> None:
     ):
         rng = _commit_added_line(repo, "mod.py", line)
         result = ps.scan(repo, diff_range=rng)
-        assert not any(
-            f.rule == "secret_leak" for f in result.findings
-        ), f"{line!r} -> {result.report()}"
+        assert not any(f.rule == "secret_leak" for f in result.findings), (
+            f"{line!r} -> {result.report()}"
+        )
 
 
 def test_refine_secret_leaks_unit() -> None:
     # env lookup: assigned_secret dropped.
-    assert ps.refine_secret_leaks(
-        "api_key = resolved_env.get(x)", ["assigned_secret"]
-    ) == []
+    assert ps.refine_secret_leaks("api_key = resolved_env.get(x)", ["assigned_secret"]) == []
     # quoted literal: assigned_secret kept.
-    assert ps.refine_secret_leaks(
-        'token = "xoxb-plausible-length"', []
-    ) == ["assigned_secret"]
+    assert ps.refine_secret_leaks('token = "xoxb-plausible-length"', []) == ["assigned_secret"]
     # unrelated format leak passes through untouched.
     assert ps.refine_secret_leaks("k = v", ["openai_key"]) == ["openai_key"]
 
@@ -244,8 +240,7 @@ def test_plist_still_subject_to_placement_and_denylist(repo: Path) -> None:
     result = ps.scan(repo)
     assert any(f.rule == "denylist" for f in result.findings), result.report()
     assert any(
-        f.rule == "tracked_data_artifact" and f.path == "logs/job.plist"
-        for f in result.findings
+        f.rule == "tracked_data_artifact" and f.path == "logs/job.plist" for f in result.findings
     ), result.report()
 
 
@@ -268,6 +263,23 @@ def test_explicit_public_git_commit_is_not_an_entropy_finding(repo: Path) -> Non
 def test_unlabeled_full_hex_value_remains_an_entropy_finding(repo: Path) -> None:
     suspicious_value = "a790972f0f844d81067ed45c28b524220a10c019"
     rng = _commit_added_line(repo, "payload.py", f'VALUE = "{suspicious_value}"')
+    result = ps.scan(repo, diff_range=rng)
+    assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_python_identifier_is_not_an_entropy_finding(repo: Path) -> None:
+    rng = _commit_added_line(
+        repo,
+        "review.py",
+        "max_operations = REVIEW_BATCH_MAX_OPERATIONS",
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_quoted_python_entropy_still_fails(repo: Path) -> None:
+    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    rng = _commit_added_line(repo, "settings.py", f'VALUE = "{suspicious}"')
     result = ps.scan(repo, diff_range=rng)
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
 

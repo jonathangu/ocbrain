@@ -71,7 +71,6 @@ def import_persona_curation(
             privacy_scope="workspace",
         )
         batch.operation()
-        batch.ensure()
         result = store_example(
             conn,
             dataset="persona",
@@ -94,8 +93,8 @@ def import_persona_curation(
             base_confidence=1.0,
             base_reasons=["explicit_persona_curation"],
             n_turns=3,
+            write_batch=batch,
         )
-        batch.operation()
         if result is None:
             skipped += 1
         elif result["quality_label"] == "excluded":

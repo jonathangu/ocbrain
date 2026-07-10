@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2 — 2026-07-10
+
+- Bound post-turn review inside large sessions at 50 mutating units or two
+  seconds, while preserving the commit-before-next-lazy-session boundary.
+- Replace conservative per-session lock estimates with measured writer-lock
+  wait, total, and maximum telemetry from explicit transactions.
+- Move persona/SFT/DPO redaction, serialization, quality scoring, and dedup reads
+  outside SQLite writer transactions; evidence and each final example insert
+  commit before parsing or scoring the next candidate.
+- Require a separate, complete human-label file with named provenance before a
+  local judge can pass calibration; embedded machine-authored winners are
+  ignored.
+- Add a calibration-only mode that cannot open blind pairs, preserve judge
+  explanations for audit, and align the evaluator to concise reasoning,
+  evidence-aware optionality, and quantified uncertainty without fake precision.
+- Record the dated human-grounded gate honestly: 7/8 (87.5%), with the remaining
+  concision-versus-reason miss preserved. The v0.3.0 blind result was not rerun.
+- Refresh runtime documentation against installed OpenClaw 2026.6.11, Claude
+  Code 2.1.206, and Codex CLI 0.144.1 command surfaces.
+
 ## 0.3.1 — 2026-07-09
 
 - Commit post-turn review work at each fully processed session before the lazy

@@ -232,9 +232,7 @@ def mine_sft(
     def _emit(session: Session) -> int:
         nonlocal stored, excluded, examined
         count = 0
-        batch.ensure()
-        evidence_id, scope = resolve_transcript_evidence(conn, session)
-        batch.operation()
+        evidence_id, scope = resolve_transcript_evidence(conn, session, write_batch=batch)
         for exchange in segment_exchanges(session, cfg):
             examined += 1
             label, confidence, reasons = label_exchange(
@@ -243,7 +241,6 @@ def mine_sft(
                 cfg,
                 retrieval_outcomes=retrieval_by_session.get(session.session_id, []),
             )
-            batch.ensure()
             result = store_example(
                 conn,
                 dataset="sft",
@@ -266,8 +263,8 @@ def mine_sft(
                 n_turns=len(exchange.context) + 1,
                 session_id=session.session_id,
                 occurred_at=exchange.occurred_at,
+                write_batch=batch,
             )
-            batch.operation()
             if result is None:
                 continue
             if result["quality_label"] == "excluded":

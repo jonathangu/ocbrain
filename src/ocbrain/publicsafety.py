@@ -32,8 +32,10 @@ product source, docs, ops, scripts -- is scanned.
 
 from __future__ import annotations
 
+import io
 import re
 import subprocess
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -205,11 +207,7 @@ def is_forbidden_tracked_path(rel: str) -> bool:
 
 
 def content_scan_excluded(rel: str) -> bool:
-    return (
-        rel in _CONTENT_SKIP_EXACT
-        or rel.startswith("tests/")
-        or rel.endswith(".lock")
-    )
+    return rel in _CONTENT_SKIP_EXACT or rel.startswith("tests/") or rel.endswith(".lock")
 
 
 def entropy_pathcheck_excluded(rel: str) -> bool:
@@ -227,6 +225,33 @@ def filter_public_git_revision_spans(line: str, spans: list[str]) -> list[str]:
     if not _GIT_REVISION_CONTEXT_RE.search(line):
         return spans
     return [span for span in spans if not _FULL_GIT_OBJECT_RE.fullmatch(span)]
+
+
+def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop entropy spans that Python tokenizes as identifiers, not literals.
+
+    Long constant names can look base64-like to the generic entropy scanner.
+    Restrict this exception to Python ``NAME`` tokens so a quoted random string
+    on the same kind of line remains a finding.
+    """
+
+    if not rel.endswith(".py") or not spans:
+        return spans
+    try:
+        names = {
+            token.string
+            for token in tokenize.generate_tokens(io.StringIO(line.lstrip()).readline)
+            if token.type == tokenize.NAME
+        }
+    except (IndentationError, tokenize.TokenError):
+        return spans
+    kept: list[str] = []
+    for span in spans:
+        parts = [part for part in re.split(r"=+", span) if part]
+        if parts and all(part in names for part in parts):
+            continue
+        kept.append(span)
+    return kept
 
 
 def refine_secret_leaks(content: str, leaks: list[str]) -> list[str]:
@@ -378,9 +403,8 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
             # high_entropy (c) skips plists -- their absolute path strings read as
             # long high-entropy runs (see entropy_pathcheck_excluded).
             if not entropy_pathcheck_excluded(rel):
-                spans = filter_public_git_revision_spans(
-                    content, find_high_entropy_spans(content)
-                )
+                spans = filter_public_git_revision_spans(content, find_high_entropy_spans(content))
+                spans = filter_python_identifier_spans(rel, content, spans)
                 if spans:
                     result.findings.append(
                         Finding(

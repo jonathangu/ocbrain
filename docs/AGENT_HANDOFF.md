@@ -125,6 +125,9 @@ The light and heavy profiles share one file lock. An overlapping invocation
 returns `locked` and exits successfully. Snapshot and migration failures abort a
 run; independent later-stage failures make the run partial and allow unrelated
 stages to continue. Each stage owns its watermark, idempotency, and commit.
+Dataset mining and post-turn review use explicit writer batches bounded by 50
+mutating units or two seconds. Review also flushes at each completed session
+before advancing a lazy transcript iterator.
 
 Do not count labels in prose when the source can speak more precisely. The
 dispatch table has fourteen names; lock and finalize are runner steps around
@@ -146,8 +149,14 @@ The pilot order is part of the safety and evaluation claim:
 4. train and record exit status plus losses;
 5. generate candidate responses;
 6. randomize candidates against references without exposing the key;
-7. rate the blind pairs;
-8. unblind once, in the scoring step.
+7. calibrate the local judge against a separate, complete human-label file;
+8. rate the blind pairs only after that gate passes;
+9. unblind once, in the scoring step.
+
+Calibration case files are not human truth. Labels require named human
+provenance, are stored separately, and exactly cover the case ids. Embedded
+machine-authored expected winners are ignored. Use calibration-only mode when
+adjusting the judge so blind material is never opened during prompt calibration.
 
 Pipeline completion is not model-quality acceptance. Report both separately.
 

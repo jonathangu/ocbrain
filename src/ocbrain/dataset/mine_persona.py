@@ -321,11 +321,17 @@ def mine_persona(
         max_seconds=cfg.dataset.write_batch_seconds,
     )
 
-    def _store(candidate: dict[str, Any], *, evidence_ids: list[str], scope: str,
-               source_kind: str, source_uri: str | None, session_id: str | None) -> None:
+    def _store(
+        candidate: dict[str, Any],
+        *,
+        evidence_ids: list[str],
+        scope: str,
+        source_kind: str,
+        source_uri: str | None,
+        session_id: str | None,
+    ) -> None:
         nonlocal stored, excluded, examined
         examined += 1
-        batch.ensure()
         result = store_example(
             conn,
             dataset="persona",
@@ -347,8 +353,8 @@ def mine_persona(
             n_turns=len(candidate["messages"]),
             session_id=session_id,
             occurred_at=candidate.get("occurred_at"),
+            write_batch=batch,
         )
-        batch.operation()
         if result is None:
             return
         if result["quality_label"] == "excluded":
@@ -358,9 +364,7 @@ def mine_persona(
 
     # Telegram (from provided sessions or discovered transcripts).
     def _emit_session(session: Session) -> None:
-        batch.ensure()
-        evidence_id, scope = resolve_transcript_evidence(conn, session)
-        batch.operation()
+        evidence_id, scope = resolve_transcript_evidence(conn, session, write_batch=batch)
         for candidate in telegram_examples(session, cfg, verified_only=verified_only):
             _store(
                 candidate,
@@ -428,9 +432,7 @@ def mine_persona(
     else:
         repo_list = discover_git_repos("~/.openclaw/workspace")
     for repo in repo_list:
-        for candidate in commit_examples(
-            conn, repo, cfg, limit=limit, write_batch=batch
-        ):
+        for candidate in commit_examples(conn, repo, cfg, limit=limit, write_batch=batch):
             _store(
                 candidate,
                 evidence_ids=candidate["evidence_ids"],

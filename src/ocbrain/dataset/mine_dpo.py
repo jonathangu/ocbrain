@@ -484,7 +484,12 @@ def _evidence_claims(conn: sqlite3.Connection, evidence_ids: list[str], limit: i
     return "\n".join(claims)
 
 
-def _store_pair(conn: sqlite3.Connection, pair: DpoPair) -> dict[str, Any] | None:
+def _store_pair(
+    conn: sqlite3.Connection,
+    pair: DpoPair,
+    *,
+    write_batch: DatasetWriteBatch | None = None,
+) -> dict[str, Any] | None:
     if not pair.evidence_ids:
         return None
     body = {
@@ -510,6 +515,7 @@ def _store_pair(conn: sqlite3.Connection, pair: DpoPair) -> dict[str, Any] | Non
         n_turns=len(pair.prompt_messages) + 1,
         session_id=pair.session_id,
         occurred_at=pair.occurred_at,
+        write_batch=write_batch,
     )
 
 
@@ -568,18 +574,14 @@ def mine_dpo(
 
     def _emit_transcript(session: Session) -> int:
         nonlocal stored, excluded, examined
-        batch.ensure()
-        evidence_id, scope = resolve_transcript_evidence(conn, session)
-        batch.operation()
+        evidence_id, scope = resolve_transcript_evidence(conn, session, write_batch=batch)
         count = 0
         for pair in find_transcript_pairs(session, cfg):
             examined += 1
             pair = DpoPair(
                 **{**pair.__dict__, "evidence_ids": (evidence_id,), "privacy_scope": scope}
             )
-            batch.ensure()
-            result = _store_pair(conn, pair)
-            batch.operation()
+            result = _store_pair(conn, pair, write_batch=batch)
             if result is None:
                 continue
             count += 1
@@ -616,9 +618,7 @@ def mine_dpo(
     if include_events:
         for pair in find_event_pairs(conn, cfg):
             examined += 1
-            batch.ensure()
-            result = _store_pair(conn, pair)
-            batch.operation()
+            result = _store_pair(conn, pair, write_batch=batch)
             if result is None:
                 continue
             if result["quality_label"] == "excluded":
@@ -654,9 +654,7 @@ def mine_dpo(
 def _session_has_founder_turn(session: Session, founder: set[str]) -> bool:
     """True if any non-injected user turn was authored by a configured founder."""
     return any(
-        turn.role == "user"
-        and turn.kind != "injected"
-        and turn.authored_by in founder
+        turn.role == "user" and turn.kind != "injected" and turn.authored_by in founder
         for turn in session.turns
     )
 
@@ -684,6 +682,11 @@ def remine_founder_sessions(
     )
 
     founder = set(founder_ids(cfg))
+    batch = DatasetWriteBatch(
+        conn,
+        max_operations=cfg.dataset.write_batch_size,
+        max_seconds=cfg.dataset.write_batch_seconds,
+    )
     base = {
         "ok": True,
         "dataset": "dpo",
@@ -694,6 +697,7 @@ def remine_founder_sessions(
         "excluded": 0,
         "founder_pairs": 0,
         "founder_pair_ids": [],
+        "writer_lock": batch.metrics(),
     }
     if not founder:
         base["reason"] = "no_founder_ids"
@@ -705,10 +709,7 @@ def remine_founder_sessions(
     founder_pair_ids: list[str] = []
 
     for path in iter_transcript_files(search_roots):
-        if (
-            time_budget_seconds is not None
-            and time.monotonic() - started > time_budget_seconds
-        ):
+        if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
             break
         files_scanned += 1
         # Cheap pre-filter: the raw file must mention a founder id before we pay to
@@ -729,12 +730,12 @@ def remine_founder_sessions(
         if session is None or not _session_has_founder_turn(session, founder):
             continue
         files_remined += 1
-        evidence_id, scope = resolve_transcript_evidence(conn, session)
+        evidence_id, scope = resolve_transcript_evidence(conn, session, write_batch=batch)
         for pair in find_transcript_pairs(session, cfg):
             pair = DpoPair(
                 **{**pair.__dict__, "evidence_ids": (evidence_id,), "privacy_scope": scope}
             )
-            result = _store_pair(conn, pair)
+            result = _store_pair(conn, pair, write_batch=batch)
             if result is None:
                 continue
             if result["quality_label"] == "excluded":
@@ -750,6 +751,7 @@ def remine_founder_sessions(
             ):
                 founder_pairs += 1
                 founder_pair_ids.append(result["id"])
+        batch.flush()
         if limit is not None and files_remined >= limit:
             break
 
@@ -761,6 +763,7 @@ def remine_founder_sessions(
             "excluded": excluded,
             "founder_pairs": founder_pairs,
             "founder_pair_ids": founder_pair_ids,
+            "writer_lock": batch.metrics(),
         }
     )
     return base

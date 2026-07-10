@@ -106,6 +106,18 @@ its rollouts under `~/.codex/sessions`. Claude's `--scope user` entry is
 available across projects. OpenClaw's `mcp add` command probes the server before
 saving it in `mcp.servers`.
 
+Claude Code authentication and OpenClaw-hosted Claude authentication are two
+separate checks. Configure both when OpenClaw should invoke the local Claude CLI:
+
+```bash
+claude auth login --claudeai
+openclaw models auth login --provider anthropic --method cli --set-default
+```
+
+The second command imports the Claude CLI credential into OpenClaw's own agent
+auth profile; a successful standalone `claude auth status` does not create that
+profile by itself.
+
 Verify the saved entries instead of trusting configuration text:
 
 ```bash
@@ -114,6 +126,13 @@ claude mcp list
 openclaw mcp doctor ocbrain
 openclaw mcp probe ocbrain
 ```
+
+The dated 2026-07-10 acceptance snapshot used OpenClaw `2026.6.11`, Claude Code
+`2.1.206`, and Codex CLI `0.144.1`. The installed OpenClaw version matched the
+registry version. Codex reported ChatGPT login, Claude reported a connected
+user-scope ocbrain server, and OpenClaw reported a reachable loopback Gateway
+plus the managed ocbrain MCP entry. These are dated observations, not evergreen
+minimum-version claims.
 
 OpenClaw can also host isolated Codex homes below
 `~/.openclaw/agents/<agent>/agent/codex-home`. Their `rollout-*.jsonl` files are
@@ -157,6 +176,8 @@ PYTHONPATH=. uv run --with pytest --with ruff --with-editable . pytest -q
 PYTHONPATH=. uv run --with pytest --with ruff --with-editable . ruff check .
 uv run --with-editable . python -m compileall src tests
 openclaw config validate
+openclaw doctor --lint --json
+openclaw secrets audit --check
 openclaw mcp doctor ocbrain
 openclaw mcp probe ocbrain
 claude mcp list

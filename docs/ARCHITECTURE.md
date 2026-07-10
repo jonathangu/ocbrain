@@ -364,8 +364,10 @@ that key. Verified adapter weights and losses are recorded separately by
 For a later pilot, `--eval-from` reuses the prior prompts, references, and rubric
 byte-for-byte, verifies the original held-out hash, and excludes those same
 source examples from training. The local judge must pass an explicit calibration
-set before the rating helper opens any blind pair; the default gate is 80% across
-at least six cases.
+set against a separate, complete human-label file before the rating helper opens
+any blind pair; the default gate is 80% across at least six cases. Labels require
+named human provenance, and machine-authored winners embedded in the case file
+are ignored. `--calibration-only` verifies the gate without reading blind pairs.
 The pack also writes MLX-LM chat `train.jsonl` plus an optional deterministic
 validation split from eligible SFT and persona rows. DPO remains separate: the
 first local LoRA pilot is supervised chat tuning, while preference training
@@ -487,11 +489,14 @@ later stage assumes a snapshotted, migrated DB.
 - **Watermarks in-transaction.** Each watermark is written in the same
   transaction as the work it covers, so a kill mid-run loses no committed
   progress and re-runs resume cleanly.
-- **Measured writer windows.** Dataset mining commits after 50 mutating units or
-  two seconds, whichever comes first, and records writer-lock wait, total hold,
-  and longest hold. Autolabel commits between source miners and before each FTS
-  attribution. Review commits each processed session and its watermark before
-  lazily parsing the next transcript. The hosted judge and embedding lanes
+- **Measured writer windows.** Dataset mining and post-turn review commit after
+  50 mutating units or two seconds, whichever comes first, and record writer-lock
+  wait, total hold, and longest hold. Autolabel commits between source miners and
+  before each FTS attribution. Review also commits each processed session and its
+  watermark before lazily parsing the next transcript. Dataset redaction,
+  serialization, quality scoring, and dedup reads happen before the writer is
+  acquired; each final example insert commits before the next candidate. The
+  hosted judge and embedding lanes
   commit each egress audit before network I/O and their results after each
   provider batch. Once dataset mining has committed, a WAL above 64 MiB is
   checkpointed with `TRUNCATE`; a blocking reader is reported as `busy` and is

@@ -1,6 +1,6 @@
 # ocbrain
 
-Current release: **v0.3.1**. Licensed under Apache-2.0.
+Current release: **v0.3.2**. Licensed under Apache-2.0.
 
 Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
 runtimes.
@@ -192,13 +192,22 @@ uvx --from 'mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@PIN' \
 PYTHONPATH=src uv run python scripts/grade-pilot-blind.py \
   --pilot-dir "${PILOT}" \
   --calibration data/curation/private-judge-calibration.jsonl \
+  --calibration-labels data/curation/private-human-labels.jsonl \
   --model your-local-grader-model
 ```
 
 The rating helper refuses non-loopback endpoints, then requires at least six
-calibration cases and 80% agreement before it opens the blind pair file. It
-checkpoints each completed rating atomically and never reads the separate A/B
-key. `dataset-pilot-score` is the only step that unblinds results.
+calibration cases and 80% agreement with a separate, complete set of
+human-provenance labels before it opens the blind pair file. Embedded
+machine-authored winners are ignored. Use `--calibration-only` to test the judge
+without reading blind pairs. The helper checkpoints each completed rating
+atomically and never reads the separate A/B key. `dataset-pilot-score` is the
+only step that unblinds results.
+
+The dated July 10 human gate contains eight private operator labels. After the
+judge prompt was aligned to those labels, it passed 7/8 (87.5%); the preserved
+miss prefers a longer answer with reasons over the operator's concise answer
+that needs one reason added. No blind rating was rerun after this calibration.
 
 The dated v0.3.0 second-pilot result is intentionally modest. Against the exact
 same 20-item blind set, the candidate improved from 2 preferences to 7; the
@@ -214,12 +223,15 @@ does not claim training started until that command actually runs.
 Dataset mining also keeps the shared brain responsive. SFT, DPO, and persona
 writes commit after at most 50 mutating units or two seconds, whichever comes
 first, and each stage reports SQLite writer-lock wait, total hold time, and the
-longest hold. After mining has committed, autopilot truncates a WAL larger than
+longest hold. Redaction, serialization, quality scoring, and dedup reads happen
+before the writer transaction; each final example insert commits before the
+next candidate is parsed or scored. After mining has committed, autopilot truncates a WAL larger than
 64 MiB; a live reader produces an honest `busy` result for a later retry.
 Autolabel releases the writer slot between source miners and before every
 expensive FTS attribution query, then batches the fast label-fold updates under
-the same measured bounds. Post-turn review commits each complete session and
-its watermark before the lazy iterator parses the next transcript. Embedding
+the same measured bounds. Post-turn review now applies the same 50-operation or
+two-second limit inside a session, then also commits the session watermark
+before the lazy iterator parses the next transcript. Embedding
 and the hosted judge commit their egress audits before network dispatch, then
 store results in a second per-provider-batch transaction.
 The passive stall watcher also commits findings before optional Telegram paging.

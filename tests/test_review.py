@@ -5,7 +5,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import ocbrain.review as review_module
 from ocbrain.config import load_config
+from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import connect, init_db, upsert_evidence
 from ocbrain.ids import content_hash
 from ocbrain.review import review_session, review_sessions
@@ -52,7 +54,9 @@ def test_settle_gating_skips_recent_session(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1", turns=[Turn("assistant", "did work"), *_tool_turns(5)],
+        "s1",
+        "/p/s1",
+        turns=[Turn("assistant", "did work"), *_tool_turns(5)],
         mtime_ns=time.time_ns(),  # just now -> not settled
     )
     result = review_sessions(conn, [session], cfg)
@@ -76,7 +80,8 @@ def test_user_correction_trigger(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1",
+        "s1",
+        "/p/s1",
         turns=[
             Turn("user", "please build the feature"),
             Turn("assistant", "done, shipped it"),
@@ -97,7 +102,8 @@ def test_user_thanks_trigger(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1",
+        "s1",
+        "/p/s1",
         turns=[Turn("assistant", "here you go"), Turn("user", "thanks, perfect work")],
     )
     review_session(conn, session, cfg)
@@ -124,7 +130,8 @@ def test_error_recovery_trigger(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1",
+        "s1",
+        "/p/s1",
         turns=[
             Turn("assistant", "first attempt"),
             Turn("tool", "boom", is_error=True),
@@ -141,7 +148,8 @@ def test_test_pass_and_fail_signals(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1",
+        "s1",
+        "/p/s1",
         turns=[
             Turn("tool", "12 passed in 0.5s"),
             Turn("tool", "AssertionError: boom", is_error=True),
@@ -157,7 +165,8 @@ def test_signal_dedup_on_rereview(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)
     session = Session(
-        "s1", "/p/s1",
+        "s1",
+        "/p/s1",
         turns=[Turn("assistant", "here you go"), Turn("user", "thanks, perfect")],
     )
     review_session(conn, session, cfg)
@@ -177,9 +186,7 @@ def test_candidate_links_session_evidence(tmp_path: Path) -> None:
         content_hash=content_hash("s1"),
         source_uri="/p/s1",
     )
-    session = Session(
-        "s1", "/p/s1", turns=[Turn("assistant", "working"), *_tool_turns(5)]
-    )
+    session = Session("s1", "/p/s1", turns=[Turn("assistant", "working"), *_tool_turns(5)])
     review_session(conn, session, cfg)
     linked = conn.execute(
         "SELECT COUNT(*) FROM knowledge_evidence WHERE evidence_id=?", (evd,)
@@ -219,5 +226,41 @@ def test_review_releases_writer_before_parsing_next_lazy_session(tmp_path: Path)
 
     result = review_sessions(conn, lazy_sessions(), cfg)
     assert result["changed"] == 2
-    assert result["writer_lock"]["boundary"] == "session"
+    assert result["writer_lock"]["boundary"] == "50 operations/2 seconds/session"
     assert result["writer_lock"]["batches_committed"] == 2
+    assert result["writer_lock"]["batch_max_operations"] == 50
+    assert result["writer_lock"]["batch_max_seconds"] == 2.0
+
+
+def test_review_commits_inside_one_session_at_operation_bound(tmp_path: Path, monkeypatch) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    observed_writer_slots = 0
+
+    class ObservingBatch(DatasetWriteBatch):
+        def operation(self) -> None:
+            nonlocal observed_writer_slots
+            commits_before = self.batches_committed
+            super().operation()
+            if self.batches_committed > commits_before:
+                observer = sqlite3.connect(tmp_path / "ocbrain.sqlite", timeout=0)
+                observer.execute("BEGIN IMMEDIATE")
+                observer.rollback()
+                observer.close()
+                observed_writer_slots += 1
+
+    monkeypatch.setattr(review_module, "DatasetWriteBatch", ObservingBatch)
+    monkeypatch.setattr(review_module, "REVIEW_BATCH_MAX_OPERATIONS", 1)
+    session = Session(
+        "s1",
+        "/p/s1",
+        turns=[Turn("assistant", "done"), *_tool_turns(5)],
+        fingerprint="bounded",
+    )
+
+    result = review_module.review_sessions(conn, [session], cfg)
+
+    assert result["changed"] == 1
+    assert result["writer_lock"]["operations"] >= 3
+    assert result["writer_lock"]["batches_committed"] == result["writer_lock"]["operations"]
+    assert observed_writer_slots == result["writer_lock"]["batches_committed"]
