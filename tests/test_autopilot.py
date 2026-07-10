@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +71,53 @@ def test_full_run_stage_order_and_ledger(tmp_path):
         "SELECT status FROM autopilot_runs WHERE id = ?", (result["run_id"],)
     ).fetchone()
     assert row["status"] == "ok"
+
+
+def test_run_checkpoints_visible_progress_and_clears_deadman(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    observed: dict[str, object] = {}
+
+    def migrate_stage(ctx):
+        return {"action": "migrate", "changed": 0}
+
+    def inspect_after_migrate(ctx):
+        fresh = connect(path)
+        fresh.row_factory = sqlite3.Row
+        row = fresh.execute(
+            "SELECT status, finished_at, stages_json FROM autopilot_runs "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        live = fresh.execute(
+            "SELECT last_heartbeat_at, deadman_due_at FROM loop_liveness "
+            "WHERE loop_id='autopilot' AND run_id='manual'"
+        ).fetchone()
+        observed["status"] = row["status"]
+        observed["finished_at"] = row["finished_at"]
+        observed["stages"] = json.loads(row["stages_json"])
+        observed["heartbeat"] = live["last_heartbeat_at"]
+        observed["due"] = live["deadman_due_at"]
+        fresh.close()
+        return {"action": "maintain", "changed": 0}
+
+    monkeypatch.setitem(autopilot.STAGES, "migrate", migrate_stage)
+    monkeypatch.setitem(autopilot.STAGES, "maintain", inspect_after_migrate)
+    result = autopilot.run_autopilot(conn, cfg, db_path=path, stages=["migrate", "maintain"])
+
+    assert observed["status"] == "running"
+    assert observed["finished_at"] is None
+    assert "migrate" in observed["stages"]
+    assert observed["heartbeat"] is not None and observed["due"] is not None
+    final = conn.execute(
+        "SELECT status, finished_at FROM autopilot_runs WHERE id = ?", (result["run_id"],)
+    ).fetchone()
+    assert final["status"] == "ok" and final["finished_at"] is not None
+    assert (
+        conn.execute(
+            "SELECT deadman_due_at FROM loop_liveness WHERE loop_id='autopilot' AND run_id='manual'"
+        ).fetchone()[0]
+        is None
+    )
 
 
 def test_flock_single_instance(tmp_path):
@@ -153,9 +201,7 @@ def test_stage_time_budget_zero_processes_nothing(tmp_path):
     roots = Path(cfg.review.session_roots[0])
     (roots / "s.jsonl").write_text('{"role":"user","content":"hi"}\n')
 
-    ctx = autopilot.AutopilotContext(
-        conn=conn, cfg=cfg, db_path=path, stage_budget_seconds=0.0
-    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path, stage_budget_seconds=0.0)
     result = autopilot.stage_review(ctx)
     assert result["changed"] == 0
 
@@ -169,9 +215,7 @@ def test_budget_for_resolves_per_stage_override(tmp_path):
         cfg,
         autopilot=dataclasses.replace(cfg.autopilot, stage_budgets={"dataset_mine": 900}),
     )
-    ctx = autopilot.AutopilotContext(
-        conn=conn, cfg=cfg, db_path=path, stage_budget_seconds=30.0
-    )
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path, stage_budget_seconds=30.0)
     assert ctx.budget_for("dataset_mine") == 900.0
     assert ctx.budget_for("tripwires") == 30.0
     assert ctx.budget_for("autolabel") == 30.0
@@ -361,9 +405,7 @@ def test_profile_and_stages_are_mutually_exclusive(tmp_path):
     conn, path = _db(tmp_path)
     cfg = _cfg(tmp_path)
     try:
-        autopilot.run_autopilot(
-            conn, cfg, db_path=path, profile="light", stages=["maintain"]
-        )
+        autopilot.run_autopilot(conn, cfg, db_path=path, profile="light", stages=["maintain"])
     except ValueError as exc:
         assert "profile" in str(exc)
     else:  # pragma: no cover - must raise
@@ -391,18 +433,18 @@ def test_maintain_wires_catalog_archival(tmp_path):
     # Archival is wired in and reports its own sub-result when enabled.
     assert "archive" in result
     assert result["archive"]["action"] == "archive-catalog"
+    assert result["liveness"]["action"] == "liveness-check"
     assert result["changed"] >= 0
 
 
 def test_maintain_skips_archival_when_disabled(tmp_path):
     conn, path = _db(tmp_path)
     base = _cfg(tmp_path)
-    cfg = dataclasses.replace(
-        base, archive=dataclasses.replace(base.archive, enabled=False)
-    )
+    cfg = dataclasses.replace(base, archive=dataclasses.replace(base.archive, enabled=False))
     ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
     result = autopilot.stage_maintain(ctx)
     assert "archive" not in result
+    assert result["liveness"]["action"] == "liveness-check"
 
 
 def test_embed_stage_skipped_on_dry_run(tmp_path):
@@ -495,9 +537,7 @@ def test_excerpt_render_stage_skipped_on_dry_run(tmp_path):
     target = tmp_path / "AGENTS.md"
     cfg = dataclasses.replace(
         base,
-        excerpt_render=dataclasses.replace(
-            base.excerpt_render, targets=[str(target)]
-        ),
+        excerpt_render=dataclasses.replace(base.excerpt_render, targets=[str(target)]),
     )
     ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path, dry_run=True)
     result = autopilot.stage_excerpt_render(ctx)
@@ -515,9 +555,7 @@ def test_excerpt_render_stage_writes_targets_and_is_idempotent(tmp_path):
     target.write_text("# Memory\n\nExisting doctrine line.\n", encoding="utf-8")
     cfg = dataclasses.replace(
         base,
-        excerpt_render=dataclasses.replace(
-            base.excerpt_render, targets=[str(target)]
-        ),
+        excerpt_render=dataclasses.replace(base.excerpt_render, targets=[str(target)]),
     )
     ctx = autopilot.AutopilotContext(conn=conn, cfg=cfg, db_path=path)
 

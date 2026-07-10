@@ -5,6 +5,7 @@ the real tracked tree ever contains a real private identifier or secret."""
 from __future__ import annotations
 
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,15 @@ def test_forbidden_path_matches_data_logs_and_artifacts() -> None:
     assert ps.is_forbidden_tracked_path("logs/autopilot.log")
     assert ps.is_forbidden_tracked_path("exports/train.jsonl")
     assert not ps.is_forbidden_tracked_path("src/ocbrain/cli.py")
+
+
+def test_source_distribution_explicitly_excludes_runtime_private_roots() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    excluded = set(config["tool"]["hatch"]["build"]["exclude"])
+    assert {"/data/**", "/logs/**", "/uv.lock"} <= excluded
+    ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "data/" in ignored and "logs/" in ignored
 
 
 # --- clean tree passes ---------------------------------------------------- #

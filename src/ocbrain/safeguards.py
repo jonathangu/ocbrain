@@ -64,9 +64,7 @@ def _get_watermark(conn: sqlite3.Connection, domain: str, stream: str) -> str | 
     return row["watermark"] if row else None
 
 
-def _set_watermark(
-    conn: sqlite3.Connection, domain: str, stream: str, watermark: str
-) -> None:
+def _set_watermark(conn: sqlite3.Connection, domain: str, stream: str, watermark: str) -> None:
     conn.execute(
         """
         INSERT INTO harvest_watermarks (domain, stream, watermark, updated_at)
@@ -76,6 +74,32 @@ def _set_watermark(
           updated_at = excluded.updated_at
         """,
         (domain, stream, watermark, now_iso()),
+    )
+
+
+def _tripwire_cursor(raw: str | None) -> tuple[str, str]:
+    """Decode the v0.3 composite tripwire cursor.
+
+    Legacy installs stored only ``knowledge.updated_at``. Treat that as the
+    timestamp with an empty id so migration resumes at the first row sharing the
+    timestamp instead of skipping it.
+    """
+    if not raw:
+        return ("", "")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return (raw, "")
+    if not isinstance(value, dict):
+        return (raw, "")
+    return (str(value.get("updated_at") or ""), str(value.get("id") or ""))
+
+
+def _encode_tripwire_cursor(updated_at: str, knowledge_id: str) -> str:
+    return json.dumps(
+        {"id": knowledge_id, "updated_at": updated_at},
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -393,31 +417,29 @@ def run_tripwires(
     """
     quarantine_cfg = _quarantine_cfg(cfg)
     timestamp = now or datetime.now(UTC)
-    deadline = (
-        time.monotonic() + time_budget_seconds
-        if time_budget_seconds is not None
-        else None
-    )
-    watermark = _get_watermark(conn, "tripwires", "knowledge") or ""
+    deadline = time.monotonic() + time_budget_seconds if time_budget_seconds is not None else None
+    watermark_raw = _get_watermark(conn, "tripwires", "knowledge")
+    watermark_at, watermark_id = _tripwire_cursor(watermark_raw)
     rows = conn.execute(
         """
         SELECT *
         FROM knowledge
         WHERE status IN ('candidate', 'current')
           AND quarantine_reason IS NULL
-          AND updated_at > ?
+          AND (
+            updated_at > ?
+            OR (updated_at = ? AND id > ?)
+          )
         ORDER BY updated_at ASC, id ASC
         LIMIT ?
         """,
-        (watermark, limit),
+        (watermark_at, watermark_at, watermark_id, limit),
     ).fetchall()
     details: list[dict[str, Any]] = []
-    max_watermark = watermark
+    processed_at, processed_id = watermark_at, watermark_id
     for row in rows:
         if deadline is not None and time.monotonic() >= deadline:
             break
-        if row["updated_at"] and row["updated_at"] > max_watermark:
-            max_watermark = row["updated_at"]
         for slug, predicate in TRIPWIRES:
             reason = predicate(conn, row, quarantine_cfg, timestamp)
             if reason:
@@ -434,8 +456,16 @@ def run_tripwires(
                 # each quarantine atomic and release the writer before it.
                 conn.commit()
                 break
-    if rows and max_watermark:
-        _set_watermark(conn, "tripwires", "knowledge", max_watermark)
+        # Advance only after every predicate for this row completed. The id
+        # tie-breaker prevents equal-timestamp batches from being skipped.
+        processed_at, processed_id = row["updated_at"], row["id"]
+    if (processed_at, processed_id) != (watermark_at, watermark_id):
+        _set_watermark(
+            conn,
+            "tripwires",
+            "knowledge",
+            _encode_tripwire_cursor(processed_at, processed_id),
+        )
         conn.commit()
     return MaintenanceResult("tripwires", len(details), details)
 
@@ -485,6 +515,8 @@ def auto_decide_compilations(
                 "decision": decision,
             }
         )
-    if details:
-        rebuild_projection(conn)
+    # Always exercise the incremental projection path. When a legacy/current DB
+    # has beliefs but no cursor, a no-proposal compile must still repair it with
+    # one full rebuild; a healthy current cursor makes this a cheap no-op.
+    rebuild_projection(conn)
     return MaintenanceResult("auto-decide", len(details), details)

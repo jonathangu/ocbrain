@@ -26,7 +26,10 @@ every later stage assumes a snapshotted, migrated DB.
 
 Idempotency lives in the stages themselves (watermarks, stable ids, UNIQUE
 constraints); autopilot only sequences them, commits after each success so a
-kill mid-run loses no committed progress, and is safe to run back-to-back.
+kill mid-run loses no committed stage work, and is safe to run back-to-back. A
+``running`` ledger row and profile deadman are committed before the first stage,
+then checkpointed after every stage so an independent stallcheck can distinguish
+a slow cycle from a disappeared one.
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ from ocbrain.fsutil import (
 from ocbrain.ids import stable_id
 from ocbrain.maintenance import (
     archive_unreferenced_catalog,
+    check_loop_liveness,
     heal_conflicts,
     prune_knowledge,
 )
@@ -445,17 +449,22 @@ def stage_excerpt_render(ctx: AutopilotContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Stage 10 — maintain (prune + heal)
+# Stage 10 — maintain (prune + heal + independent liveness observer)
 # --------------------------------------------------------------------------- #
 def stage_maintain(ctx: AutopilotContext) -> dict[str, Any]:
     pruned = prune_knowledge(ctx.conn, now=ctx.now).as_dict()
     healed = heal_conflicts(ctx.conn, now=ctx.now).as_dict()
-    changed = int(pruned["changed"]) + int(healed["changed"])
+    # Stallcheck cannot reliably watch its own death. The independently
+    # scheduled light/heavy autopilot consumes its heartbeat/deadman ledger so a
+    # missing watchdog becomes durable tripwire evidence.
+    liveness = check_loop_liveness(ctx.conn, now=ctx.now).as_dict()
+    changed = int(pruned["changed"]) + int(healed["changed"]) + int(liveness["changed"])
     result: dict[str, Any] = {
         "action": "maintain",
         "changed": changed,
         "prune": pruned,
         "heal": healed,
+        "liveness": liveness,
     }
     # v0.3: sweep never-referenced stale catalog docs out of the working set so
     # the judge + rebuild stop paying for the 101k-file backlog. Reversible
@@ -591,6 +600,7 @@ def run_autopilot(
     with file_lock(lock_path) as acquired:
         if not acquired:
             return {"status": "locked", "stages": {}}
+        profile_key = profile or ("manual" if stages else "full")
         return _run_locked(
             conn,
             cfg,
@@ -600,6 +610,7 @@ def run_autopilot(
             dry_run=dry_run,
             roots=roots,
             repos=repos,
+            profile_key=profile_key,
         )
 
 
@@ -613,6 +624,7 @@ def _run_locked(
     dry_run: bool,
     roots: list[str] | None,
     repos: list[str] | None,
+    profile_key: str,
 ) -> dict[str, Any]:
     ctx = AutopilotContext(
         conn=conn,
@@ -631,6 +643,25 @@ def _run_locked(
     stage_results: dict[str, Any] = {}
     status = "ok"
     run_error: str | None = None
+    deadman_seconds = _profile_deadman_seconds(cfg, profile_key, len(selected))
+
+    if not dry_run:
+        # Commit observability before work begins. A hard kill can no longer
+        # erase the run from history, and the separate stallcheck process has a
+        # durable deadline it can inspect even while this file lock stays held.
+        _write_run_progress_resilient(
+            conn,
+            db_path,
+            run_id=run_id,
+            started_at=started_at,
+            finished_at=None,
+            status="running",
+            stage_results=stage_results,
+            error=None,
+            profile_key=profile_key,
+            deadman_seconds=deadman_seconds,
+            active=True,
+        )
 
     for name in selected:
         stage_fn = STAGES[name]
@@ -661,21 +692,41 @@ def _run_locked(
             if name in ABORT_STAGES:
                 status = "error"
                 run_error = f"{name}: {exc}"
-                break
-            status = "partial"
+            else:
+                status = "partial"
+
+        if not dry_run:
+            _write_run_progress_resilient(
+                conn,
+                db_path,
+                run_id=run_id,
+                started_at=started_at,
+                finished_at=None,
+                status="running",
+                stage_results=stage_results,
+                error=run_error,
+                profile_key=profile_key,
+                deadman_seconds=deadman_seconds,
+                active=True,
+            )
+        if status == "error":
+            break
 
     # compile stage already runs one rebuild internally; nothing extra here.
     finished_at = now_iso()
     if not dry_run:
-        _write_run_ledger_resilient(
+        _write_run_progress_resilient(
             conn,
             db_path,
-            run_id,
-            started_at,
-            finished_at,
-            status,
-            stage_results,
-            run_error,
+            run_id=run_id,
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            stage_results=stage_results,
+            error=run_error,
+            profile_key=profile_key,
+            deadman_seconds=deadman_seconds,
+            active=False,
         )
 
     return {
@@ -726,39 +777,94 @@ def _resolve_stages(stages: list[str] | None) -> list[str]:
     return ordered
 
 
-def _write_run_ledger_resilient(
+def _profile_deadman_seconds(cfg: OcbrainConfig, profile_key: str, stage_count: int) -> int:
+    configured = cfg.autopilot.profile_deadman_seconds.get(profile_key)
+    if configured is not None:
+        return max(60, int(configured))
+    # Custom profiles still get a conservative deadline without requiring a
+    # second config edit. The grace period covers an overlapping scheduler tick.
+    derived = int(cfg.autopilot.stage_budget_seconds) * max(1, stage_count) + 1800
+    return max(3600, derived)
+
+
+def _upsert_autopilot_liveness(
+    conn: sqlite3.Connection,
+    *,
+    profile_key: str,
+    checkpoint_at: str,
+    deadman_seconds: int,
+    active: bool,
+) -> None:
+    checkpoint = datetime.fromisoformat(checkpoint_at.replace("Z", "+00:00"))
+    due_at = (
+        datetime.fromtimestamp(checkpoint.timestamp() + deadman_seconds, tz=UTC).isoformat()
+        if active
+        else None
+    )
+    conn.execute(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        ) VALUES ('autopilot', ?, ?, ?, ?, ?)
+        ON CONFLICT(loop_id, run_id) DO UPDATE SET
+          last_heartbeat_at = excluded.last_heartbeat_at,
+          last_ledger_write_at = excluded.last_ledger_write_at,
+          expected_interval_seconds = excluded.expected_interval_seconds,
+          deadman_due_at = excluded.deadman_due_at
+        """,
+        (profile_key, checkpoint_at, checkpoint_at, deadman_seconds, due_at),
+    )
+
+
+def _write_run_progress_resilient(
     conn: sqlite3.Connection,
     db_path: Path | None,
+    *,
     run_id: str,
     started_at: str,
-    finished_at: str,
+    finished_at: str | None,
     status: str,
     stage_results: dict[str, Any],
     error: str | None,
+    profile_key: str,
+    deadman_seconds: int,
+    active: bool,
 ) -> None:
-    """Write the run ledger durably (spec §4.2 — the run's only durable record).
+    """Checkpoint the run ledger and its deadman in one short transaction.
 
-    The ledger is written after every stage on the shared connection. Because a
+    Progress is written before work and after every stage. Because a
     stage can leave that connection's SQLite handle in a bad state (e.g. a
     ``file is not a database`` from an interrupted/torn snapshot or a poisoned
-    WAL), the ledger write must not be able to both crash the process *and* lose
-    the run record. Try the working connection first; on any :class:`sqlite3.Error`
-    fall back to a fresh short-lived connection to the DB path so the run is
-    still recorded (``INSERT OR REPLACE`` makes the retry idempotent). Only a
-    genuinely unwritable on-disk DB — where the fresh handle also fails — is
-    allowed to propagate.
+    WAL), fall back to a fresh short-lived connection. The ledger row and
+    liveness row commit together, so neither observer can get ahead of the
+    other. Only a genuinely unwritable on-disk DB is allowed to propagate.
     """
+    checkpoint_at = finished_at or now_iso()
+
+    def write(target: sqlite3.Connection) -> None:
+        _write_run_ledger(target, run_id, started_at, finished_at, status, stage_results, error)
+        _upsert_autopilot_liveness(
+            target,
+            profile_key=profile_key,
+            checkpoint_at=checkpoint_at,
+            deadman_seconds=deadman_seconds,
+            active=active,
+        )
+
     try:
-        _write_run_ledger(conn, run_id, started_at, finished_at, status, stage_results, error)
+        write(conn)
         conn.commit()
         return
     except sqlite3.Error:
+        with contextlib.suppress(sqlite3.Error):
+            conn.rollback()
         if db_path is None or str(db_path) == ":memory:":
             raise
     fresh = sqlite3.connect(Path(db_path))
     fresh.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     try:
-        _write_run_ledger(fresh, run_id, started_at, finished_at, status, stage_results, error)
+        write(fresh)
         fresh.commit()
     finally:
         fresh.close()
@@ -768,7 +874,7 @@ def _write_run_ledger(
     conn: sqlite3.Connection,
     run_id: str,
     started_at: str,
-    finished_at: str,
+    finished_at: str | None,
     status: str,
     stage_results: dict[str, Any],
     error: str | None,

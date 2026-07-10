@@ -8,7 +8,7 @@ exhaust for the signature of a parked-and-forgotten turn, records the finding
 into the brain's deadman engine, and sends Jonathan ONE Telegram digest of any
 *new* stalls (deduplicated so a persistent stall pages exactly once).
 
-Three readers feed it:
+Four readers feed it:
 
   READER A (filesystem) — the money reader. Scans subagent workflow dirs for
     ``agent-*.jsonl`` transcripts whose LAST record is an assistant ``end_turn``
@@ -28,6 +28,10 @@ Three readers feed it:
 
   READER C (sqlite, read-only) — ``channel_ingress_events`` that failed with
     ``handler-timeout`` inside the lookback window (dropped inbound work).
+
+  READER D (brain sqlite) — overdue ``loop_liveness`` deadmen, including the
+    autopilot profile heartbeat. This makes the watchdog reciprocal: autopilot
+    maintenance watches stallcheck, and stallcheck watches a stuck autopilot.
 
 Every finding upserts a ``loop_liveness`` row + a ``loop_tripwire`` evidence
 row into the brain DB, so the existing liveness sweep and the weekly review see
@@ -84,9 +88,7 @@ _HOME = Path.home()
 DEFAULT_WORKFLOW_GLOBS: tuple[str, ...] = (
     str(_HOME / ".claude/projects/*/*/subagents/workflows/*/"),
 )
-DEFAULT_TASK_OUTPUT_GLOBS: tuple[str, ...] = (
-    f"/private/tmp/claude-{os.getuid()}/*/*/tasks/",
-)
+DEFAULT_TASK_OUTPUT_GLOBS: tuple[str, ...] = (f"/private/tmp/claude-{os.getuid()}/*/*/tasks/",)
 DEFAULT_RUNNER_DB = str(_HOME / ".openclaw/state/openclaw.sqlite")
 
 # Secondary signal. Case-insensitive REGEX families (not exact substrings), so
@@ -162,8 +164,7 @@ def load_config(config_path: Path | str | None = None) -> StallCheckConfig:
     config over the hard defaults. A missing file yields pure defaults (inert
     pager)."""
     path = Path(
-        config_path
-        or os.environ.get("OCBRAIN_CONFIG", "data/ocbrain.config.json")
+        config_path or os.environ.get("OCBRAIN_CONFIG", "data/ocbrain.config.json")
     ).expanduser()
     raw: dict[str, Any] = {}
     if path.is_file():
@@ -219,9 +220,7 @@ class Finding:
     def fingerprint(self) -> str:
         # Stable across runs for the same stall; changes when the terminal
         # signature changes (a genuinely new stall on the same unit).
-        return stable_id(
-            "stall", self.stall_class, self.unit_id, self.terminal_signature
-        )
+        return stable_id("stall", self.stall_class, self.unit_id, self.terminal_signature)
 
     @property
     def loop_id(self) -> str:
@@ -562,7 +561,7 @@ def scan_runner_task_runs(
     for row in rows:
         last_event = row["last_event_at"] or now_ms
         age = max(0.0, (now_ms - last_event) / 1000.0)
-        note = (row["progress_summary"] or row["error"] or row["label"] or row["task"] or "")
+        note = row["progress_summary"] or row["error"] or row["label"] or row["task"] or ""
         findings.append(
             Finding(
                 stall_class="task_run_lost" if row["status"] == "lost" else "task_run_stale",
@@ -614,10 +613,91 @@ def scan_ingress_timeouts(
     return findings
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def scan_brain_deadmans(brain: sqlite3.Connection, now: datetime) -> list[Finding]:
+    """READER D — overdue producer heartbeats in the shared brain ledger.
+
+    Rows created *by* stall findings use a ``stall/`` loop id and are excluded,
+    otherwise the observer would recursively report its own reports. A stable
+    state hash changes only after the producer makes progress, so one stuck
+    run pages once while a later, genuinely new stall on the same profile can
+    page again.
+    """
+    findings: list[Finding] = []
+    rows = brain.execute(
+        """
+        SELECT loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+               deadman_due_at
+        FROM loop_liveness
+        WHERE deadman_due_at IS NOT NULL
+          AND loop_id NOT LIKE 'stall/%'
+        ORDER BY deadman_due_at, loop_id, run_id
+        """
+    ).fetchall()
+    for row in rows:
+        due_at = _parse_iso(row["deadman_due_at"])
+        if due_at is None or due_at > now:
+            continue
+        heartbeat = _parse_iso(row["last_heartbeat_at"])
+        ledger_write = _parse_iso(row["last_ledger_write_at"])
+        heartbeat_stale = heartbeat is None or heartbeat <= due_at
+        ledger_stale = ledger_write is None or ledger_write <= due_at
+        if not heartbeat_stale and not ledger_stale:
+            continue
+        loop_id = str(row["loop_id"])
+        run_id = str(row["run_id"] or "unknown-run")
+        state = json.dumps(
+            {
+                "loop_id": loop_id,
+                "run_id": run_id,
+                "heartbeat": row["last_heartbeat_at"],
+                "ledger": row["last_ledger_write_at"],
+            },
+            sort_keys=True,
+        )
+        stale_parts = []
+        if heartbeat_stale:
+            stale_parts.append("heartbeat")
+        if ledger_stale:
+            stale_parts.append("ledger")
+        findings.append(
+            Finding(
+                stall_class="loop_deadman",
+                unit_id=f"{loop_id}/{run_id}",
+                terminal_signature=f"deadman:{content_hash(state)[:16]}",
+                snippet=(
+                    f"{loop_id} {run_id} crossed its deadman with "
+                    f"{' and '.join(stale_parts)} progress stale"
+                ),
+                artifact_path=f"brain:loop_liveness/{loop_id}/{run_id}",
+                age_seconds=max(0.0, (now - due_at).total_seconds()),
+                occurred_at=due_at.isoformat(),
+            )
+        )
+    return findings
+
+
 # --- Brain writes: deadman engine + pager ledger -------------------------------
 def open_brain(path: Path | str) -> sqlite3.Connection:
     conn = connect(Path(path))
     conn.execute(f"PRAGMA busy_timeout={BRAIN_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def open_brain_ro(path: Path | str) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{Path(path).expanduser()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -658,6 +738,8 @@ CREATE TABLE IF NOT EXISTS stall_pages (
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
   paged_at TEXT,
+  retired_at TEXT,
+  retire_reason TEXT,
   run_count INTEGER NOT NULL DEFAULT 1
 );
 """
@@ -667,6 +749,11 @@ _FIRSTRUN_MARKER = "__firstrun__"
 
 def ensure_stall_pages(conn: sqlite3.Connection) -> None:
     conn.executescript(STALL_PAGES_SCHEMA)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(stall_pages)")}
+    if "retired_at" not in columns:
+        conn.execute("ALTER TABLE stall_pages ADD COLUMN retired_at TEXT")
+    if "retire_reason" not in columns:
+        conn.execute("ALTER TABLE stall_pages ADD COLUMN retire_reason TEXT")
 
 
 def is_first_run(conn: sqlite3.Connection) -> bool:
@@ -701,19 +788,46 @@ def already_paged(conn: sqlite3.Connection, fingerprint: str) -> bool:
     return row is not None
 
 
+def already_handled(conn: sqlite3.Connection, fingerprint: str) -> bool:
+    """True when a finding was delivered or deliberately retired.
+
+    Old (> backlog window) findings discovered after bootstrap are not paged,
+    but they must not remain "new" forever and rewrite their ledger every 15
+    minutes. Failed/disabled delivery still has both fields NULL and remains
+    eligible for retry.
+    """
+    row = conn.execute(
+        """
+        SELECT 1 FROM stall_pages
+        WHERE fingerprint = ?
+          AND (paged_at IS NOT NULL OR retired_at IS NOT NULL)
+        LIMIT 1
+        """,
+        (fingerprint,),
+    ).fetchone()
+    return row is not None
+
+
 def record_page(
-    conn: sqlite3.Connection, finding: Finding, now: datetime, *, paged: bool
+    conn: sqlite3.Connection,
+    finding: Finding,
+    now: datetime,
+    *,
+    paged: bool,
+    retire_reason: str | None = None,
 ) -> None:
     stamp = now.isoformat()
     conn.execute(
         """
         INSERT INTO stall_pages (
           fingerprint, stall_class, unit_id, terminal_signature,
-          first_seen_at, last_seen_at, paged_at, run_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+          first_seen_at, last_seen_at, paged_at, retired_at, retire_reason, run_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(fingerprint) DO UPDATE SET
           last_seen_at = excluded.last_seen_at,
           paged_at = COALESCE(stall_pages.paged_at, excluded.paged_at),
+          retired_at = COALESCE(stall_pages.retired_at, excluded.retired_at),
+          retire_reason = COALESCE(stall_pages.retire_reason, excluded.retire_reason),
           run_count = stall_pages.run_count + 1
         """,
         (
@@ -724,6 +838,8 @@ def record_page(
             stamp,
             stamp,
             stamp if paged else None,
+            stamp if retire_reason else None,
+            retire_reason,
         ),
     )
 
@@ -766,8 +882,7 @@ def feed_deadman(conn: sqlite3.Connection, finding: Finding, now: datetime) -> s
         source_type="loop_tripwire",
         source_runtime="ocbrain-stallcheck",
         source_uri=(
-            f"ocbrain://stall/{finding.stall_class}/{finding.unit_id}"
-            f"/{finding.terminal_signature}"
+            f"ocbrain://stall/{finding.stall_class}/{finding.unit_id}/{finding.terminal_signature}"
         ),
         content_hash=content_hash(body),
         claim=f"Stall detected: {finding.stall_class} {finding.unit_id} — {finding.snippet}",
@@ -815,12 +930,7 @@ def read_bot_token(openclaw_json: str, account: str) -> str | None:
         data = json.loads(Path(openclaw_json).expanduser().read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    account_cfg = (
-        data.get("channels", {})
-        .get("telegram", {})
-        .get("accounts", {})
-        .get(account, {})
-    )
+    account_cfg = data.get("channels", {}).get("telegram", {}).get("accounts", {}).get(account, {})
     token = account_cfg.get("botToken")
     return token or None
 
@@ -897,6 +1007,7 @@ class RunReport:
     findings: list[Finding] = field(default_factory=list)
     new_findings: list[Finding] = field(default_factory=list)
     paged: list[Finding] = field(default_factory=list)
+    retired: list[Finding] = field(default_factory=list)
     first_run: bool = False
     page_status: int | None = None
     evidence_ids: list[str] = field(default_factory=list)
@@ -914,6 +1025,7 @@ def collect_findings(
     now: datetime,
     *,
     runner: sqlite3.Connection | None = None,
+    brain: sqlite3.Connection | None = None,
 ) -> list[Finding]:
     findings: list[Finding] = []
     findings.extend(scan_workflow_stalls(cfg, now))
@@ -921,6 +1033,8 @@ def collect_findings(
     if runner is not None:
         findings.extend(scan_runner_task_runs(runner, cfg, now))
         findings.extend(scan_ingress_timeouts(runner, cfg, now))
+    if brain is not None:
+        findings.extend(scan_brain_deadmans(brain, now))
     # De-dup within one run by fingerprint (a unit can only be found once).
     unique: dict[str, Finding] = {}
     for f in findings:
@@ -944,20 +1058,18 @@ def run(
     first_run = is_first_run(brain)
     report = RunReport(first_run=first_run)
 
-    findings = collect_findings(cfg, now, runner=runner)
+    findings = collect_findings(cfg, now, runner=runner, brain=brain)
     report.findings = findings
 
     # Feed the deadman engine for EVERY finding (idempotent), every run.
     for finding in findings:
-        report.evidence_ids.append(
-            _write_with_lock_retry(brain, feed_deadman, brain, finding, now)
-        )
+        report.evidence_ids.append(_write_with_lock_retry(brain, feed_deadman, brain, finding, now))
     # Deadman evidence is durable before an optional Telegram request, and the
     # pager's network latency never owns SQLite's writer slot.
     _write_with_lock_retry(brain, brain.commit)
 
     backlog_cutoff = cfg.terminal_backlog_seconds
-    new_findings = [f for f in findings if not already_paged(brain, f.fingerprint)]
+    new_findings = [f for f in findings if not already_handled(brain, f.fingerprint)]
     report.new_findings = new_findings
 
     if first_run:
@@ -966,6 +1078,7 @@ def run(
     else:
         # Steady state: page only new findings that are not already terminal-and-old.
         candidates = [f for f in new_findings if f.age_seconds <= backlog_cutoff]
+        report.retired = [f for f in new_findings if f.age_seconds > backlog_cutoff]
     candidates.sort(key=lambda f: f.age_seconds, reverse=True)
     # Bound each run to one digest of at most max_pages_per_run stalls; the rest
     # remain un-paged (paged_at NULL) and ride the next cycle.
@@ -977,9 +1090,7 @@ def run(
     pager_configured = bool(cfg.pager_chat_id and cfg.pager_openclaw_json)
     send_attempted = False
     if to_page and send:
-        message, included = build_digest_message(
-            to_page, prefix=message_prefix, backlog=first_run
-        )
+        message, included = build_digest_message(to_page, prefix=message_prefix, backlog=first_run)
         send_attempted = pager_configured
         report.page_status = send_telegram(cfg, message)
         delivered = report.page_status is not None and 200 <= report.page_status < 300
@@ -988,9 +1099,18 @@ def run(
 
     # Ledger every new finding so run_count/last_seen advance; stamp paged_at ONLY
     # on genuine delivery, so an undelivered stall stays eligible for the next run.
+    retired_fps = {finding.fingerprint for finding in report.retired}
     for finding in new_findings:
         _write_with_lock_retry(
-            brain, record_page, brain, finding, now, paged=finding.fingerprint in delivered_fps
+            brain,
+            record_page,
+            brain,
+            finding,
+            now,
+            paged=finding.fingerprint in delivered_fps,
+            retire_reason=(
+                "outside_backlog_window" if finding.fingerprint in retired_fps else None
+            ),
         )
 
     _write_with_lock_retry(brain, upsert_self_heartbeat, brain, cfg, now)
@@ -1017,9 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="prefix prepended to the Telegram digest (e.g. a test marker)",
     )
-    parser.add_argument(
-        "--no-send", action="store_true", help="scan + record but do not page"
-    )
+    parser.add_argument("--no-send", action="store_true", help="scan + record but do not page")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1032,15 +1150,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         runner = None
+        brain = None
         try:
             runner = open_runner_ro(cfg.runner_db)
         except sqlite3.Error:
             runner = None
+        if args.brain_db:
+            try:
+                brain = open_brain_ro(args.brain_db)
+            except sqlite3.Error:
+                brain = None
         try:
-            findings = collect_findings(cfg, now, runner=runner)
+            findings = collect_findings(cfg, now, runner=runner, brain=brain)
         finally:
             if runner is not None:
                 runner.close()
+            if brain is not None:
+                brain.close()
         by_class: dict[str, int] = {}
         for f in findings:
             by_class[f.stall_class] = by_class.get(f.stall_class, 0) + 1
@@ -1102,6 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"[stallcheck] {now.isoformat()} findings={len(report.findings)} "
         f"new={len(report.new_findings)} paged={len(report.paged)} "
+        f"retired={len(report.retired)} "
         f"first_run={report.first_run} page_status={status} counts={report.counts}"
     )
     return 0

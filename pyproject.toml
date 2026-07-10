@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain"
-version = "0.3.2"
+version = "0.3.3"
 description = "Lightweight shared memory for ChatGPT/Codex, Claude Code, and OpenClaw"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,20 @@ brain-loop-ingest = "ocbrain.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.hatch.build]
+# Hatch's source archive may otherwise include untracked worktree files. Keep
+# every private/runtime surface out explicitly; .gitignore is defense in depth,
+# not the package boundary.
+exclude = [
+  "/data/**",
+  "/logs/**",
+  "/dist/**",
+  "/.venv/**",
+  "/.pytest_cache/**",
+  "/.ruff_cache/**",
+  "/uv.lock",
+]
 
 [tool.ruff]
 line-length = 100

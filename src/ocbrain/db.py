@@ -115,6 +115,8 @@ CREATE TABLE IF NOT EXISTS retrieval_uses (
   note TEXT,
   served_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_retrieval_uses_knowledge_outcome_served
+  ON retrieval_uses(knowledge_id, outcome, served_at);
 
 CREATE TABLE IF NOT EXISTS loop_liveness (
   loop_id TEXT NOT NULL,
@@ -165,6 +167,9 @@ CREATE TABLE IF NOT EXISTS brain_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_brain_events_kind_ts ON brain_events(kind, ts);
+CREATE INDEX IF NOT EXISTS idx_brain_events_correction_target
+  ON brain_events(json_extract(body_json, '$.target_id'))
+  WHERE kind = 'correction_recorded';
 
 CREATE TABLE IF NOT EXISTS current_beliefs (
   belief_id TEXT PRIMARY KEY,
@@ -187,6 +192,8 @@ CREATE TABLE IF NOT EXISTS current_beliefs (
 
 CREATE INDEX IF NOT EXISTS idx_current_beliefs_scope
   ON current_beliefs(scope_type, scope_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_updated_id ON knowledge(updated_at, id);
 
 CREATE TABLE IF NOT EXISTS egress_audits (
   id TEXT PRIMARY KEY,
@@ -442,9 +449,7 @@ def _rebuild_memory_view(conn: sqlite3.Connection) -> bool:
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'memory'"
     ).fetchone()
-    if row is not None and _normalized_sql(row["sql"] or "") == _normalized_sql(
-        _MEMORY_VIEW_SQL
-    ):
+    if row is not None and _normalized_sql(row["sql"] or "") == _normalized_sql(_MEMORY_VIEW_SQL):
         return False
     conn.execute("DROP VIEW IF EXISTS memory")
     conn.execute(_MEMORY_VIEW_SQL)
@@ -460,6 +465,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     the additive v0.2 columns and rebuild the quarantine-aware memory view.
     """
     _migrate_retrieval_uses(conn)
+    _repair_orphan_retrieval_uses(conn)
     for column, decl in _V2_KNOWLEDGE_COLUMNS:
         _ensure_column(conn, "knowledge", column, decl)
     for column, decl in _V3_KNOWLEDGE_COLUMNS:
@@ -471,8 +477,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     for column, decl in _V4_DATASET_EXPORT_COLUMNS:
         _ensure_column(conn, "dataset_exports", column, decl)
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_dsx_grade "
-        "ON dataset_examples(dataset, grade_score)"
+        "CREATE INDEX IF NOT EXISTS idx_dsx_grade ON dataset_examples(dataset, grade_score)"
     )
     _rebuild_memory_view(conn)
 
@@ -532,22 +537,14 @@ def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list
     else:
         outcome_expr = "'unknown'"
 
-    # knowledge_id: prefer an existing knowledge_id, else the legacy
-    # artifact_or_candidate_id, else NULL.
-    knowledge_sources = [
-        col for col in ("knowledge_id", "artifact_or_candidate_id") if col in source_cols
-    ]
-    if not knowledge_sources:
-        knowledge_expr = "NULL"
-    elif len(knowledge_sources) == 1:
-        knowledge_expr = knowledge_sources[0]
-    else:
-        knowledge_expr = f"COALESCE({', '.join(knowledge_sources)})"
+    # ``artifact_or_candidate_id`` was polymorphic legacy provenance, not a
+    # canonical knowledge foreign key. Never copy it into knowledge_id: doing so
+    # creates FK violations for old candidate/event ids. A genuinely canonical
+    # knowledge_id is preserved here and validated after the rebuild.
+    knowledge_expr = "knowledge_id" if "knowledge_id" in source_cols else "NULL"
 
     # served_to_runtime: prefer canonical served_to_runtime, else legacy runtime.
-    runtime_sources = [
-        col for col in ("served_to_runtime", "runtime") if col in source_cols
-    ]
+    runtime_sources = [col for col in ("served_to_runtime", "runtime") if col in source_cols]
     if not runtime_sources:
         runtime_expr = "NULL"
     elif len(runtime_sources) == 1:
@@ -557,9 +554,7 @@ def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list
 
     # served_at is NOT NULL in canonical; backfill from legacy created_at (NOT NULL
     # in legacy) whenever served_at is missing or null.
-    served_at_sources = [
-        col for col in ("served_at", "created_at") if col in source_cols
-    ]
+    served_at_sources = [col for col in ("served_at", "created_at") if col in source_cols]
     if not served_at_sources:
         served_at_expr = "NULL"
     elif len(served_at_sources) == 1:
@@ -569,6 +564,14 @@ def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list
 
     def passthrough(col: str) -> str:
         return col if col in source_cols else "NULL"
+
+    # Preserve the old polymorphic id as explicit provenance rather than losing
+    # it or pretending it references knowledge. task_ref is the canonical free-
+    # form provenance slot and remains queryable after migration.
+    task_ref_expr = passthrough("task_ref")
+    if "artifact_or_candidate_id" in source_cols:
+        legacy_ref = "'legacy-object:' || artifact_or_candidate_id"
+        task_ref_expr = f"COALESCE({task_ref_expr}, {legacy_ref})"
 
     target_columns = [
         "id",
@@ -585,7 +588,7 @@ def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list
         "id",
         knowledge_expr,
         runtime_expr,
-        passthrough("task_ref"),
+        task_ref_expr,
         passthrough("affected_decision"),
         passthrough("corrected"),
         outcome_expr,
@@ -593,6 +596,36 @@ def _retrieval_uses_copy_columns(source_cols: set[str]) -> tuple[list[str], list
         served_at_expr,
     ]
     return target_columns, source_exprs
+
+
+def _repair_orphan_retrieval_uses(conn: sqlite3.Connection) -> int:
+    """Repair canonical rows whose optional knowledge FK points nowhere.
+
+    Five pre-v0.2 rows in the live database carried candidate/event ids through
+    the legacy migration. Preserve that value in ``task_ref`` and clear the
+    invalid optional FK; no retrieval-use row is deleted.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, knowledge_id
+        FROM retrieval_uses
+        WHERE knowledge_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM knowledge WHERE knowledge.id = retrieval_uses.knowledge_id
+          )
+        """
+    ).fetchall()
+    for row in rows:
+        conn.execute(
+            """
+            UPDATE retrieval_uses
+            SET task_ref = COALESCE(task_ref, 'legacy-object:' || knowledge_id),
+                knowledge_id = NULL
+            WHERE id = ?
+            """,
+            (row["id"],),
+        )
+    return len(rows)
 
 
 def _migrate_retrieval_uses(conn: sqlite3.Connection) -> None:
@@ -688,6 +721,10 @@ def upsert_evidence(
     occurred_at: str | None = None,
 ) -> str:
     evidence_id = stable_id("evd", source_uri or "", content_hash)
+    evidence_existed = (
+        conn.execute("SELECT 1 FROM evidence WHERE id = ? LIMIT 1", (evidence_id,)).fetchone()
+        is not None
+    )
     conn.execute(
         """
         INSERT INTO evidence (
@@ -732,13 +769,12 @@ def upsert_evidence(
         claim[:160],
         claim,
         source_uri or artifact_uri or evidence_id,
+        replace=evidence_existed,
     )
     return evidence_id
 
 
-def _record_clobber_refused(
-    conn: sqlite3.Connection, knowledge_id: str, *, actor: str
-) -> str:
+def _record_clobber_refused(conn: sqlite3.Connection, knowledge_id: str, *, actor: str) -> str:
     """Persist a neutral ``clobber_refused`` signal breadcrumb (spec §5.1-2, §5.2).
 
     Uses the same stable-id recipe as the autolabel lane's ``record_signal`` so a
@@ -804,14 +840,8 @@ def upsert_knowledge(
     # Human-provenance no-clobber guard (spec §5.1-2): a non-human writer may not
     # overwrite a row an actual human authored. Record an audit breadcrumb and
     # leave the existing row untouched.
-    existing = conn.execute(
-        "SELECT origin FROM knowledge WHERE id = ?", (knowledge_id,)
-    ).fetchone()
-    if (
-        existing is not None
-        and existing["origin"] == "human"
-        and not actor.startswith("human")
-    ):
+    existing = conn.execute("SELECT origin FROM knowledge WHERE id = ?", (knowledge_id,)).fetchone()
+    if existing is not None and existing["origin"] == "human" and not actor.startswith("human"):
         _record_clobber_refused(conn, knowledge_id, actor=actor)
         return knowledge_id
 
@@ -913,6 +943,7 @@ def upsert_knowledge(
             body_uri=body_uri,
         ),
         body_uri or knowledge_id,
+        replace=existing is not None,
     )
     return knowledge_id
 
@@ -992,8 +1023,15 @@ def upsert_search_index(
     title: str,
     body: str,
     path: str,
+    *,
+    replace: bool = True,
 ) -> None:
-    conn.execute("DELETE FROM search_index WHERE doc_id = ?", (doc_id,))
+    # FTS5's UNINDEXED doc_id cannot support a normal lookup index. Avoid an
+    # O(all FTS rows) DELETE when the parent row is new; this is the hot path for
+    # harvested evidence and safeguard tripwires. Existing parents still replace
+    # their one index row so updates remain exact.
+    if replace:
+        conn.execute("DELETE FROM search_index WHERE doc_id = ?", (doc_id,))
     conn.execute(
         "INSERT INTO search_index (doc_id, kind, title, body, path) VALUES (?, ?, ?, ?, ?)",
         (doc_id, kind, title, body, path),
@@ -1033,16 +1071,12 @@ def search(
         clauses.append("knowledge.status = ?")
         params.append(filters["status"])
     if filters.get("loop_id"):
-        clauses.append(
-            "(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)"
-        )
-        needle = f'%\"loop_id\": \"{filters["loop_id"]}\"%'
+        clauses.append("(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)")
+        needle = f'%"loop_id": "{filters["loop_id"]}"%'
         params.extend([needle, needle])
     if filters.get("family"):
-        clauses.append(
-            "(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)"
-        )
-        needle = f'%\"family\": \"{filters["family"]}\"%'
+        clauses.append("(knowledge.loop_tags LIKE ? OR evidence.loop_tags LIKE ?)")
+        needle = f'%"family": "{filters["family"]}"%'
         params.extend([needle, needle])
     params.append(limit)
     return list(
@@ -1058,7 +1092,7 @@ def search(
             FROM search_index
             LEFT JOIN knowledge ON knowledge.id = search_index.doc_id
             LEFT JOIN evidence ON evidence.id = search_index.doc_id
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY rank
             LIMIT ?
             """,
@@ -1137,7 +1171,7 @@ def list_current_knowledge(
             f"""
             SELECT *
             FROM knowledge
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY
               inject DESC,
               COALESCE(promote_score, -1) DESC,
@@ -1207,7 +1241,7 @@ def get_current_doc(
         f"""
         SELECT *
         FROM knowledge
-        WHERE {' AND '.join(clauses)}
+        WHERE {" AND ".join(clauses)}
         ORDER BY updated_at DESC
         LIMIT 1
         """,

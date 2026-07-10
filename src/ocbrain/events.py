@@ -340,9 +340,7 @@ def _ensure_proposal_loaded(
 
 
 def _read_projection_cursor(conn: sqlite3.Connection) -> int | None:
-    row = conn.execute(
-        "SELECT last_event_rowid FROM projection_cursor WHERE id = 1"
-    ).fetchone()
+    row = conn.execute("SELECT last_event_rowid FROM projection_cursor WHERE id = 1").fetchone()
     if row is None:
         return None
     return row["last_event_rowid"]
@@ -466,9 +464,7 @@ def replace_projection(conn: sqlite3.Connection, projected: dict[str, dict[str, 
         _write_belief_row(conn, belief_id, row)
 
 
-def _write_belief_row(
-    conn: sqlite3.Connection, belief_id: str, row: dict[str, Any]
-) -> None:
+def _write_belief_row(conn: sqlite3.Connection, belief_id: str, row: dict[str, Any]) -> None:
     """Serialize one folded belief into ``current_beliefs``.
 
     Single source of truth for the row encoding so the full rebuild and the
@@ -537,19 +533,28 @@ def iter_events(conn: sqlite3.Connection, *, at_ts: str | None = None):
 
 
 def hard_blocked_belief(conn: sqlite3.Connection, belief_id: str) -> bool:
-    for row in iter_events(conn):
-        if row["kind"] != "correction_recorded":
-            continue
-        body = json.loads(row["body_json"])
-        if body.get("target_layer") not in {"knowledge", "belief"}:
-            continue
-        if body.get("target_id") != belief_id:
-            continue
-        if not body.get("hard"):
-            continue
-        if body.get("op") in {"mark_wrong", "retract", "demote"}:
-            return True
-    return False
+    """Return whether a hard correction blocks this belief/knowledge id.
+
+    This used to deserialize the entire append-only event log for every lookup.
+    Tripwire review calls it once per knowledge row, turning a 300k-event brain
+    into an O(rows × events) scan that exhausted every five-minute light-cycle
+    budget. Keep the exact semantics, but let SQLite use the expression index on
+    correction target ids.
+    """
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM brain_events
+        WHERE kind = 'correction_recorded'
+          AND json_extract(body_json, '$.target_id') = ?
+          AND json_extract(body_json, '$.target_layer') IN ('knowledge', 'belief')
+          AND json_extract(body_json, '$.hard') = 1
+          AND json_extract(body_json, '$.op') IN ('mark_wrong', 'retract', 'demote')
+        LIMIT 1
+        """,
+        (belief_id,),
+    ).fetchone()
+    return row is not None
 
 
 def get_current_belief(conn: sqlite3.Connection, belief_id: str) -> dict[str, Any] | None:
@@ -593,9 +598,7 @@ def get_current_belief(conn: sqlite3.Connection, belief_id: str) -> dict[str, An
     }
 
 
-def evidence_provenance(
-    conn: sqlite3.Connection, evidence_ids: list[str]
-) -> list[dict[str, Any]]:
+def evidence_provenance(conn: sqlite3.Connection, evidence_ids: list[str]) -> list[dict[str, Any]]:
     if not evidence_ids:
         return []
     wanted = set(evidence_ids)
@@ -716,10 +719,7 @@ def approval_packet(
     context = context or ScopeContext()
     prefix = cli_prefix or ["ocbrain"]
     pending = [proposal for proposal in proposals if proposal["status"] == "pending"]
-    items = [
-        approval_packet_item(proposal, actor=actor, cli_prefix=prefix)
-        for proposal in pending
-    ]
+    items = [approval_packet_item(proposal, actor=actor, cli_prefix=prefix) for proposal in pending]
     return {
         "channel": "telegram",
         "send_performed": False,
@@ -871,8 +871,7 @@ def quiet_loop_surface(
         {
             "name": "has_useful_write",
             "passed": any(
-                event_counts.get(kind, 0)
-                for kind in ("evidence_recorded", "compilation_decided")
+                event_counts.get(kind, 0) for kind in ("evidence_recorded", "compilation_decided")
             ),
             "observed": {
                 "evidence_recorded": event_counts.get("evidence_recorded", 0),

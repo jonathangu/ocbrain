@@ -8,6 +8,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# Runtime scheduler output is private operational state, never source.
+logs/
 data/*.sqlite
 data/*.sqlite-*
 # Never commit anything under data/ (live DB, snapshots, local config, exported datasets)

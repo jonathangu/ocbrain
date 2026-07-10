@@ -123,7 +123,8 @@ def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
     rows = {
         row["id"]: row
         for row in conn.execute(
-            "SELECT id, knowledge_id, served_to_runtime, outcome, served_at FROM retrieval_uses"
+            "SELECT id, knowledge_id, served_to_runtime, task_ref, outcome, served_at "
+            "FROM retrieval_uses"
         )
     }
     # All rows preserved.
@@ -131,9 +132,11 @@ def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
     # served_at backfilled from created_at; served_to_runtime backfilled from runtime.
     assert rows["ret_legacy_1"]["served_at"] == "2026-06-01T00:00:00+00:00"
     assert rows["ret_legacy_1"]["served_to_runtime"] == "codex"
-    # knowledge_id backfilled from artifact_or_candidate_id.
-    assert rows["ret_legacy_1"]["knowledge_id"] == "cand_1"
-    assert rows["ret_legacy_3"]["knowledge_id"] == "cand_3"
+    # A polymorphic legacy candidate/event id is provenance, not a knowledge FK.
+    assert rows["ret_legacy_1"]["knowledge_id"] is None
+    assert rows["ret_legacy_3"]["knowledge_id"] is None
+    assert rows["ret_legacy_1"]["task_ref"] == "legacy-object:cand_1"
+    assert rows["ret_legacy_3"]["task_ref"] == "legacy-object:cand_3"
     # served_at backfilled even when the legacy served_at column was NULL.
     assert rows["ret_legacy_3"]["served_at"] == "2026-06-03T00:00:00+00:00"
     # Valid outcomes are preserved verbatim.
@@ -141,6 +144,7 @@ def test_init_db_migrates_legacy_retrieval_uses(tmp_path: Path) -> None:
     assert rows["ret_legacy_2"]["outcome"] == "helpful"
     # The invalid 'included' outcome is sanitized to 'unknown' (not dropped).
     assert rows["ret_legacy_3"]["outcome"] == "unknown"
+    assert conn.execute("SELECT COUNT(*) FROM pragma_foreign_key_check").fetchone()[0] == 0
 
     # The exact path that was failing on legacy DBs now succeeds.
     log_retrieval_use(conn, None, runtime="mcp", task_ref="brain.digest", outcome="served")
@@ -179,8 +183,7 @@ def test_init_db_recovers_half_migrated_retrieval_uses(tmp_path: Path) -> None:
     init_db(conn)
 
     names = {
-        row["name"]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     # The stray table is dropped after recovery.
     assert "retrieval_uses_legacy" not in names
@@ -189,24 +192,50 @@ def test_init_db_recovers_half_migrated_retrieval_uses(tmp_path: Path) -> None:
     rows = {
         row["id"]: row
         for row in conn.execute(
-            "SELECT id, knowledge_id, served_to_runtime, outcome, served_at FROM retrieval_uses"
+            "SELECT id, knowledge_id, served_to_runtime, task_ref, outcome, served_at "
+            "FROM retrieval_uses"
         )
     }
     # Rows recovered into the canonical table, with sanitization applied.
     assert set(rows) == {"ret_stray_1", "ret_stray_2"}
     assert rows["ret_stray_1"]["outcome"] == "served"
     assert rows["ret_stray_2"]["outcome"] == "unknown"
-    assert rows["ret_stray_1"]["knowledge_id"] == "cand_1"
+    assert rows["ret_stray_1"]["knowledge_id"] is None
+    assert rows["ret_stray_1"]["task_ref"] == "legacy-object:cand_1"
     assert rows["ret_stray_1"]["served_at"] == "2026-06-01T00:00:00+00:00"
+    assert conn.execute("SELECT COUNT(*) FROM pragma_foreign_key_check").fetchone()[0] == 0
 
     # Idempotent: a second init_db neither re-creates the stray table nor dupes rows.
     init_db(conn)
     assert conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0] == 2
     names_again = {
-        row["name"]
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     assert "retrieval_uses_legacy" not in names_again
+
+
+def test_init_db_repairs_orphaned_canonical_retrieval_fk(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute(
+        """
+        INSERT INTO retrieval_uses (id, knowledge_id, outcome, served_at)
+        VALUES ('ret_orphan', 'evt_not_knowledge', 'served', '2026-06-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=ON")
+    assert conn.execute("SELECT COUNT(*) FROM pragma_foreign_key_check").fetchone()[0] == 1
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT knowledge_id, task_ref FROM retrieval_uses WHERE id='ret_orphan'"
+    ).fetchone()
+    assert row["knowledge_id"] is None
+    assert row["task_ref"] == "legacy-object:evt_not_knowledge"
+    assert conn.execute("SELECT COUNT(*) FROM pragma_foreign_key_check").fetchone()[0] == 0
 
 
 def test_value_knowledge_requires_exactly_one_typed_value(tmp_path: Path) -> None:
@@ -280,9 +309,39 @@ def test_identity_spine_dedupes_value_across_runtime_evidence(tmp_path: Path) ->
     assert conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0] == 1
 
 
-def test_import_memory_makes_markdown_searchable_and_digestible(
-    tmp_path: Path, capsys
+def test_new_fts_rows_skip_replace_scan_but_existing_rows_replace_exactly(
+    tmp_path: Path,
 ) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="test",
+        source_uri="test://one",
+        content_hash="same-content",
+        claim="first searchable claim",
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM search_index WHERE doc_id=?", (evidence_id,)).fetchone()[
+            0
+        ]
+        == 1
+    )
+
+    same_id = upsert_evidence(
+        conn,
+        source_type="test",
+        source_uri="test://one",
+        content_hash="same-content",
+        claim="updated searchable claim",
+    )
+    assert same_id == evidence_id
+    rows = conn.execute("SELECT body FROM search_index WHERE doc_id=?", (evidence_id,)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["body"] == "updated searchable claim"
+
+
+def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     memory_path = tmp_path / "memory" / "2026-06-28.md"
     memory_path.parent.mkdir()
@@ -345,9 +404,7 @@ def test_import_memory_makes_markdown_searchable_and_digestible(
     assert digest_payload["documents"][0]["title"] == "OCBrain product check"
 
 
-def test_event_backfill_batches_past_already_projected_rows(
-    tmp_path: Path, capsys
-) -> None:
+def test_event_backfill_batches_past_already_projected_rows(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = connect(db_path)
     init_db(conn)
@@ -398,9 +455,7 @@ def test_event_backfill_batches_past_already_projected_rows(
     assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 2
 
 
-def test_event_backfill_compilation_references_source_evidence_id(
-    tmp_path: Path, capsys
-) -> None:
+def test_event_backfill_compilation_references_source_evidence_id(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = connect(db_path)
     init_db(conn)
@@ -435,9 +490,7 @@ def test_event_backfill_compilation_references_source_evidence_id(
     assert not proposed_body["evidence_ids"][0].startswith("evt_")
 
 
-def test_event_backfill_all_classifies_and_rebuilds_once(
-    tmp_path: Path, capsys
-) -> None:
+def test_event_backfill_all_classifies_and_rebuilds_once(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = connect(db_path)
     init_db(conn)
@@ -975,3 +1028,56 @@ def test_liveness_check_reads_runner_ledger_and_writes_tripwire_evidence(tmp_pat
 
     assert result.changed == 2
     assert {"heartbeat_starved", "no_ledger_writes"} <= tripwires
+
+
+def test_liveness_tripwire_is_idempotent_when_only_due_time_moves(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    conn.execute(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        ) VALUES ('stall/workflow', 'run-1', ?, ?, 900, ?)
+        """,
+        (
+            "2026-06-23T11:00:00+00:00",
+            "2026-06-23T11:00:00+00:00",
+            "2026-06-23T11:55:00+00:00",
+        ),
+    )
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    first = check_loop_liveness(conn, now=now)
+    conn.commit()
+    assert first.changed == 2
+
+    conn.execute(
+        "UPDATE loop_liveness SET deadman_due_at=? WHERE loop_id='stall/workflow'",
+        ("2026-06-23T11:59:00+00:00",),
+    )
+    second = check_loop_liveness(conn, now=now)
+    conn.commit()
+    assert second.changed == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM evidence WHERE source_type='loop_tripwire'").fetchone()[
+            0
+        ]
+        == 2
+    )
+
+
+def test_liveness_check_records_invalid_deadman_deadline(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    conn.execute(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        ) VALUES ('broken-loop', 'run-1', NULL, NULL, 900, 'not-a-date')
+        """
+    )
+    result = check_loop_liveness(conn, now=datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
+    conn.commit()
+    assert result.changed == 1
+    assert result.details[0]["tripwire"] == "invalid_deadman_due"

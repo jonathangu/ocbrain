@@ -442,48 +442,75 @@ def check_loop_liveness(
     )
     for row in rows:
         due_at = parse_datetime(row["deadman_due_at"])
-        if due_at is None or due_at > timestamp:
+        if due_at is None:
+            detail = _record_liveness_tripwire(conn, row, "invalid_deadman_due", timestamp)
+            if detail is not None:
+                details.append(detail)
+            continue
+        if due_at > timestamp:
             continue
         tripwire_kinds = liveness_tripwire_kinds(row, due_at=due_at)
         for kind in tripwire_kinds:
-            claim = liveness_claim(kind, row)
-            evidence_id = upsert_evidence(
-                conn,
-                source_type="loop_tripwire",
-                source_runtime="ocbrain",
-                source_uri=f"ocbrain://loop/{row['loop_id']}/{row['run_id']}/liveness/{kind}",
-                content_hash=content_hash(
-                    json.dumps(
-                        {
-                            "kind": kind,
-                            "loop_id": row["loop_id"],
-                            "run_id": row["run_id"],
-                            "deadman_due_at": row["deadman_due_at"],
-                            "last_heartbeat_at": row["last_heartbeat_at"],
-                            "last_ledger_write_at": row["last_ledger_write_at"],
-                        },
-                        sort_keys=True,
-                    )
-                ),
-                claim=claim,
-                verifier_status="not_required",
-                loop_tags={
-                    "loop_id": row["loop_id"],
-                    "run_id": row["run_id"],
-                    "tripwire": kind,
-                },
-                privacy_scope="workspace",
-                occurred_at=timestamp.isoformat(),
-            )
-            details.append(
-                {
-                    "loop_id": row["loop_id"],
-                    "run_id": row["run_id"],
-                    "tripwire": kind,
-                    "evidence_id": evidence_id,
-                }
-            )
+            detail = _record_liveness_tripwire(conn, row, kind, timestamp)
+            if detail is not None:
+                details.append(detail)
     return MaintenanceResult("liveness-check", len(details), details)
+
+
+def _record_liveness_tripwire(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    kind: str,
+    timestamp: datetime,
+) -> dict[str, Any] | None:
+    """Write one state-change tripwire, not one copy per sweep.
+
+    ``deadman_due_at`` moves whenever the producer refreshes its scan. Including
+    it in the hash created a new evidence row for the same unchanged dead loop on
+    every maintenance pass. Heartbeat/ledger state is the durable condition; a
+    later recovery and second death changes those fields and produces new
+    evidence. Malformed due values include the raw value so distinct corruption
+    remains distinguishable.
+    """
+    source_uri = f"ocbrain://loop/{row['loop_id']}/{row['run_id']}/liveness/{kind}"
+    payload = {
+        "kind": kind,
+        "loop_id": row["loop_id"],
+        "run_id": row["run_id"],
+        "last_heartbeat_at": row["last_heartbeat_at"],
+        "last_ledger_write_at": row["last_ledger_write_at"],
+    }
+    if kind == "invalid_deadman_due":
+        payload["deadman_due_at"] = row["deadman_due_at"]
+    digest = content_hash(json.dumps(payload, sort_keys=True))
+    existing = conn.execute(
+        "SELECT id FROM evidence WHERE source_uri = ? AND content_hash = ? LIMIT 1",
+        (source_uri, digest),
+    ).fetchone()
+    if existing is not None:
+        return None
+    evidence_id = upsert_evidence(
+        conn,
+        source_type="loop_tripwire",
+        source_runtime="ocbrain",
+        source_uri=source_uri,
+        content_hash=digest,
+        claim=liveness_claim(kind, row),
+        verifier_status="not_required",
+        loop_tags={
+            "loop_id": row["loop_id"],
+            "run_id": row["run_id"],
+            "tripwire": kind,
+        },
+        privacy_scope="workspace",
+        occurred_at=timestamp.isoformat(),
+    )
+    return {
+        "loop_id": row["loop_id"],
+        "run_id": row["run_id"],
+        "tripwire": kind,
+        "evidence_id": evidence_id,
+    }
 
 
 def liveness_tripwire_kinds(row: sqlite3.Row, *, due_at: datetime) -> list[str]:
@@ -506,6 +533,8 @@ def liveness_claim(kind: str, row: sqlite3.Row) -> str:
         return f"Loop {loop} run {run} missed its deadman heartbeat."
     if kind == "no_ledger_writes":
         return f"Loop {loop} run {run} crossed deadman without runner ledger writes."
+    if kind == "invalid_deadman_due":
+        return f"Loop {loop} run {run} has an invalid deadman deadline."
     return f"Loop {loop} run {run} has stale running ledger activity."
 
 

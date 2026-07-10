@@ -214,8 +214,7 @@ def test_evasion_text_flagged_by_both_signals_directly():
     # Sanity: the OLD exact-substring approach genuinely missed this text.
     low = MAX_LANE_EVASION_TEXT.lower()
     assert not any(
-        seed in low
-        for seed in ("waiting on the monitor", "standing by", "waiting for the monitor")
+        seed in low for seed in ("waiting on the monitor", "standing by", "waiting for the monitor")
     )
 
 
@@ -469,6 +468,148 @@ def test_run_pages_once_then_dedups_and_heartbeats(tmp_path, monkeypatch):
     assert len(sent) == 1  # no second Telegram message
 
 
+def test_brain_deadman_reader_watches_autopilot_without_recursing(tmp_path):
+    brain = _brain(tmp_path)
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+    stale = (now - timedelta(hours=2)).isoformat()
+    overdue = (now - timedelta(minutes=5)).isoformat()
+    future = (now + timedelta(hours=1)).isoformat()
+    brain.executemany(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("autopilot", "light", stale, stale, 3600, overdue),
+            ("autopilot", "heavy", stale, stale, 14400, future),
+            ("stall/workflow_passive_wait", "old", stale, stale, None, overdue),
+        ],
+    )
+    brain.commit()
+
+    findings = stallcheck.scan_brain_deadmans(brain, now)
+    assert len(findings) == 1
+    assert findings[0].stall_class == "loop_deadman"
+    assert findings[0].unit_id == "autopilot/light"
+    first_fingerprint = findings[0].fingerprint
+
+    # Recovery clears the deadline; a later run with a new heartbeat can create
+    # a genuinely new fingerprint instead of being suppressed forever.
+    recovered = (now + timedelta(minutes=1)).isoformat()
+    brain.execute(
+        "UPDATE loop_liveness SET last_heartbeat_at=?, last_ledger_write_at=?, "
+        "deadman_due_at=NULL WHERE loop_id='autopilot' AND run_id='light'",
+        (recovered, recovered),
+    )
+    assert stallcheck.scan_brain_deadmans(brain, now + timedelta(minutes=2)) == []
+    second_due = (now + timedelta(minutes=3)).isoformat()
+    brain.execute(
+        "UPDATE loop_liveness SET deadman_due_at=? WHERE loop_id='autopilot' AND run_id='light'",
+        (second_due,),
+    )
+    later = stallcheck.scan_brain_deadmans(brain, now + timedelta(minutes=4))
+    assert len(later) == 1
+    assert later[0].fingerprint != first_fingerprint
+
+
+def test_dry_run_reports_brain_deadman_without_writing(tmp_path, capsys):
+    brain = _brain(tmp_path)
+    stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    overdue = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    brain.execute(
+        """
+        INSERT INTO loop_liveness (
+          loop_id, run_id, last_heartbeat_at, last_ledger_write_at,
+          expected_interval_seconds, deadman_due_at
+        ) VALUES ('autopilot', 'light', ?, ?, 3600, ?)
+        """,
+        (stale, stale, overdue),
+    )
+    brain.commit()
+    db_path = brain.execute("PRAGMA database_list").fetchone()[2]
+    before = brain.total_changes
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "stall_check": {
+                    "workflow_globs": [str(tmp_path / "no-workflows" / "*")],
+                    "task_output_globs": [str(tmp_path / "no-tasks" / "*")],
+                    "runner_db": str(tmp_path / "no-runner.sqlite"),
+                }
+            }
+        )
+    )
+
+    rc = stallcheck.main(["--config", str(config_path), "--brain-db", db_path, "--dry-run"])
+
+    assert rc == 0
+    assert "loop_deadman" in capsys.readouterr().out
+    assert brain.total_changes == before
+
+
+def test_steady_state_retires_out_of_window_finding_once(tmp_path):
+    wf = tmp_path / "wf_old"
+    wf.mkdir()
+    agent = wf / "agent-old01.jsonl"
+    _write_agent_jsonl(agent, last_text="Standing by, waiting for the monitor.")
+    _age(agent, minutes=72 * 60)
+    cfg = _cfg(
+        workflow_globs=(f"{tmp_path}/wf_*/",),
+        terminal_backlog_hours=48,
+    )
+    brain = _brain(tmp_path)
+    now = datetime.now(UTC)
+    stallcheck.ensure_stall_pages(brain)
+    stallcheck.mark_first_run_done(brain, now)
+    brain.commit()
+
+    first = stallcheck.run(cfg, brain, runner=None, now=now, send=False)
+    assert first.first_run is False
+    assert len(first.new_findings) == 1
+    assert first.paged == []
+    assert len(first.retired) == 1
+    row = brain.execute(
+        "SELECT paged_at, retired_at, retire_reason, run_count FROM stall_pages "
+        "WHERE fingerprint = ?",
+        (first.retired[0].fingerprint,),
+    ).fetchone()
+    assert row["paged_at"] is None
+    assert row["retired_at"] is not None
+    assert row["retire_reason"] == "outside_backlog_window"
+    assert row["run_count"] == 1
+
+    second = stallcheck.run(cfg, brain, runner=None, now=now + timedelta(minutes=15), send=False)
+    assert second.new_findings == []
+    assert second.retired == []
+    assert (
+        brain.execute(
+            "SELECT run_count FROM stall_pages WHERE fingerprint = ?",
+            (first.retired[0].fingerprint,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_ensure_stall_pages_adds_retirement_columns_to_legacy_table(tmp_path):
+    brain = _brain(tmp_path)
+    brain.execute(
+        """
+        CREATE TABLE stall_pages (
+          fingerprint TEXT PRIMARY KEY, stall_class TEXT NOT NULL,
+          unit_id TEXT NOT NULL, terminal_signature TEXT,
+          first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+          paged_at TEXT, run_count INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    stallcheck.ensure_stall_pages(brain)
+    columns = {row["name"] for row in brain.execute("PRAGMA table_info(stall_pages)")}
+    assert {"retired_at", "retire_reason"} <= columns
+
+
 def test_pager_network_call_never_holds_sqlite_writer_lock(tmp_path, monkeypatch):
     wf = tmp_path / "wf_stall"
     wf.mkdir()
@@ -563,9 +704,7 @@ def test_run_inert_pager_when_unconfigured(tmp_path):
 def test_read_bot_token_extracts_and_missing(tmp_path):
     cfg_file = tmp_path / "openclaw.json"
     cfg_file.write_text(
-        json.dumps(
-            {"channels": {"telegram": {"accounts": {"default": {"botToken": "SECRET123"}}}}}
-        )
+        json.dumps({"channels": {"telegram": {"accounts": {"default": {"botToken": "SECRET123"}}}}})
     )
     assert stallcheck.read_bot_token(str(cfg_file), "default") == "SECRET123"
     assert stallcheck.read_bot_token(str(cfg_file), "missing") is None

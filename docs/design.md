@@ -37,8 +37,11 @@ dataset work. Snapshot or migration failure aborts; other stage failures make a
 run partial and allow independent later stages to continue.
 
 The separate stallcheck process is passive. It detects a parked turn from
-transcripts and runner ledgers, writes liveness evidence, and may page through
-an operator-owned transport. It never claims the work itself.
+transcripts and runner ledgers, reads overdue producer deadmen, writes liveness
+evidence, and may page through an operator-owned transport. It never claims the
+work itself. Autopilot maintenance independently consumes stallcheck's
+self-heartbeat; autopilot checkpoints its own running row and deadman after
+every stage for stallcheck to consume. Neither process is its own only witness.
 
 ## Retrieval and feedback
 

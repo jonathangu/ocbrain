@@ -455,12 +455,17 @@ fire finds the lock held and exits cleanly instead of double-running.
 | 10 | **maintain** | prune stale knowledge, heal conflicts (emitting supersession signals), and **archive never-referenced stale catalog docs** (v0.3) out of the working set | existing TTL logic + reversible status flip |
 | 11 | **dataset-mine** | mine SFT/DPO/persona from newly-settled history in bounded, measured writer batches; checkpoint a large WAL after commit | `dataset_sources` fingerprints + `UNIQUE` |
 | 12 | **dataset-export** | deterministically write the JSONL corpora + manifest, skipping if unchanged | `payload_hash` |
-| 13 | **finalize** | record the run in `autopilot_runs` (per-stage results or errors), release the lock | — |
+| 13 | **finalize** | finalize the already-visible `autopilot_runs` row, clear the profile deadman, release the lock | durable stage checkpoints |
 
 The `light` profile runs stages 2, 5, 7, 7b, 8, 9, 9b, 10; the `heavy` profile
 runs the full table. The `embed` stage always runs immediately after
 `autolabel`, and `excerpt_render` always runs immediately after `promote`, in
 every profile.
+
+Before the first stage, the runner commits a `running` row and a profile
+deadman. It checkpoints both after each completed stage and clears the deadline
+only when the run finalizes. A hard kill therefore leaves visible partial
+progress plus an overdue deadline instead of erasing the run from the ledger.
 
 ### 9.1 Abort vs. partial
 
@@ -516,17 +521,21 @@ later stage assumes a snapshotted, migrated DB.
 
 `ocbrain.stallcheck` is a separate, passive process on its own launchd timer
 (every 15 minutes) — it does not share the autopilot lock or its cadence, and
-it never writes knowledge or evidence rows. Each pass reads, read-only:
+it never promotes knowledge or claims work. Each pass reads, read-only:
 agent-workflow transcripts, for an `end_turn` left with a still-pending
 monitor/background-task call, or a task output file opened but never closed;
 and the runner ledger, for lost or stalled task runs and failed inbound
-message handling. A finding upserts a `loop_liveness` row and a
+message handling. It also reads overdue producer deadmen from the brain itself,
+including the autopilot profile deadline. A finding upserts a `loop_liveness` row and a
 `loop_tripwire` evidence row into the same brain DB the liveness sweep and
 weekly review already read, and — if a local pager configuration is present —
 sends a single, deduplicated Telegram digest of any *new* stalls so a
 persistent stall pages once, not repeatedly. The checker also writes its own
-heartbeat row (`loop_id='stallcheck'`) so the weekly review notices if the
-watchdog itself stops running.
+heartbeat row (`loop_id='stallcheck'`). The independently scheduled autopilot
+`maintain` stage consumes that deadman row, while stallcheck consumes the
+autopilot runner's stage-checkpointed deadman. Watchdog death and a stuck
+maintenance loop therefore have different observers. Findings first discovered
+after the backlog window are marked retired, not repeatedly re-counted as new.
 
 ---
 

@@ -367,7 +367,11 @@ outcomes can decay on the shorter unhelpful TTL.
 ### Loop Liveness
 
 `loop_liveness` tracks runner-owned heartbeat/deadman rows. OCBrain reads these
-rows and can emit tripwire evidence when a loop appears starved or silent.
+rows and emits idempotent tripwire evidence when a loop appears starved, silent,
+or carries a malformed deadline. Autopilot maintenance is the independent
+consumer of stallcheck's self-heartbeat; stallcheck is the independent consumer
+of the autopilot profile deadman. The runner checkpoints its visible `running`
+row and deadline after every completed stage.
 
 OCBrain does not claim the loop, run the loop, repair the loop, or enqueue more
 work.
@@ -608,7 +612,9 @@ OCBrain running the loop.
 1. `prune` marks stale/unreferenced or served-but-never-useful knowledge stale.
 2. `heal` resolves conflicting current values by superseding lower-confidence
    rows and writing correction evidence.
-3. `liveness-check` emits tripwire evidence for missed loop heartbeats.
+3. `liveness-check` emits idempotent tripwire evidence for missed loop
+   heartbeats; autopilot maintenance and stallcheck observe one another through
+   separate scheduled processes.
 
 Success means the brain stays useful and auditable without deleting history.
 

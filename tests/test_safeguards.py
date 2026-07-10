@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -161,9 +162,7 @@ def test_tripwire_registry_has_all_six(tmp_path):
     ]
 
 
-def test_tripwires_release_writer_before_next_expensive_predicate(
-    tmp_path, monkeypatch
-):
+def test_tripwires_release_writer_before_next_expensive_predicate(tmp_path, monkeypatch):
     conn = _db(tmp_path)
     _seed_value(conn, subject="first")
     _seed_value(conn, subject="second")
@@ -236,9 +235,12 @@ def test_tripwire_injection_suspected_from_linked_flagged_evidence(tmp_path):
     conn.commit()
     scan_evidence_for_injection(conn)
     conn.commit()
-    assert conn.execute(
-        "SELECT injection_scan_status FROM evidence WHERE id = ?", (evidence_id,)
-    ).fetchone()[0] == "flagged"
+    assert (
+        conn.execute(
+            "SELECT injection_scan_status FROM evidence WHERE id = ?", (evidence_id,)
+        ).fetchone()[0]
+        == "flagged"
+    )
 
     link_knowledge_evidence(conn, kid, evidence_id, relation="supports")
     conn.commit()
@@ -339,6 +341,37 @@ def test_run_tripwires_watermark_advances_and_second_run_is_noop(tmp_path):
     assert second.changed == 0
 
 
+def test_tripwire_cursor_does_not_skip_equal_timestamp_rows(tmp_path):
+    conn = _db(tmp_path)
+    ids = sorted(
+        [
+            _seed_value(conn, subject="same-ts-a", value_text="a benign fact"),
+            _seed_value(conn, subject="same-ts-b", value_text="another benign fact"),
+        ]
+    )
+    shared_ts = "2026-07-10T12:00:00+00:00"
+    conn.execute("UPDATE knowledge SET updated_at=?", (shared_ts,))
+    conn.commit()
+
+    run_tripwires(conn, limit=1)
+    first_cursor = json.loads(
+        conn.execute(
+            "SELECT watermark FROM harvest_watermarks "
+            "WHERE domain='tripwires' AND stream='knowledge'"
+        ).fetchone()[0]
+    )
+    assert first_cursor == {"id": ids[0], "updated_at": shared_ts}
+
+    run_tripwires(conn, limit=1)
+    second_cursor = json.loads(
+        conn.execute(
+            "SELECT watermark FROM harvest_watermarks "
+            "WHERE domain='tripwires' AND stream='knowledge'"
+        ).fetchone()[0]
+    )
+    assert second_cursor == {"id": ids[1], "updated_at": shared_ts}
+
+
 # --------------------------------------------------------------------------- #
 # Injection scan
 # --------------------------------------------------------------------------- #
@@ -435,6 +468,23 @@ def test_auto_decide_shadows_hard_blocked_belief(tmp_path):
     conn.commit()
     decisions = proposal_decisions(conn)
     assert decisions[proposal]["body"]["decision"] == "shadow"
+
+
+def test_auto_decide_repairs_missing_projection_cursor_without_new_proposals(tmp_path):
+    conn = _db(tmp_path)
+    _propose(conn, "belief:cursor", "A clean cursor repair belief.")
+    auto_decide_compilations(conn)
+    conn.commit()
+    conn.execute("DELETE FROM projection_cursor")
+    conn.commit()
+
+    result = auto_decide_compilations(conn)
+    conn.commit()
+
+    assert result.changed == 0
+    row = conn.execute("SELECT last_event_rowid FROM projection_cursor WHERE id=1").fetchone()
+    assert row is not None
+    assert row[0] == conn.execute("SELECT max(rowid) FROM brain_events").fetchone()[0]
 
 
 def test_quarantine_missing_row_returns_false(tmp_path):

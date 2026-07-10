@@ -1,6 +1,6 @@
 # ocbrain
 
-Current release: **v0.3.2**. Licensed under Apache-2.0.
+Current release: **v0.3.3**. Licensed under Apache-2.0.
 
 Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
 runtimes.
@@ -446,18 +446,23 @@ useful knowledge on a shorter TTL, and can later archive stale rows without
 deleting the audit trail. `heal` supersedes conflicting current values and
 writes correction evidence. `liveness-check` reads runner deadman rows and
 writes loop tripwire evidence such as `heartbeat_starved` or
-`no_ledger_writes`; it does not claim lanes or enqueue loop work.
+`no_ledger_writes`; it does not claim lanes or enqueue loop work. The autopilot
+`maintain` stage runs this check as an independent observer, so stallcheck's own
+heartbeat is still consumed if the stallcheck process dies.
 
 `ocbrain.stallcheck` is a separate, passive companion process on its own
 15-minute launchd timer, independent of the autopilot lock. It reads agent
 transcripts and runner tables (read-only) for a parked-and-forgotten turn — an
 `end_turn` left with a still-pending monitor, or a task output file opened but
-never closed — writes the finding as `loop_liveness` + tripwire evidence in
-the same ledger the liveness sweep reads, and can send a single deduplicated
-Telegram digest of new stalls when a local pager config is present. It also
-writes its own heartbeat row so a weekly review would notice if the watchdog
-itself stopped running. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for detail.
+never closed — and also reads overdue producer deadmen from the brain ledger.
+It writes each finding as `loop_liveness` + tripwire evidence and can send a
+single deduplicated Telegram digest of new stalls when a local pager config is
+present. The observation is reciprocal: stallcheck writes its own heartbeat for
+autopilot maintenance to consume, while every autopilot profile commits a
+`running` ledger row and moving deadman for stallcheck to consume. Findings
+first discovered outside the configured backlog window are durably retired
+rather than remaining "new" forever. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for detail.
 
 ## Public safety
 

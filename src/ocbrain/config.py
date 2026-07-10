@@ -73,6 +73,19 @@ class AutopilotConfig:
     # Locking discipline across profiles. ``shared`` == light and heavy runs
     # contend for the same autopilot lock so they never overlap.
     profile_locks: str = "shared"
+    # A running profile checkpoints a durable deadman row after every completed
+    # stage. If the process disappears or stops making progress past this
+    # profile-specific window, the independent stallcheck job can page it.
+    # Values are deliberately wider than the normal cadence: a slow but healthy
+    # run should skip overlapping timer fires, not manufacture a stall.
+    profile_deadman_seconds: dict[str, int] = field(
+        default_factory=lambda: {
+            "light": 3600,
+            "heavy": 14400,
+            "full": 14400,
+            "manual": 3600,
+        }
+    )
     # Reclaim a large WAL only after dataset mining has committed every bounded
     # writer batch. Small WALs are left to SQLite's normal autocheckpoint path.
     checkpoint_after_dataset_mine: bool = True
@@ -354,9 +367,7 @@ def _load_config_from_environ(path: Path | str | None) -> OcbrainConfig:
     config_path = (
         Path(path).expanduser()
         if path is not None
-        else Path(
-            os.environ.get("OCBRAIN_CONFIG", "data/ocbrain.config.json")
-        ).expanduser()
+        else Path(os.environ.get("OCBRAIN_CONFIG", "data/ocbrain.config.json")).expanduser()
     )
     file_data: dict[str, Any] = {}
     if config_path.exists():

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.3 — 2026-07-10
+
+- Replace the tripwire scan's timestamp-only watermark with a composite
+  `(updated_at, id)` cursor, so equal-timestamp rows cannot be skipped at a batch
+  or time-budget boundary.
+- Replace per-row full event-log deserialization for hard corrections with an
+  indexed JSON target lookup. On the live backlog, a clean 1,000-row tripwire
+  page fell from 301.2534 seconds to 0.0351 seconds.
+- Avoid a full FTS delete scan when inserting a brand-new evidence or knowledge
+  row; existing parents still replace their exact index row.
+- Retire newly discovered stalls outside the paging backlog window so they do
+  not remain `new` and rewrite their ledger every 15 minutes.
+- Run liveness checking from independent autopilot maintenance, make unchanged
+  deadman evidence idempotent, and record malformed deadlines explicitly.
+- Commit an autopilot `running` row and profile deadman before work, checkpoint
+  both after every stage, and have the independent stallcheck process page an
+  overdue producer deadline, including in read-only dry-run inspection.
+- Preserve polymorphic legacy retrieval ids as `task_ref` provenance instead of
+  invalid knowledge foreign keys; repair existing orphan references without
+  deleting retrieval history.
+- Repair a missing event-projection cursor even when compilation has no new
+  proposals.
+- Exclude runtime logs, data, local caches, build output, and the untracked lock
+  file explicitly from source distributions; `logs/` is now gitignored too.
+
+
 ## 0.3.2 — 2026-07-10
 
 - Bound post-turn review inside large sessions at 50 mutating units or two
