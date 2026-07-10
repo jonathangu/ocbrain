@@ -130,23 +130,24 @@ prompts, writes the prompts/references/rubric, and excludes every held-out
 content hash from all training streams:
 
 ```bash
+PILOT=data/datasets/pilot-v1
 uv run --with-editable . ocbrain dataset-pilot-prepare \
   --min-grade 0.8 \
   --base-model /absolute/path/to/local-4bit-model \
   --base-model-source upstream/model-repo \
   --base-model-revision pinned-commit
 uv run --with-editable . ocbrain dataset-pilot-record-training \
-  --pilot-dir data/datasets/pilot-v1 \
+  --pilot-dir "${PILOT}" \
   --iterations 25 \
   --train-loss 2.218 \
   --validation-loss 4.592 \
   --exit-code 0
 uv run --with-editable . ocbrain dataset-pilot-blind \
-  --pilot-dir data/datasets/pilot-v1 \
-  --candidate-responses data/datasets/pilot-v1/eval/candidate-responses.jsonl
+  --pilot-dir "${PILOT}" \
+  --candidate-responses "${PILOT}/eval/candidate-responses.jsonl"
 uv run --with-editable . ocbrain dataset-pilot-score \
-  --pilot-dir data/datasets/pilot-v1 \
-  --ratings data/datasets/pilot-v1/eval/blind-ratings.jsonl
+  --pilot-dir "${PILOT}" \
+  --ratings "${PILOT}/eval/blind-ratings.jsonl"
 ```
 
 After verified local training is recorded, generate the candidate side with the
@@ -155,9 +156,9 @@ same pinned MLX-LM environment used for training:
 ```bash
 uvx --from 'mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@PIN' \
   python scripts/generate-pilot-candidates.py \
-  --pilot-dir data/datasets/pilot-v1
+  --pilot-dir "${PILOT}"
 PYTHONPATH=src uv run python scripts/grade-pilot-blind.py \
-  --pilot-dir data/datasets/pilot-v1 \
+  --pilot-dir "${PILOT}" \
   --model your-local-grader-model
 ```
 

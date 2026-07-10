@@ -74,6 +74,14 @@ _QUOTED_SECRET_ASSIGN_RE = re.compile(
     r"""(?i)(api[_-]?key|secret|token|password|credential)\s*[:=]\s*["'][^"']{8,}["']"""
 )
 
+# A full public Git object id is reproducibility metadata, not a credential,
+# but only suppress the entropy finding when the same line explicitly labels
+# it as a Git commit/revision. An unlabeled 40-hex value remains suspicious.
+_FULL_GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
+_GIT_REVISION_CONTEXT_RE = re.compile(
+    r"(?i)(?:git.{0,24}(?:commit|revision)|(?:commit|revision).{0,24}git)"
+)
+
 
 # --- findings ------------------------------------------------------------- #
 
@@ -212,6 +220,13 @@ def entropy_pathcheck_excluded(rel: str) -> bool:
     (b) STILL apply to plists; only these two heuristics are relaxed."""
 
     return rel.endswith(".plist")
+
+
+def filter_public_git_revision_spans(line: str, spans: list[str]) -> list[str]:
+    """Drop an explicitly labeled full Git object id from entropy findings."""
+    if not _GIT_REVISION_CONTEXT_RE.search(line):
+        return spans
+    return [span for span in spans if not _FULL_GIT_OBJECT_RE.fullmatch(span)]
 
 
 def refine_secret_leaks(content: str, leaks: list[str]) -> list[str]:
@@ -363,7 +378,9 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
             # high_entropy (c) skips plists -- their absolute path strings read as
             # long high-entropy runs (see entropy_pathcheck_excluded).
             if not entropy_pathcheck_excluded(rel):
-                spans = find_high_entropy_spans(content)
+                spans = filter_public_git_revision_spans(
+                    content, find_high_entropy_spans(content)
+                )
                 if spans:
                     result.findings.append(
                         Finding(

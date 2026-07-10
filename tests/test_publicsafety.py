@@ -254,6 +254,24 @@ def test_entropy_pathcheck_excluded_unit() -> None:
     assert not ps.entropy_pathcheck_excluded("src/ocbrain/cli.py")
 
 
+def test_explicit_public_git_commit_is_not_an_entropy_finding(repo: Path) -> None:
+    public_revision = "a790972f0f844d81067ed45c28b524220a10c019"
+    rng = _commit_added_line(
+        repo,
+        "version.py",
+        f'MLX_LM_GIT_COMMIT = "{public_revision}"',
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_unlabeled_full_hex_value_remains_an_entropy_finding(repo: Path) -> None:
+    suspicious_value = "a790972f0f844d81067ed45c28b524220a10c019"
+    rng = _commit_added_line(repo, "payload.py", f'VALUE = "{suspicious_value}"')
+    result = ps.scan(repo, diff_range=rng)
+    assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
 def test_diff_range_ignores_removed_lines(repo: Path) -> None:
     # Removing a secret must not be flagged as adding one.
     (repo / "old.py").write_text(f'X = "{FAKE_SECRET}"\n', encoding="utf-8")
