@@ -15,6 +15,7 @@ PACK_CLASSES = {
     "persona": "train_voice",
 }
 DEFAULT_TARGETS = {"sft": 2000, "dpo": 300, "persona": 500}
+FINAL_TARGETS = {"sft": 1000, "dpo": 200, "persona": 300}
 
 
 def _rank(seed: str, dataset: str, row: sqlite3.Row) -> tuple[int, str]:
@@ -125,5 +126,78 @@ def selected_pack_stats(conn: sqlite3.Connection, *, min_grade: float = 0.8) -> 
         "graded": graded_total,
         "grade_coverage": round(graded_total / selected_total, 4) if selected_total else 0.0,
         "min_grade": min_grade,
+        "local_only": True,
+    }
+
+
+def finalize_training_pack(
+    conn: sqlite3.Connection,
+    *,
+    targets: dict[str, int] | None = None,
+    min_grade: float = 0.8,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Narrow a graded candidate pack to deterministic passing training rows."""
+    wanted = dict(FINAL_TARGETS)
+    if targets:
+        unknown = set(targets) - set(PACK_CLASSES)
+        if unknown:
+            raise ValueError(f"unknown pack datasets: {', '.join(sorted(unknown))}")
+        wanted.update({key: max(0, int(value)) for key, value in targets.items()})
+    if not 0.0 <= min_grade <= 1.0:
+        raise ValueError("min_grade must be between 0 and 1")
+
+    chosen: dict[str, list[sqlite3.Row]] = {}
+    missing: dict[str, dict[str, int]] = {}
+    for dataset, train_class in PACK_CLASSES.items():
+        rows = conn.execute(
+            """
+            SELECT id, train_selection_rank
+            FROM dataset_examples
+            WHERE dataset = ? AND train_class = ? AND train_selected = 1
+              AND grade_score >= ?
+            ORDER BY COALESCE(train_selection_rank, 2147483647), id
+            """,
+            (dataset, train_class, min_grade),
+        ).fetchall()
+        if len(rows) < wanted[dataset]:
+            missing[dataset] = {"required": wanted[dataset], "found": len(rows)}
+        chosen[dataset] = rows[: wanted[dataset]]
+    if missing:
+        raise RuntimeError("v0.4 final training pack gate failed: " + canonical_json(missing))
+
+    timestamp = (now or datetime.now(UTC)).isoformat(timespec="microseconds")
+    conn.execute(
+        """
+        UPDATE dataset_examples
+        SET train_selected = 0, train_selection_rank = NULL,
+            train_selection_reason = NULL, train_selected_at = NULL
+        WHERE train_selected = 1
+        """
+    )
+    for _dataset, rows in chosen.items():
+        for rank, row in enumerate(rows, 1):
+            conn.execute(
+                """
+                UPDATE dataset_examples
+                SET train_selected = 1, train_selection_rank = ?,
+                    train_selection_reason = 'deterministic_passing_pack_v1',
+                    train_selected_at = ?
+                WHERE id = ?
+                """,
+                (rank, timestamp, row["id"]),
+            )
+    counts = {dataset: len(rows) for dataset, rows in chosen.items()}
+    return {
+        "action": "dataset-pack-finalize",
+        "selected": counts,
+        "targets": wanted,
+        "min_grade": min_grade,
+        "selection_hash": hashlib.sha256(
+            canonical_json(
+                {dataset: [str(row["id"]) for row in rows] for dataset, rows in chosen.items()}
+            ).encode()
+        ).hexdigest(),
+        "grade_coverage": 1.0,
         "local_only": True,
     }

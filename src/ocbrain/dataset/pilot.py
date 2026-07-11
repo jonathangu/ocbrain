@@ -97,7 +97,7 @@ def _eligible_rows(
         conn.execute(
             f"""
             SELECT id, dataset, content_hash, example_json, grade_score,
-                   grade_model, grade_prompt_version, train_class
+                   grade_model, grade_prompt_version, train_class, train_selected
             FROM dataset_examples
             WHERE dataset = ?
               AND quality_label = 'good'
@@ -313,7 +313,11 @@ def prepare_pilot(
             if parts is None:
                 continue
             prompt, reference = parts
-            rank = sha256_text(f"{seed}:{row['content_hash']}")
+            # Prefer locally graded voice rows outside the finalized training
+            # pack, so the 100-case evaluation does not consume its own 300-row
+            # training minimum.
+            digest = sha256_text(f"{seed}:{row['content_hash']}")
+            rank = f"{int(row['train_selected'])}:{digest}"
             if row["content_hash"] not in sentinel_hashes:
                 eval_candidates.append((rank, row, prompt, reference))
         eval_candidates.sort(key=lambda item: item[0])

@@ -485,6 +485,16 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_pack_select_parser.add_argument("--seed", default="ocbrain-v04-selected-pack-v1")
     dataset_pack_select_parser.set_defaults(func=cmd_dataset_pack_select)
 
+    dataset_pack_finalize_parser = subparsers.add_parser(
+        "dataset-pack-finalize",
+        help="Finalize the graded candidate pool into a passing v0.4 training pack",
+    )
+    dataset_pack_finalize_parser.add_argument("--sft", type=int, default=1000)
+    dataset_pack_finalize_parser.add_argument("--dpo", type=int, default=200)
+    dataset_pack_finalize_parser.add_argument("--persona", type=int, default=300)
+    dataset_pack_finalize_parser.add_argument("--min-grade", type=float, default=0.8)
+    dataset_pack_finalize_parser.set_defaults(func=cmd_dataset_pack_finalize)
+
     dataset_pack_stats_parser = subparsers.add_parser(
         "dataset-pack-stats",
         help="Report selected-pack local grade coverage and passing counts",
@@ -1821,6 +1831,20 @@ def cmd_dataset_pack_select(args: argparse.Namespace) -> int:
         conn,
         targets={"sft": args.sft, "dpo": args.dpo, "persona": args.persona},
         seed=args.seed,
+    )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pack_finalize(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.selection import finalize_training_pack
+
+    conn = open_db(args)
+    result = finalize_training_pack(
+        conn,
+        targets={"sft": args.sft, "dpo": args.dpo, "persona": args.persona},
+        min_grade=args.min_grade,
     )
     conn.commit()
     output(args, result)

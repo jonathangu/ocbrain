@@ -59,7 +59,8 @@ Current surfaces:
   `event-backfill`, `digest`, `loop-ingest`, `mark-stale`, `prune`, `heal`,
   `liveness-check`, `mcp`, `autopilot`, `quarantine`, `label`, `dataset-mine`,
   `dataset-grade`, `dataset-export`, `dataset-stats`, `dataset-pilot-prepare`,
-  `dataset-classify`, `dataset-pack-select`, `dataset-pack-stats`,
+  `dataset-classify`, `dataset-pack-select`, `dataset-pack-finalize`,
+  `dataset-pack-stats`,
   `dataset-calibration-import`, `retrieval-feedback-stats`,
   `retrieval-benchmark`, `dataset-pilot-record-training`,
   `dataset-pilot-blind`, `dataset-pilot-score`, `dataset-pilot-multiblind`,
@@ -153,6 +154,12 @@ evaluation remains a byte-for-byte legacy sentinel. Four-way blind evaluation
 compares Jonathan, the untuned base, the tuned candidate, and a frontier agent;
 the bar does not move after training begins.
 
+Selection is two-phase so failed grades do not become nominal training rows.
+`dataset-pack-select` creates the bounded candidate pool; the local grader works
+only on that pool; `dataset-pack-finalize` deterministically keeps the required
+passing rows. The expanded voice evaluation prefers separately graded rows
+outside the final pack, leaving its 300 authentic voice examples intact.
+
 Dataset grading is deliberately local-only. The command rejects every
 non-loopback endpoint before reading an example, applies stream-specific
 rubrics, stores the normalized grade in `metadata.llm_grade`, and records a
@@ -172,6 +179,7 @@ uv run --with-editable . ocbrain dataset-grade \
   --model your-local-grader-model \
   --selected-only \
   --limit 100
+uv run --with-editable . ocbrain dataset-pack-finalize --min-grade 0.8
 uv run --with-editable . ocbrain dataset-pack-stats --min-grade 0.8
 uv run --with-editable . ocbrain dataset-export --min-grade 0.8
 ```

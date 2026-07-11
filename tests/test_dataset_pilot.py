@@ -193,7 +193,12 @@ def test_v04_quality_gate_preserves_legacy_sentinel_and_requires_train_classes(t
     conn.execute(
         "UPDATE dataset_examples SET train_class = CASE dataset "
         "WHEN 'persona' THEN 'train_voice' WHEN 'sft' THEN 'train_skill' "
-        "WHEN 'dpo' THEN 'train_judgment' END, train_selected = 1"
+        "WHEN 'dpo' THEN 'train_judgment' END, "
+        "train_selected = CASE WHEN dataset = 'persona' THEN 0 ELSE 1 END"
+    )
+    conn.execute(
+        "UPDATE dataset_examples SET train_selected = 1 WHERE id IN "
+        "(SELECT id FROM dataset_examples WHERE dataset = 'persona' ORDER BY id LIMIT 5)"
     )
     conn.commit()
     sentinel = tmp_path / "pilot-v2"
