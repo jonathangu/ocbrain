@@ -171,14 +171,22 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
     # autopilot import-time would be circular. By the time harvest runs, cli is
     # already fully loaded.
     from ocbrain.cli import (
+        current_history_fingerprints,
         history_files,
         import_history_file,
         imported_history_sources,
     )
 
     deadline = _deadline(ctx, "harvest")
-    files = history_files([Path(r).expanduser() for r in ctx.session_roots])
+    roots = [Path(r).expanduser() for r in ctx.session_roots]
+    files = history_files(roots)
+    # Exact-file roots are operator-curated high-value ledgers. Process them
+    # before large transcript trees so a busy five-minute harvest budget can
+    # never starve a canonical snapshot at the end of the global path order.
+    exact_roots = {str(path) for path in roots if path.is_file()}
+    files.sort(key=lambda path: (str(path) not in exact_roots, path))
     existing = imported_history_sources(ctx.conn)
+    current_fingerprints = current_history_fingerprints(ctx.conn)
     imported = 0
     skipped = 0
     for path in files:
@@ -187,7 +195,8 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         from ocbrain.fsutil import history_runtime
 
         key = (str(path), f"{history_runtime(path)}_history_file")
-        if key in existing:
+        fingerprint = file_fingerprint(path)
+        if current_fingerprints.get(key) == fingerprint:
             continue
         try:
             result = import_history_file(
@@ -207,6 +216,7 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         # stage budget. Close this file's import transaction first.
         ctx.conn.commit()
         existing.add((result["path"], f"{result['runtime']}_history_file"))
+        current_fingerprints[key] = fingerprint
         imported += 1
     mem = _harvest_memory_globs(ctx, deadline)
     imported += mem

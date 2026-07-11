@@ -590,6 +590,45 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
     assert {item["scope"] for item in search_payload["results"]} == {"workspace"}
     assert len(search_payload["results"]) == 3
 
+    # A live append-only transcript path must refresh when its fingerprint
+    # changes, while keeping one current searchable knowledge document.
+    openclaw_path.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "runtime": "openclaw",
+                "content": "openclaw transcript contains refreshed sentinel",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(openclaw_path),
+            ]
+        )
+        == 0
+    )
+    refresh_payload = json.loads(capsys.readouterr().out)
+    assert refresh_payload["imported"] == 1
+    assert refresh_payload["existing"] == 0
+    assert refresh_payload["counts"]["evidence"] == 4
+    assert refresh_payload["counts"]["knowledge"] == 3
+
+    assert cli.main(["--db", str(db_path), "search", "refreshed sentinel"]) == 0
+    refreshed_results = json.loads(capsys.readouterr().out)["results"]
+    current_docs = [
+        result
+        for result in refreshed_results
+        if result["kind"] == "knowledge:doc" and result["path"] == str(openclaw_path)
+    ]
+    assert len(current_docs) == 1
+
 
 def test_capability_no_longer_force_gated(tmp_path: Path) -> None:
     # v0.2 removed the gate-forcing block: a high-risk capability written with

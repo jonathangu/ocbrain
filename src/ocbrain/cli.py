@@ -1158,6 +1158,7 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     if args.limit is not None:
         files = files[: args.limit]
     existing_sources = imported_history_sources(conn)
+    current_fingerprints = current_history_fingerprints(conn)
     imported = 0
     existing = 0
     by_runtime: dict[str, int] = {}
@@ -1166,7 +1167,8 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     batch_size = max(args.batch_size, 1)
     for path in files:
         source_key = (str(path), f"{history_runtime(path)}_history_file")
-        if source_key in existing_sources:
+        fingerprint = file_fingerprint(path)
+        if current_fingerprints.get(source_key) == fingerprint:
             existing += 1
             continue
         try:
@@ -1188,6 +1190,7 @@ def cmd_import_history(args: argparse.Namespace) -> int:
         if len(samples) < 20:
             samples.append(result)
         existing_sources.add((result["path"], f'{result["runtime"]}_history_file'))
+        current_fingerprints[source_key] = fingerprint
         if imported % batch_size == 0:
             conn.commit()
     conn.commit()
@@ -1393,6 +1396,30 @@ def imported_history_sources(conn) -> set[tuple[str, str]]:
                 'claude_history_file',
                 'unknown_history_file'
               )
+            """
+        )
+    }
+
+
+def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:
+    """Return the fingerprint backing each currently searchable history doc.
+
+    Evidence is immutable, so a changing append-only source can have several
+    historical evidence rows.  The current knowledge row carries the fingerprint
+    whose search index is active and is therefore the correct idempotency gate.
+    """
+    return {
+        (row["body_uri"], f'{row["doc_kind"].removesuffix("_history")}_history_file'):
+        row["content_hash"]
+        for row in conn.execute(
+            """
+            SELECT body_uri, doc_kind, content_hash
+            FROM knowledge
+            WHERE type = 'doc'
+              AND body_uri IS NOT NULL
+              AND doc_kind IN ('openclaw_history', 'codex_history',
+                               'claude_history', 'unknown_history')
+              AND content_hash IS NOT NULL
             """
         )
     }
