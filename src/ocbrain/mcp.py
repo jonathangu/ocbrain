@@ -55,6 +55,36 @@ WRITE_LOCK_RETRIES = 3
 WRITE_LOCK_BACKOFF_SECONDS = 0.25
 
 
+def strip_explicit_nulls(value: Any) -> Any:
+    """Remove provider null sentinels at the one seam every tool call crosses."""
+    if isinstance(value, dict):
+        return {key: strip_explicit_nulls(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [strip_explicit_nulls(item) for item in value]
+    return value
+
+
+def provider_safe_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Make omission explicit for providers that populate every schema field."""
+    transformed = dict(schema)
+    if schema.get("type") == "object":
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            originally_required = set(schema.get("required") or [])
+            safe_properties: dict[str, Any] = {}
+            for name, value in properties.items():
+                safe_value = provider_safe_schema(value) if isinstance(value, dict) else value
+                if name not in originally_required:
+                    safe_value = {"anyOf": [safe_value, {"type": "null"}]}
+                safe_properties[name] = safe_value
+            transformed["properties"] = safe_properties
+            transformed["required"] = list(properties)
+            transformed["additionalProperties"] = False
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        transformed["items"] = provider_safe_schema(schema["items"])
+    return transformed
+
+
 def serve(db_path: Path, *, allow_writes: bool = False) -> int:
     conn = connect(db_path)
     conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
@@ -176,7 +206,10 @@ def _log_retrieval_if_available(
 
 def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
-    arguments = params.get("arguments", {})
+    raw_arguments = params.get("arguments", {})
+    if not isinstance(raw_arguments, dict):
+        raise ValueError("tool arguments must be an object")
+    arguments = strip_explicit_nulls(raw_arguments)
     if name == "brain.search":
         query = require_string(arguments, "query")
         limit = min(max(int(arguments.get("limit", 10)), 1), 50)
@@ -509,6 +542,7 @@ def tool_list() -> list[dict[str, Any]]:
                         "type": "object",
                         "properties": {
                             "project": {"type": "string"},
+                            "repo": {"type": "string"},
                             "type": {"type": "string"},
                             "status": {"type": "string"},
                             "loop_id": {"type": "string"},
@@ -688,7 +722,39 @@ def tool_list() -> list[dict[str, Any]]:
                         "writer": {"type": "string"},
                         "session": {"type": "string"},
                         "artifact_ref": {"type": "string"},
-                        "scope": {"type": "object"},
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "scope_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "global",
+                                        "project",
+                                        "repo",
+                                        "client",
+                                        "personal_finance",
+                                        "task",
+                                        "session",
+                                        "legacy_unscoped",
+                                    ],
+                                },
+                                "scope_id": {"type": "string"},
+                                "visibility": {
+                                    "type": "string",
+                                    "enum": ["public", "internal", "confidential", "secret"],
+                                },
+                                "egress_policy": {
+                                    "type": "string",
+                                    "enum": [
+                                        "hosted_ok",
+                                        "local_only",
+                                        "approval_required",
+                                        "prohibited",
+                                    ],
+                                },
+                                "provenance": {"type": "string"},
+                            },
+                        },
                         "context": {
                             "type": "object",
                             "properties": {
@@ -789,6 +855,7 @@ def tool_list() -> list[dict[str, Any]]:
             tool["annotations"] = dict(destructive_write)
         else:
             tool["annotations"] = dict(local_write)
+        tool["inputSchema"] = provider_safe_schema(tool["inputSchema"])
     return tools
 
 

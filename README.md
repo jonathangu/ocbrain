@@ -72,6 +72,12 @@ Current surfaces:
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
   `brain://loop/families`.
 
+MCP schemas are provider-safe. Required arguments remain required; every
+optional argument is required-but-nullable, nested objects reject unknown keys,
+and the dispatcher strips explicit nulls at one boundary before tool logic.
+That gives OpenAI-family callers an honest alternative to inventing unused
+values without changing Claude Code or OpenClaw semantics.
+
 For agent runtime behavior, read
 [`docs/AGENT_USE_GUIDE.md`](docs/AGENT_USE_GUIDE.md). For the current product and
 engineering walkthrough, read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).

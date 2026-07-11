@@ -12,6 +12,7 @@ import json
 import sqlite3
 import urllib.request
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -471,14 +472,9 @@ def _grade_examples_unlocked(
     conn.commit()
 
     call = transport or _ollama_transport
-    graded = 0
-    errors = 0
-    attempted = 0
-    blocked = False
-    ledger_pending = False
-    error_types: dict[str, int] = {}
-    for row in rows:
-        attempted += 1
+    parallel_requests = max(1, min(int(grade_cfg.parallel_requests), 8))
+
+    def infer(row: sqlite3.Row) -> tuple[dict[str, Any] | None, Exception | None]:
         try:
             record = json.loads(row["example_json"])
             raw = call(
@@ -487,56 +483,86 @@ def _grade_examples_unlocked(
                 _messages(row["dataset"], record),
                 grade_cfg.timeout_seconds,
             )
-            grade = normalize_grade(row["dataset"], raw)
-            _store_grade(
-                conn,
-                row,
-                grade,
-                model=model,
-                prompt_version=grade_cfg.prompt_version,
-                graded_at=timestamp,
-            )
-            graded += 1
-        except Exception as exc:  # one malformed local response must not lose the batch
-            # A failed write must not poison the progress-ledger update below.
-            conn.rollback()
-            errors += 1
-            name = type(exc).__name__
-            error_types[name] = error_types.get(name, 0) + 1
-            # Model/response failures are deterministic for this grader version
-            # and should not poison every future batch. SQLite infrastructure
-            # failures are transient and must remain eligible for a normal retry.
-            if not isinstance(exc, sqlite3.Error):
-                _store_grade_error(
+            return normalize_grade(row["dataset"], raw), None
+        except Exception as exc:  # normalized below on the single DB writer thread
+            return None, exc
+
+    executor: ThreadPoolExecutor | None = None
+    if parallel_requests > 1:
+        executor = ThreadPoolExecutor(
+            max_workers=parallel_requests,
+            thread_name_prefix="ocbrain-local-grade",
+        )
+        inferred = executor.map(infer, rows)
+    else:
+        inferred = map(infer, rows)
+    graded = 0
+    errors = 0
+    attempted = 0
+    blocked = False
+    ledger_pending = False
+    error_types: dict[str, int] = {}
+    try:
+        work = zip(rows, inferred, strict=True)
+        for row, (grade, inference_error) in work:
+            attempted += 1
+            try:
+                if inference_error is not None:
+                    raise inference_error
+                if grade is None:  # pragma: no cover - infer invariant
+                    raise ValueError("local grader produced no normalized result")
+                _store_grade(
                     conn,
                     row,
-                    error_type=name,
+                    grade,
                     model=model,
                     prompt_version=grade_cfg.prompt_version,
                     graded_at=timestamp,
                 )
-        try:
-            conn.execute(
-                """
-                UPDATE dataset_grade_runs
-                SET item_count = ?, error_count = ?, error = ?
-                WHERE id = ?
-                """,
-                (
-                    attempted,
-                    errors,
-                    canonical_json(error_types) if error_types else None,
-                    run_id,
-                ),
-            )
-            # Release the write lock before the next local inference call. A
-            # slow example must not block MCP feedback or scheduled autopilot.
-            conn.commit()
-        except sqlite3.OperationalError:
-            conn.rollback()
-            blocked = True
-            ledger_pending = True
-            break
+                graded += 1
+            except Exception as exc:  # one malformed local response must not lose the batch
+                # A failed write must not poison the progress-ledger update below.
+                conn.rollback()
+                errors += 1
+                name = type(exc).__name__
+                error_types[name] = error_types.get(name, 0) + 1
+                # Model/response failures are deterministic for this grader version
+                # and should not poison every future batch. SQLite infrastructure
+                # failures are transient and must remain eligible for a normal retry.
+                if not isinstance(exc, sqlite3.Error):
+                    _store_grade_error(
+                        conn,
+                        row,
+                        error_type=name,
+                        model=model,
+                        prompt_version=grade_cfg.prompt_version,
+                        graded_at=timestamp,
+                    )
+            try:
+                conn.execute(
+                    """
+                    UPDATE dataset_grade_runs
+                    SET item_count = ?, error_count = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        attempted,
+                        errors,
+                        canonical_json(error_types) if error_types else None,
+                        run_id,
+                    ),
+                )
+                # The worker pool does local inference only. This main thread is
+                # still the sole SQLite writer and commits each completed item.
+                conn.commit()
+            except sqlite3.OperationalError:
+                conn.rollback()
+                blocked = True
+                ledger_pending = True
+                break
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     status = "blocked" if blocked else "ok" if errors == 0 else "partial" if graded else "error"
     if not ledger_pending:
@@ -561,6 +587,7 @@ def _grade_examples_unlocked(
         "model": model,
         "prompt_version": grade_cfg.prompt_version,
         "local_only": True,
+        "parallel_requests": parallel_requests,
         "daily_items": used_today + attempted,
         "daily_item_cap": grade_cfg.daily_item_cap,
         "repaired_runs": repaired_runs,

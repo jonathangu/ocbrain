@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import threading
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,7 +29,7 @@ def _db(tmp_path: Path):
     return conn
 
 
-def _cfg(*, per_run: int = 100, daily: int = 500) -> OcbrainConfig:
+def _cfg(*, per_run: int = 100, daily: int = 500, parallel: int = 1) -> OcbrainConfig:
     base = OcbrainConfig()
     return dataclasses.replace(
         base,
@@ -36,6 +38,7 @@ def _cfg(*, per_run: int = 100, daily: int = 500) -> OcbrainConfig:
             model="local-test-model",
             per_run_item_cap=per_run,
             daily_item_cap=daily,
+            parallel_requests=parallel,
         ),
     )
 
@@ -156,6 +159,37 @@ def test_grade_persists_metadata_and_is_idempotent(tmp_path: Path):
 
     again = grade_examples(conn, cfg=cfg, transport=_transport, now=now)
     assert again["skipped"] == "no_candidates"
+
+
+def test_parallel_local_inference_keeps_one_db_writer(tmp_path: Path):
+    conn = _db(tmp_path)
+    for index in range(4):
+        _store(conn, "sft", index)
+    conn.commit()
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def concurrent_transport(endpoint, model, messages, timeout):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        return _transport(endpoint, model, messages, timeout)
+
+    result = grade_examples(
+        conn,
+        cfg=_cfg(parallel=2),
+        transport=concurrent_transport,
+    )
+    assert result["graded"] == 4
+    assert result["parallel_requests"] == 2
+    assert state["maximum"] == 2
+    assert (
+        conn.execute("SELECT COUNT(*) FROM dataset_examples WHERE grade_score = 0.86").fetchone()[0]
+        == 4
+    )
     assert conn.execute("SELECT COUNT(*) FROM dataset_grade_runs").fetchone()[0] == 1
 
 

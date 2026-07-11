@@ -248,6 +248,7 @@ class DatasetGradingConfig:
     per_run_item_cap: int = 100
     daily_item_cap: int = 500
     prompt_version: str = "dataset-rubric-v2-bounded-context"
+    parallel_requests: int = 1
 
 
 @dataclass(frozen=True)

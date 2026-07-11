@@ -46,6 +46,12 @@ pages it, detects a stuck `running` ledger row, and watches repeated judge
 sub-stage failures. The reciprocal deadman and optional daily pager canary make
 grit a structural heartbeat contract rather than motivational prompting.
 
+The MCP surface also normalizes provider behavior. Optional schema properties
+are exposed as required-but-nullable, unknown object keys are rejected, and
+explicit nulls are stripped at the dispatcher seam. This prevents an eager
+tool caller from turning an invented default into intended scope, privacy, or
+limit input.
+
 ---
 
 ## 2. The two-plane store

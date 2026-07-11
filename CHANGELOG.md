@@ -8,6 +8,9 @@
 - Instrument retrieval uses with queries, runtimes, sessions, and served ids;
   preserve explicit feedback provenance and conservatively infer later
   same-session or exact-reference outcomes.
+- Make MCP tool schemas provider-safe with required-but-nullable optional
+  fields, closed object shapes, and one null-stripping dispatch seam so eager
+  tool callers cannot turn invented defaults into intended scope or flags.
 - Classify corpus rows into `train_voice`, `train_judgment`, `train_skill`,
   `retrieval_only`, or `exclude`, with adversarial persona-author and injection
   contamination guards.

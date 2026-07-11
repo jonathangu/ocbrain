@@ -52,6 +52,21 @@ def test_mcp_tools_are_knowledge_first(tmp_path):
     assert by_name["brain.feedback"]["annotations"]["readOnlyHint"] is False
     assert by_name["brain.forget"]["annotations"]["destructiveHint"] is True
 
+    search_schema = by_name["brain.search"]["inputSchema"]
+    assert search_schema["additionalProperties"] is False
+    assert set(search_schema["required"]) == set(search_schema["properties"])
+    assert {branch.get("type") for branch in search_schema["properties"]["limit"]["anyOf"]} == {
+        "integer",
+        "null",
+    }
+    context_object = next(
+        branch
+        for branch in search_schema["properties"]["context"]["anyOf"]
+        if branch.get("type") == "object"
+    )
+    assert context_object["additionalProperties"] is False
+    assert set(context_object["required"]) == set(context_object["properties"])
+
 
 def test_mcp_write_tools_are_opt_in(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
@@ -165,6 +180,35 @@ def test_mcp_digest_search_feedback_and_filters(tmp_path):
     assert digest_payload["memory"][0]["predicate"] == "typecheck_errors"
     assert digest_payload["retrieval_use_id"].startswith("ret_")
     assert digest_payload["retrieval_use_status"] == "recorded"
+
+    nullable_search = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.search",
+                "arguments": {
+                    "query": "typecheck errors",
+                    "limit": None,
+                    "filters": None,
+                    "context": {
+                        "project": None,
+                        "repo": None,
+                        "client": None,
+                        "task": None,
+                        "session": None,
+                        "runtime": None,
+                    },
+                    "cross_scope": None,
+                    "at_ts": None,
+                },
+            },
+        },
+    )
+    nullable_payload = json.loads(nullable_search["result"]["content"][0]["text"])
+    assert nullable_payload
 
     search = handle_request(
         conn,
