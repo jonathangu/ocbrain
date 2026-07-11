@@ -128,7 +128,7 @@ openclaw mcp probe ocbrain
 ```
 
 The dated 2026-07-10 acceptance snapshot used OpenClaw `2026.6.11`, Claude Code
-`2.1.206`, and Codex CLI `0.144.1`. The installed OpenClaw version matched the
+`2.1.207`, and Codex CLI `0.144.1`. The installed OpenClaw version matched the
 registry version. Codex reported ChatGPT login, Claude reported a connected
 user-scope ocbrain server, and OpenClaw reported a reachable loopback Gateway
 plus the managed ocbrain MCP entry. These are dated observations, not evergreen

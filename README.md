@@ -90,6 +90,7 @@ For the public install, upgrade, and model-driven verification path, use
 ## Quick Start
 
 ```bash
+uv run --with-editable . ocbrain --version
 uv run --with-editable . ocbrain init
 uv run --with-editable . ocbrain evidence --claim "Codex emitted evidence."
 uv run --with-editable . ocbrain value \
