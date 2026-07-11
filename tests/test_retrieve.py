@@ -66,6 +66,27 @@ def test_scoped_retrieve_uses_repo_fts_when_event_results_are_catalog_stubs(tmp_
     assert payload["items"][0]["source"] == "fts_repo_fallback"
 
 
+def test_repo_source_cache_refreshes_when_document_changes(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    repo = tmp_path / "repo-refresh"
+    repo.mkdir()
+    readme = repo / "README.md"
+    readme.write_text(
+        "# Alpha retention sentinel\n\n"
+        "Alpha retention sentinel design keeps this first documentation state visible.\n"
+    )
+    context = ScopeContext(project="ocbrain", repo=str(repo))
+    first = retrieve(conn, "alpha retention sentinel", context=context, limit=5)
+    assert "Alpha retention sentinel" in first["items"][0]["body"]
+
+    readme.write_text(
+        "# Beta retrieval freshness\n\n"
+        "Beta retrieval freshness proves a long-lived MCP process sees changed source files.\n"
+    )
+    second = retrieve(conn, "beta retrieval freshness", context=context, limit=5)
+    assert "Beta retrieval freshness" in second["items"][0]["body"]
+
+
 def _db(tmp_path: Path) -> sqlite3.Connection:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

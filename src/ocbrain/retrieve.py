@@ -4,7 +4,6 @@ import math
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +15,10 @@ from ocbrain.text import find_probable_injection, redact_secrets
 # Default lexical/semantic blend when a query vector is available (0.5/0.5).
 DEFAULT_SEMANTIC_WEIGHT = 0.5
 CATALOG_STUB_WEIGHT = 0.15
+_REPO_DOCUMENT_CACHE: dict[
+    str,
+    tuple[tuple[tuple[str, int, int], ...], tuple[tuple[str, str, str], ...]],
+] = {}
 
 NEGATION_TERMS = {"no", "not", "never", "without", "cannot", "can't", "doesn't", "isn't"}
 STOP_TERMS = {
@@ -239,7 +242,6 @@ def _merge_repo_fts_fallback(
     return sorted(merged, key=lambda item: (-float(item["score"]), str(item["belief_id"])))[:limit]
 
 
-@lru_cache(maxsize=8)
 def _repo_documents(repo: str) -> tuple[tuple[str, str, str], ...]:
     """Load a bounded, source-hashed local repo corpus for retrieval fallback."""
     root = Path(repo).expanduser().resolve()
@@ -250,8 +252,22 @@ def _repo_documents(repo: str) -> tuple[tuple[str, str, str], ...]:
             candidates.add(path)
     for pattern in ("docs/**/*.md", "src/ocbrain/**/*.py"):
         candidates.update(path for path in root.glob(pattern) if path.is_file())
+    bounded = sorted(candidates)[:1000]
+    signature_parts: list[tuple[str, int, int]] = []
+    for path in bounded:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        signature_parts.append(
+            (str(path.relative_to(root)), int(stat.st_size), int(stat.st_mtime_ns))
+        )
+    signature = tuple(signature_parts)
+    cached = _REPO_DOCUMENT_CACHE.get(str(root))
+    if cached is not None and cached[0] == signature:
+        return cached[1]
     documents: list[tuple[str, str, str]] = []
-    for path in sorted(candidates)[:1000]:
+    for path in bounded:
         try:
             payload = path.read_bytes()
         except OSError:
@@ -261,7 +277,11 @@ def _repo_documents(repo: str) -> tuple[tuple[str, str, str], ...]:
         text = payload.decode("utf-8", errors="replace")
         relative = str(path.relative_to(root))
         documents.append((relative, text, sha256_text(text)))
-    return tuple(documents)
+    result = tuple(documents)
+    _REPO_DOCUMENT_CACHE[str(root)] = (signature, result)
+    if len(_REPO_DOCUMENT_CACHE) > 8:
+        _REPO_DOCUMENT_CACHE.pop(next(iter(_REPO_DOCUMENT_CACHE)))
+    return result
 
 
 def _repo_file_items(query: str, repo: str, *, limit: int) -> list[dict[str, Any]]:
