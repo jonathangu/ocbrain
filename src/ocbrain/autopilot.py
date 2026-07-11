@@ -181,6 +181,7 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
     existing = imported_history_sources(ctx.conn)
     imported = 0
     skipped = 0
+    lock_retries = 0
     for path in files:
         if _expired(deadline):
             break
@@ -190,13 +191,18 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         if key in existing:
             continue
         try:
-            result = import_history_file(
-                ctx.conn,
-                path,
-                project=None,
-                privacy_scope="workspace",
-                max_bytes=200_000,
+            result, retries = _retry_sqlite_locked(
+                ctx,
+                deadline,
+                lambda current_path=path: import_history_file(
+                    ctx.conn,
+                    current_path,
+                    project=None,
+                    privacy_scope="workspace",
+                    max_bytes=200_000,
+                ),
             )
+            lock_retries += retries
         except (OSError, UnicodeError, ValueError):
             skipped += 1
             continue
@@ -216,7 +222,35 @@ def stage_harvest(ctx: AutopilotContext) -> dict[str, Any]:
         "imported": imported,
         "memory_imported": mem,
         "skipped": skipped,
+        "lock_retries": lock_retries,
     }
+
+
+def _retry_sqlite_locked(
+    ctx: AutopilotContext,
+    deadline: float | None,
+    operation: Callable[[], Any],
+) -> tuple[Any, int]:
+    """Retry one idempotent harvest write while its stage budget remains.
+
+    Import writes use stable ids/upserts, and every failed SQLite statement is
+    rolled back before retry. Non-lock failures propagate unchanged.
+    """
+    retries = 0
+    maximum = max(0, int(ctx.cfg.autopilot.sqlite_lock_retries))
+    while True:
+        try:
+            return operation(), retries
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower() or retries >= maximum:
+                raise
+            with contextlib.suppress(sqlite3.Error):
+                ctx.conn.rollback()
+            delay = float(ctx.cfg.autopilot.sqlite_lock_backoff_seconds) * (2**retries)
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                raise
+            retries += 1
+            time.sleep(delay)
 
 
 def _harvest_memory_globs(ctx: AutopilotContext, deadline: float | None) -> int:

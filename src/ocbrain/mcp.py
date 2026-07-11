@@ -143,6 +143,9 @@ def _log_retrieval_if_available(
     *,
     task_ref: str,
     note: str | None = None,
+    context: ScopeContext | None = None,
+    query_text: str | None = None,
+    served_ids: list[str] | None = None,
 ) -> tuple[str | None, str]:
     """Log a read without making it unavailable behind a long DB writer.
 
@@ -154,10 +157,13 @@ def _log_retrieval_if_available(
         retrieval_use_id = log_retrieval_use(
             conn,
             knowledge_id,
-            runtime="mcp",
+            runtime=(context.runtime if context and context.runtime else "mcp"),
             task_ref=task_ref,
             outcome="served",
             note=note,
+            query_text=query_text,
+            served_ids=served_ids,
+            session_id=(context.session if context else None),
         )
         conn.commit()
         return retrieval_use_id, "recorded"
@@ -188,22 +194,28 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
             retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
                 conn,
                 None,
-                task_ref=f"brain.search:{query}",
+                task_ref=context.task or f"brain.search:{query}",
                 note=f"scoped=true;limit={limit}",
+                context=context,
+                query_text=query,
+                served_ids=[str(item["belief_id"]) for item in payload["items"]],
             )
             payload["retrieval_use_id"] = retrieval_use_id
             payload["retrieval_use_status"] = retrieval_use_status
             return text_result(payload)
         rows = search(conn, query, limit, scopes=PUBLIC_SCOPES, filters=filters)
+        served_ids = [str(row["doc_id"]) for row in rows]
+        retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
+            conn,
+            served_ids[0] if len(served_ids) == 1 and served_ids[0].startswith("know") else None,
+            task_ref=f"brain.search:{query}",
+            note=f"limit={limit};filters={json.dumps(filters, sort_keys=True)}",
+            query_text=query,
+            served_ids=served_ids,
+        )
         result_rows = []
         for row in rows:
             row_dict = dict(row)
-            retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
-                conn,
-                row["doc_id"] if row["kind"].startswith("knowledge:") else None,
-                task_ref=f"brain.search:{query}",
-                note=f"limit={limit};filters={json.dumps(filters, sort_keys=True)}",
-            )
             row_dict["retrieval_use_id"] = retrieval_use_id
             row_dict["retrieval_use_status"] = retrieval_use_status
             result_rows.append(row_dict)
@@ -222,8 +234,11 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
         retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
             conn,
             None,
-            task_ref=f"brain.preview:{query}",
+            task_ref=context_from_arguments(arguments).task or f"brain.preview:{query}",
             note=f"limit={limit}",
+            context=context_from_arguments(arguments),
+            query_text=query,
+            served_ids=[str(item["belief_id"]) for item in payload["items"]],
         )
         payload["retrieval_use_id"] = retrieval_use_id
         payload["retrieval_use_status"] = retrieval_use_status
@@ -786,7 +801,7 @@ def checked_filters(value: Any) -> dict[str, Any]:
         return {}
     if not isinstance(value, dict):
         raise ValueError("filters must be an object")
-    allowed = {"project", "type", "status", "loop_id", "family"}
+    allowed = {"project", "repo", "type", "status", "loop_id", "family"}
     return {key: val for key, val in value.items() if key in allowed and isinstance(val, str)}
 
 

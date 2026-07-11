@@ -7,7 +7,9 @@ Last updated: 2026-06-25
 > stallcheck, local dataset grading, eval-before-train pilot, and current MCP
 > write surfaces. It is preserved as design history. Use
 > [`ARCHITECTURE.md`](ARCHITECTURE.md), [`AGENT_USE_GUIDE.md`](AGENT_USE_GUIDE.md),
-> and the top-level [`README.md`](../README.md) for current behavior.
+> [`CONTRACT.md`](CONTRACT.md), and the top-level [`README.md`](../README.md) for
+> current behavior. Statements below about human-gated routine knowledge are
+> historical and must not be used as current operating doctrine.
 
 This is the coding and product guide for OCBrain as it exists in this repo.
 It is meant for humans and agents who need to understand, maintain, extend, or

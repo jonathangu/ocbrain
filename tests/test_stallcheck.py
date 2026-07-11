@@ -514,6 +514,74 @@ def test_brain_deadman_reader_watches_autopilot_without_recursing(tmp_path):
     assert later[0].fingerprint != first_fingerprint
 
 
+def test_autopilot_failure_reader_pages_partial_and_stale_running(tmp_path):
+    brain = _brain(tmp_path)
+    now = datetime(2026, 7, 10, 22, 0, tzinfo=UTC)
+    brain.executemany(
+        """
+        INSERT INTO autopilot_runs
+          (id, started_at, finished_at, status, stages_json, error)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                "run_partial",
+                (now - timedelta(hours=2)).isoformat(),
+                (now - timedelta(hours=1)).isoformat(),
+                "partial",
+                json.dumps({"harvest": {"error": "database is locked"}}),
+                None,
+            ),
+            (
+                "run_running",
+                (now - timedelta(hours=6)).isoformat(),
+                None,
+                "running",
+                "{}",
+                None,
+            ),
+        ],
+    )
+    brain.commit()
+
+    findings = stallcheck.scan_autopilot_failures(brain, _cfg(), now)
+    assert {finding.stall_class for finding in findings} == {
+        "autopilot_failed",
+        "autopilot_stuck_running",
+    }
+    partial = next(item for item in findings if item.stall_class == "autopilot_failed")
+    assert "harvest: database is locked" in partial.snippet
+
+
+def test_autopilot_failure_reader_detects_judge_substage_streak(tmp_path):
+    brain = _brain(tmp_path)
+    now = datetime(2026, 7, 10, 22, 0, tzinfo=UTC)
+    payload = json.dumps(
+        {"autolabel": {"stages": {"judge": {"error": "read operation timed out"}}}}
+    )
+    for index in range(2):
+        started = now - timedelta(minutes=30 + index * 30)
+        brain.execute(
+            """
+            INSERT INTO autopilot_runs
+              (id, started_at, finished_at, status, stages_json, error)
+            VALUES (?, ?, ?, 'ok', ?, NULL)
+            """,
+            (
+                f"run_judge_{index}",
+                started.isoformat(),
+                (started + timedelta(minutes=5)).isoformat(),
+                payload,
+            ),
+        )
+    brain.commit()
+
+    findings = stallcheck.scan_autopilot_failures(brain, _cfg(judge_failure_streak=2), now)
+    streaks = [item for item in findings if item.stall_class == "judge_failure_streak"]
+    assert len(streaks) == 1
+    assert "2 consecutive" in streaks[0].snippet
+
+
 def test_dry_run_reports_brain_deadman_without_writing(tmp_path, capsys):
     brain = _brain(tmp_path)
     stale = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
@@ -699,6 +767,33 @@ def test_run_inert_pager_when_unconfigured(tmp_path):
     report = stallcheck.run(cfg, brain, runner=None, now=datetime.now(UTC))
     assert len(report.paged) == 1
     assert report.page_status is None  # inert: found + recorded, but never sent
+
+
+def test_daily_canary_sends_once_and_records_real_delivery(tmp_path, monkeypatch):
+    brain = _brain(tmp_path)
+    cfg = _cfg(
+        daily_canary_enabled=True,
+        daily_canary_hour_utc=0,
+        pager_chat_id="chat",
+        pager_openclaw_json="/configured",
+    )
+    sent: list[str] = []
+    monkeypatch.setattr(stallcheck, "send_telegram", lambda _cfg, text: sent.append(text) or 200)
+    now = datetime(2026, 7, 10, 20, 0, tzinfo=UTC)
+
+    first = stallcheck.run(cfg, brain, now=now)
+    second = stallcheck.run(cfg, brain, now=now + timedelta(minutes=15))
+
+    assert first.canary_status == 200
+    assert second.canary_status is None
+    assert len(sent) == 1
+    assert "pager canary" in sent[0].lower()
+    assert (
+        brain.execute(
+            "SELECT paged_at FROM stall_pages WHERE fingerprint='__canary__:2026-07-10'"
+        ).fetchone()["paged_at"]
+        is not None
+    )
 
 
 def test_read_bot_token_extracts_and_missing(tmp_path):

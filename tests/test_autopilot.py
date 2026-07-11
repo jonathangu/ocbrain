@@ -132,6 +132,26 @@ def test_flock_single_instance(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM autopilot_runs").fetchone()[0] == 0
 
 
+def test_harvest_sqlite_lock_retry_is_bounded_and_rolls_back(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path)
+    ctx = autopilot.AutopilotContext(conn=conn, cfg=_cfg(tmp_path), db_path=path)
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    monkeypatch.setattr(autopilot.time, "sleep", lambda value: sleeps.append(value))
+    result, retries = autopilot._retry_sqlite_locked(ctx, None, flaky)
+
+    assert result == "ok"
+    assert retries == 2
+    assert sleeps == [0.25, 0.5]
+
+
 def test_snapshot_daily_skip(tmp_path):
     conn, path = _db(tmp_path)
     cfg = _cfg(tmp_path)

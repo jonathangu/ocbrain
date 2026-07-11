@@ -110,10 +110,19 @@ def _rate(
                 "style. Concision must never make a boastful, fabricated, or privacy-unsafe answer "
                 "win. Prefer concise, specific judgment over padded assistant prose, while keeping "
                 "one useful reason. For a list or summary, a compact answer is the better editable "
-                "base when its missing reason can be added in one line. Under noisy evidence, "
+                "base when its missing reason can be added in one line. "
+                "When the prompt explicitly asks to summarize or list priorities, do not penalize "
+                "a compact slash/list form merely for being terse; prefer it over a polished "
+                "paragraph when the named priorities are concrete and the only missing piece is "
+                "one short reason. This exception does not apply when the prompt asks why or asks "
+                "for an explanation. "
+                "Under noisy evidence, "
                 "preserve optionality; communicate uncertainty with the best supported estimate "
                 "or range instead of fake precision or evasiveness. If neither response is ideal, "
-                "choose the closer editable base. Return JSON only."
+                "choose the closer editable base. For a fictional or hypothetical example, prefer "
+                "the response that makes assumptions and data provenance explicit over a colorful "
+                "story whose invented claims are not identified or inspectable. "
+                "Return JSON only."
             ),
         },
         {

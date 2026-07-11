@@ -122,6 +122,26 @@ def test_priority_inject_then_labeled_then_retrieval_and_catalog_excluded(
     assert catalog not in ordered
 
 
+def test_labeled_raw_catalog_doc_stays_unembedded_until_retrieved(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    catalog = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="raw-history",
+        title="Raw history file",
+        body_uri="/local/history.jsonl",
+        doc_kind="history",
+        status="current",
+        origin="catalog",
+    )
+    _set(conn, catalog, quality_label="good")
+    assert catalog not in {row["id"] for row in eligible_rows(conn, cfg)}
+    _touch_retrieval(conn, catalog)
+    assert catalog in {row["id"] for row in eligible_rows(conn, cfg)}
+
+
 def test_stale_and_unembedded_are_eligible_fresh_are_not(tmp_path: Path) -> None:
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)

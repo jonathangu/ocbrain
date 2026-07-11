@@ -90,6 +90,11 @@ class AutopilotConfig:
     # writer batch. Small WALs are left to SQLite's normal autocheckpoint path.
     checkpoint_after_dataset_mine: bool = True
     checkpoint_wal_min_bytes: int = 64 * 1024 * 1024
+    # Transient SQLite writers (MCP feedback / stallcheck) must not turn an
+    # otherwise healthy harvest into a partial run. Retries remain bounded by
+    # both this count and the harvest stage deadline.
+    sqlite_lock_retries: int = 4
+    sqlite_lock_backoff_seconds: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -156,6 +161,9 @@ class JudgeConfig:
     batch_size: int = 20
     per_run_item_cap: int = 100
     signal_weight: float = 0.4
+    timeout_seconds: float = 45.0
+    timeout_max_retries: int = 3
+    retry_backoff_seconds: float = 2.0
     # {model: {"prompt": usd_per_mtok, "completion": usd_per_mtok}}; supplied via
     # config JSON so no price is baked into source.
     price_per_mtok: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -239,7 +247,7 @@ class DatasetGradingConfig:
     timeout_seconds: int = 180
     per_run_item_cap: int = 100
     daily_item_cap: int = 500
-    prompt_version: str = "dataset-rubric-v1"
+    prompt_version: str = "dataset-rubric-v2-bounded-context"
 
 
 @dataclass(frozen=True)

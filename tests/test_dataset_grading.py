@@ -9,7 +9,14 @@ import pytest
 
 from ocbrain.config import DatasetGradingConfig, OcbrainConfig
 from ocbrain.dataset.export import export_all
-from ocbrain.dataset.grade import DATASET_RUBRICS, grade_examples, require_loopback_endpoint
+from ocbrain.dataset.grade import (
+    DATASET_RUBRICS,
+    MAX_GRADE_CONTEXT_CHARS,
+    _messages,
+    grade_examples,
+    normalize_grade,
+    require_loopback_endpoint,
+)
 from ocbrain.dataset.quality import store_example
 from ocbrain.db import connect, init_db
 
@@ -94,6 +101,38 @@ def test_loopback_boundary_rejects_remote_endpoints():
         require_loopback_endpoint("http://user:secret@localhost:11434/api/chat")
 
 
+def test_normalize_grade_accepts_validated_flat_local_model_dimensions():
+    raw = {
+        "overall_score": 0.82,
+        **{name: 0.8 for name in DATASET_RUBRICS["dpo"]},
+        "verdict": "pass",
+        "flags": [],
+        "explanation": "Valid flat structured response.",
+    }
+    grade = normalize_grade("dpo", raw)
+    assert grade["overall_score"] == 0.82
+    assert grade["dimensions"] == {name: 0.8 for name in DATASET_RUBRICS["dpo"]}
+
+
+def test_grade_view_bounds_old_context_but_preserves_target():
+    target = "target response " * 100
+    record = {
+        "messages": [
+            {"role": "user", "content": "old context " * 1000},
+            {"role": "user", "content": "recent question"},
+            {"role": "assistant", "content": target},
+        ],
+        "metadata": {"private": "not included"},
+    }
+    request = json.loads(_messages("sft", record)[1]["content"])
+    example = request["example"]
+    assert example["messages"][-1]["content"] == target
+    assert sum(len(item["content"]) for item in example["messages"][:-1]) <= (
+        MAX_GRADE_CONTEXT_CHARS
+    )
+    assert "metadata" not in example
+
+
 def test_grade_persists_metadata_and_is_idempotent(tmp_path: Path):
     conn = _db(tmp_path)
     for i, dataset in enumerate(("sft", "dpo", "persona")):
@@ -112,8 +151,7 @@ def test_grade_persists_metadata_and_is_idempotent(tmp_path: Path):
     assert all(row["grade_score"] == 0.86 for row in rows)
     assert all(row["grade_model"] == "local-test-model" for row in rows)
     assert all(
-        json.loads(row["example_json"])["metadata"]["llm_grade"]["local_only"]
-        for row in rows
+        json.loads(row["example_json"])["metadata"]["llm_grade"]["local_only"] for row in rows
     )
 
     again = grade_examples(conn, cfg=cfg, transport=_transport, now=now)
@@ -138,9 +176,7 @@ def test_grade_can_target_a_private_curation_source_prefix(tmp_path: Path):
         source_uri_prefix="curation://pack-a/",
     )
     assert result["graded"] == 1
-    scores = conn.execute(
-        "SELECT id, grade_score FROM dataset_examples ORDER BY id"
-    ).fetchall()
+    scores = conn.execute("SELECT id, grade_score FROM dataset_examples ORDER BY id").fetchall()
     assert {row["id"] for row in scores if row["grade_score"] is not None} == {wanted["id"]}
 
 
@@ -184,12 +220,13 @@ def test_grade_releases_write_lock_between_local_calls(tmp_path: Path):
         calls += 1
         if calls == 2:
             observer = connect(tmp_path / "db.sqlite")
-            assert observer.execute(
-                "SELECT COUNT(*) FROM dataset_examples WHERE grade_score IS NOT NULL"
-            ).fetchone()[0] == 1
-            run = observer.execute(
-                "SELECT status, item_count FROM dataset_grade_runs"
-            ).fetchone()
+            assert (
+                observer.execute(
+                    "SELECT COUNT(*) FROM dataset_examples WHERE grade_score IS NOT NULL"
+                ).fetchone()[0]
+                == 1
+            )
+            run = observer.execute("SELECT status, item_count FROM dataset_grade_runs").fetchone()
             assert run["status"] == "running" and run["item_count"] == 1
             observer.close()
         return _transport(endpoint, model, messages, timeout)
@@ -218,9 +255,12 @@ def test_failed_example_is_skipped_until_forced(tmp_path: Path):
 
     advanced = grade_examples(conn, cfg=_cfg(), limit=1, transport=_transport)
     assert advanced["graded"] == 1
-    assert conn.execute(
-        "SELECT grade_score FROM dataset_examples WHERE id = ?", (second["id"],)
-    ).fetchone()[0] == 0.86
+    assert (
+        conn.execute(
+            "SELECT grade_score FROM dataset_examples WHERE id = ?", (second["id"],)
+        ).fetchone()[0]
+        == 0.86
+    )
 
     retried = grade_examples(conn, cfg=_cfg(), limit=1, force=True, transport=_transport)
     assert retried["graded"] == 1
@@ -273,9 +313,7 @@ def test_progress_lock_returns_blocked_and_next_run_repairs(tmp_path: Path):
     repaired = grade_examples(conn, cfg=_cfg(), limit=1, transport=_transport)
     assert repaired["repaired_runs"] == 1
     assert repaired["graded"] == 1
-    statuses = {
-        row[0] for row in conn.execute("SELECT status FROM dataset_grade_runs")
-    }
+    statuses = {row[0] for row in conn.execute("SELECT status FROM dataset_grade_runs")}
     assert statuses == {"interrupted", "ok"}
 
 

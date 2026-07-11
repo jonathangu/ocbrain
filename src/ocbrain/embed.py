@@ -148,6 +148,14 @@ def eligible_rows(
               SELECT 1 FROM retrieval_uses ru WHERE ru.knowledge_id = k.id
             )
           )
+          AND NOT (
+            k.type = 'doc'
+            AND COALESCE(k.origin, '') NOT IN ('human', 'harvest', 'loop')
+            AND k.inject = 0
+            AND NOT EXISTS (
+              SELECT 1 FROM retrieval_uses ru2 WHERE ru2.knowledge_id = k.id
+            )
+          )
         ORDER BY embed_priority ASC, k.updated_at DESC, k.id ASC
         LIMIT ?
         """,
@@ -272,8 +280,7 @@ def _write_egress_audit(
         "context": {},
         "query": None,
         "included": [
-            {"id": item["id"], "scope": item["scope"], "body": item["text"]}
-            for item in included
+            {"id": item["id"], "scope": item["scope"], "body": item["text"]} for item in included
         ],
         "rejected": rejected,
         "payload_hash": sha256_text(payload_text),

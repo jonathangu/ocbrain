@@ -428,6 +428,13 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_curate_parser.add_argument("--input", type=Path, required=True)
     dataset_curate_parser.set_defaults(func=cmd_dataset_persona_curate)
 
+    dataset_calibration_parser = subparsers.add_parser(
+        "dataset-calibration-import",
+        help="Import private human preferences with reasons and ideal corrections",
+    )
+    dataset_calibration_parser.add_argument("--input", type=Path, required=True)
+    dataset_calibration_parser.set_defaults(func=cmd_dataset_calibration_import)
+
     dataset_grade_parser = subparsers.add_parser(
         "dataset-grade", help="Grade examples with a loopback-only local LLM"
     )
@@ -440,7 +447,74 @@ def build_parser() -> argparse.ArgumentParser:
         help="Grade only examples whose local provenance URI begins with this value",
     )
     dataset_grade_parser.add_argument("--force", action="store_true")
+    dataset_grade_parser.add_argument(
+        "--train-class",
+        action="append",
+        dest="train_classes",
+        choices=[
+            "train_voice",
+            "train_judgment",
+            "train_skill",
+            "retrieval_only",
+            "exclude",
+        ],
+        help="Grade only examples in one or more weights/retrieval classes",
+    )
+    dataset_grade_parser.add_argument(
+        "--selected-only",
+        action="store_true",
+        help="Grade only the deterministic v0.4 selected training pack",
+    )
     dataset_grade_parser.set_defaults(func=cmd_dataset_grade)
+
+    dataset_classify_parser = subparsers.add_parser(
+        "dataset-classify",
+        help="Classify examples as weights training, retrieval-only, or excluded",
+    )
+    dataset_classify_parser.add_argument("--limit", type=int)
+    dataset_classify_parser.add_argument("--force", action="store_true")
+    dataset_classify_parser.set_defaults(func=cmd_dataset_classify)
+
+    dataset_pack_select_parser = subparsers.add_parser(
+        "dataset-pack-select",
+        help="Select the deterministic local v0.4 training pack",
+    )
+    dataset_pack_select_parser.add_argument("--sft", type=int, default=2000)
+    dataset_pack_select_parser.add_argument("--dpo", type=int, default=300)
+    dataset_pack_select_parser.add_argument("--persona", type=int, default=500)
+    dataset_pack_select_parser.add_argument("--seed", default="ocbrain-v04-selected-pack-v1")
+    dataset_pack_select_parser.set_defaults(func=cmd_dataset_pack_select)
+
+    dataset_pack_stats_parser = subparsers.add_parser(
+        "dataset-pack-stats",
+        help="Report selected-pack local grade coverage and passing counts",
+    )
+    dataset_pack_stats_parser.add_argument("--min-grade", type=float, default=0.8)
+    dataset_pack_stats_parser.set_defaults(func=cmd_dataset_pack_stats)
+
+    feedback_stats_parser = subparsers.add_parser(
+        "retrieval-feedback-stats",
+        help="Report explicit/inferred retrieval feedback coverage",
+    )
+    feedback_stats_parser.set_defaults(func=cmd_retrieval_feedback_stats)
+
+    retrieval_benchmark_parser = subparsers.add_parser(
+        "retrieval-benchmark",
+        help="Run a frozen, scope-aware retrieval benchmark without returning corpus text",
+    )
+    retrieval_benchmark_parser.add_argument("--input", type=Path, required=True)
+    retrieval_benchmark_parser.add_argument(
+        "--allow-small", action="store_true", help="Allow fewer than 100 cases for diagnostics"
+    )
+    retrieval_benchmark_parser.set_defaults(func=cmd_retrieval_benchmark)
+
+    retrieval_benchmark_expand_parser = subparsers.add_parser(
+        "retrieval-benchmark-expand",
+        help="Expand a private 25-case base across four supported runtimes",
+    )
+    retrieval_benchmark_expand_parser.add_argument("--input", type=Path, required=True)
+    retrieval_benchmark_expand_parser.add_argument("--output", type=Path, required=True)
+    retrieval_benchmark_expand_parser.set_defaults(func=cmd_retrieval_benchmark_expand)
 
     dataset_export_parser = subparsers.add_parser(
         "dataset-export", help="Export deterministic JSONL datasets + manifest"
@@ -463,8 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pilot_prepare_parser.add_argument("--output-dir", type=Path)
     pilot_prepare_parser.add_argument("--min-grade", type=float)
-    pilot_prepare_parser.add_argument("--eval-prompts", type=int, default=20)
-    pilot_prepare_parser.add_argument("--seed", default="ocbrain-voice-pilot-v1")
+    pilot_prepare_parser.add_argument("--eval-prompts", type=int, default=100)
+    pilot_prepare_parser.add_argument("--seed", default="ocbrain-voice-pilot-v3")
     pilot_prepare_parser.add_argument("--base-model")
     pilot_prepare_parser.add_argument("--base-model-source")
     pilot_prepare_parser.add_argument("--base-model-revision")
@@ -472,6 +546,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--eval-from",
         type=Path,
         help="Reuse a prior pilot's prompts/references/rubric byte-for-byte",
+    )
+    pilot_prepare_parser.add_argument(
+        "--legacy-sentinel-from",
+        type=Path,
+        help="Preserve a prior frozen eval separately and exclude all its sources from train",
+    )
+    pilot_prepare_parser.add_argument(
+        "--diagnostic-small-pack",
+        action="store_true",
+        help="Disable v0.4 corpus-size/train-class gates for diagnostics only",
     )
     pilot_prepare_parser.add_argument("--training-iterations", type=int, default=25)
     pilot_prepare_parser.set_defaults(func=cmd_dataset_pilot_prepare)
@@ -490,6 +574,27 @@ def build_parser() -> argparse.ArgumentParser:
     pilot_score_parser.add_argument("--pilot-dir", type=Path, required=True)
     pilot_score_parser.add_argument("--ratings", type=Path, required=True)
     pilot_score_parser.set_defaults(func=cmd_dataset_pilot_score)
+
+    pilot_multiblind_parser = subparsers.add_parser(
+        "dataset-pilot-multiblind",
+        help="Build a blinded Jonathan/base/tuned/frontier evaluation pack",
+    )
+    pilot_multiblind_parser.add_argument("--pilot-dir", type=Path, required=True)
+    pilot_multiblind_parser.add_argument(
+        "--response",
+        action="append",
+        required=True,
+        help="One of base=/path, tuned=/path, frontier=/path; repeat three times",
+    )
+    pilot_multiblind_parser.add_argument("--seed", default="ocbrain-multiblind-v1")
+    pilot_multiblind_parser.set_defaults(func=cmd_dataset_pilot_multiblind)
+
+    pilot_multiscore_parser = subparsers.add_parser(
+        "dataset-pilot-multiscore", help="Score completed four-way blind rankings"
+    )
+    pilot_multiscore_parser.add_argument("--pilot-dir", type=Path, required=True)
+    pilot_multiscore_parser.add_argument("--ratings", type=Path, required=True)
+    pilot_multiscore_parser.set_defaults(func=cmd_dataset_pilot_multiscore)
 
     pilot_record_parser = subparsers.add_parser(
         "dataset-pilot-record-training", help="Record verified local adapter evidence"
@@ -680,8 +785,7 @@ def cmd_search(args: argparse.Namespace) -> int:
         if value
     }
     rows = [
-        dict(row)
-        for row in search(conn, args.query, args.limit, scopes=scopes, filters=filters)
+        dict(row) for row in search(conn, args.query, args.limit, scopes=scopes, filters=filters)
     ]
     output(args, {"query": args.query, "filters": filters, "results": rows})
     return 0
@@ -992,7 +1096,7 @@ def legacy_rows_for_backfill(
             f"""
             SELECT *
             FROM knowledge
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
               AND NOT EXISTS (
                 SELECT 1
                 FROM current_beliefs
@@ -1187,7 +1291,7 @@ def cmd_import_history(args: argparse.Namespace) -> int:
         by_runtime[result["runtime"]] = by_runtime.get(result["runtime"], 0) + 1
         if len(samples) < 20:
             samples.append(result)
-        existing_sources.add((result["path"], f'{result["runtime"]}_history_file'))
+        existing_sources.add((result["path"], f"{result['runtime']}_history_file"))
         if imported % batch_size == 0:
             conn.commit()
     conn.commit()
@@ -1268,9 +1372,7 @@ def import_memory_file(
     raw = path.read_text(encoding="utf-8", errors="replace")
     if not raw.strip():
         return None
-    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode(
-        "utf-8", errors="replace"
-    )
+    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode("utf-8", errors="replace")
     text = redact_secrets(truncated)
     title = title_from_text(text, path.stem)
     source_uri = str(path)
@@ -1547,9 +1649,7 @@ def cmd_quarantine_list(args: argparse.Namespace) -> int:
 
 def cmd_quarantine_release(args: argparse.Namespace) -> int:
     conn = open_db(args)
-    released = release_quarantine(
-        conn, args.knowledge_id, actor=args.actor, reason=args.reason
-    )
+    released = release_quarantine(conn, args.knowledge_id, actor=args.actor, reason=args.reason)
     conn.commit()
     row = get_knowledge(conn, args.knowledge_id)
     output(
@@ -1647,6 +1747,16 @@ def cmd_dataset_persona_curate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dataset_calibration_import(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.calibration import import_calibrations
+
+    conn = open_db(args)
+    result = import_calibrations(conn, args.input)
+    conn.commit()
+    output(args, result)
+    return 0
+
+
 def cmd_dataset_export(args: argparse.Namespace) -> int:
     conn = open_db(args)
     cfg = load_config()
@@ -1681,10 +1791,77 @@ def cmd_dataset_grade(args: argparse.Namespace) -> int:
         model=getattr(args, "model", None),
         force=getattr(args, "force", False),
         source_uri_prefix=getattr(args, "source_uri_prefix", None),
+        train_classes=getattr(args, "train_classes", None),
+        selected_only=bool(getattr(args, "selected_only", False)),
     )
     conn.commit()
     output(args, result)
     return 1 if result.get("status") in {"error", "blocked", "locked"} else 0
+
+
+def cmd_dataset_classify(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.classify import classify_examples
+
+    conn = open_db(args)
+    result = classify_examples(
+        conn,
+        force=bool(getattr(args, "force", False)),
+        limit=getattr(args, "limit", None),
+    )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pack_select(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.selection import select_training_pack
+
+    conn = open_db(args)
+    result = select_training_pack(
+        conn,
+        targets={"sft": args.sft, "dpo": args.dpo, "persona": args.persona},
+        seed=args.seed,
+    )
+    conn.commit()
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pack_stats(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.selection import selected_pack_stats
+
+    conn = open_db(args)
+    output(args, selected_pack_stats(conn, min_grade=args.min_grade))
+    return 0
+
+
+def cmd_retrieval_feedback_stats(args: argparse.Namespace) -> int:
+    from ocbrain.feedback import feedback_coverage
+
+    conn = open_db(args)
+    output(args, feedback_coverage(conn))
+    return 0
+
+
+def cmd_retrieval_benchmark(args: argparse.Namespace) -> int:
+    from ocbrain.retrieval_eval import run_benchmark
+
+    conn = open_db(args)
+    result = run_benchmark(
+        conn,
+        args.input,
+        require_cases=1 if bool(getattr(args, "allow_small", False)) else 100,
+    )
+    output(args, result)
+    return 0
+
+
+def cmd_retrieval_benchmark_expand(args: argparse.Namespace) -> int:
+    from ocbrain.retrieval_eval import expand_runtime_matrix
+
+    result = expand_runtime_matrix(args.input, args.output)
+    output(args, result)
+    return 0
 
 
 def cmd_dataset_stats(args: argparse.Namespace) -> int:
@@ -1703,13 +1880,15 @@ def cmd_dataset_pilot_prepare(args: argparse.Namespace) -> int:
             cfg=load_config(),
             output_dir=getattr(args, "output_dir", None),
             min_grade=getattr(args, "min_grade", None),
-            eval_prompts=getattr(args, "eval_prompts", 20),
-            seed=getattr(args, "seed", "ocbrain-voice-pilot-v1"),
+            eval_prompts=getattr(args, "eval_prompts", 100),
+            seed=getattr(args, "seed", "ocbrain-voice-pilot-v3"),
             base_model=getattr(args, "base_model", None),
             base_model_source=getattr(args, "base_model_source", None),
             base_model_revision=getattr(args, "base_model_revision", None),
             eval_from=getattr(args, "eval_from", None),
             training_iterations=getattr(args, "training_iterations", 25),
+            quality_gates=not bool(getattr(args, "diagnostic_small_pack", False)),
+            sentinel_from=getattr(args, "legacy_sentinel_from", None),
         )
     except RuntimeError as exc:
         output(
@@ -1742,6 +1921,28 @@ def cmd_dataset_pilot_score(args: argparse.Namespace) -> int:
     from ocbrain.dataset.pilot import score_blind_ratings
 
     result = score_blind_ratings(args.pilot_dir, args.ratings)
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pilot_multiblind(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import prepare_multiblind
+
+    response_sets: dict[str, Path] = {}
+    for raw in args.response:
+        name, separator, value = str(raw).partition("=")
+        if not separator or name not in {"base", "tuned", "frontier"} or not value:
+            raise ValueError("--response must be base=PATH, tuned=PATH, or frontier=PATH")
+        response_sets[name] = Path(value).expanduser()
+    result = prepare_multiblind(args.pilot_dir, response_sets, seed=args.seed)
+    output(args, result)
+    return 0
+
+
+def cmd_dataset_pilot_multiscore(args: argparse.Namespace) -> int:
+    from ocbrain.dataset.pilot import score_multiblind
+
+    result = score_multiblind(args.pilot_dir, args.ratings)
     output(args, result)
     return 0
 

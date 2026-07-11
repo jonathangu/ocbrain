@@ -113,6 +113,11 @@ CREATE TABLE IF NOT EXISTS retrieval_uses (
     )
   ) DEFAULT 'unknown',
   note TEXT,
+  query_text TEXT,
+  served_ids_json TEXT,
+  session_id TEXT,
+  feedback_source TEXT,
+  feedback_at TEXT,
   served_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_retrieval_uses_knowledge_outcome_served
@@ -297,6 +302,13 @@ CREATE TABLE IF NOT EXISTS dataset_examples (
   grade_model TEXT,
   grade_prompt_version TEXT,
   graded_at TEXT,
+  train_class TEXT,
+  train_class_reason TEXT,
+  train_classified_at TEXT,
+  train_selected INTEGER NOT NULL DEFAULT 0,
+  train_selection_rank INTEGER,
+  train_selection_reason TEXT,
+  train_selected_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(dataset, content_hash)
@@ -329,6 +341,19 @@ CREATE TABLE IF NOT EXISTS dataset_grade_runs (
   error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_dataset_grade_runs_ts ON dataset_grade_runs(ts);
+
+CREATE TABLE IF NOT EXISTS dataset_calibrations (
+  eval_id TEXT PRIMARY KEY,
+  winner TEXT NOT NULL,
+  reason TEXT,
+  ideal_response TEXT,
+  ideal_response_source TEXT,
+  preference_strength TEXT,
+  labeled_by TEXT,
+  labeled_at TEXT NOT NULL,
+  source_hash TEXT NOT NULL,
+  status TEXT NOT NULL
+);
 
 -- v0.3 additive tables. CREATE ... IF NOT EXISTS keeps init_db idempotent.
 -- embed_runs: one row per embedding batch, for daily-cap accounting + auditing.
@@ -417,8 +442,22 @@ _V4_DATASET_EXAMPLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("grade_model", "TEXT"),
     ("grade_prompt_version", "TEXT"),
     ("graded_at", "TEXT"),
+    ("train_class", "TEXT"),
+    ("train_class_reason", "TEXT"),
+    ("train_classified_at", "TEXT"),
+    ("train_selected", "INTEGER NOT NULL DEFAULT 0"),
+    ("train_selection_rank", "INTEGER"),
+    ("train_selection_reason", "TEXT"),
+    ("train_selected_at", "TEXT"),
 )
 _V4_DATASET_EXPORT_COLUMNS: tuple[tuple[str, str], ...] = (("min_grade", "REAL"),)
+_V4_RETRIEVAL_USE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("query_text", "TEXT"),
+    ("served_ids_json", "TEXT"),
+    ("session_id", "TEXT"),
+    ("feedback_source", "TEXT"),
+    ("feedback_at", "TEXT"),
+)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -476,8 +515,22 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "dataset_examples", column, decl)
     for column, decl in _V4_DATASET_EXPORT_COLUMNS:
         _ensure_column(conn, "dataset_exports", column, decl)
+    for column, decl in _V4_RETRIEVAL_USE_COLUMNS:
+        _ensure_column(conn, "retrieval_uses", column, decl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_dsx_grade ON dataset_examples(dataset, grade_score)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dsx_train_class "
+        "ON dataset_examples(dataset, train_class, grade_score)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dsx_train_selected "
+        "ON dataset_examples(dataset, train_selected, train_class, grade_score)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retrieval_feedback_pending "
+        "ON retrieval_uses(outcome, served_at)"
     )
     _rebuild_memory_view(conn)
 
@@ -1064,6 +1117,10 @@ def search(
     if filters.get("project"):
         clauses.append("(knowledge.project = ? OR evidence.project = ?)")
         params.extend([filters["project"], filters["project"]])
+    if filters.get("repo"):
+        repo = str(Path(filters["repo"]).expanduser().resolve())
+        clauses.append("search_index.path LIKE ?")
+        params.append(f"{repo}%")
     if filters.get("type"):
         clauses.append("knowledge.type = ?")
         params.append(filters["type"])
@@ -1093,7 +1150,15 @@ def search(
             LEFT JOIN knowledge ON knowledge.id = search_index.doc_id
             LEFT JOIN evidence ON evidence.id = search_index.doc_id
             WHERE {" AND ".join(clauses)}
-            ORDER BY rank
+            ORDER BY
+              CASE
+                WHEN evidence.source_type LIKE '%_history_file' THEN 1
+                WHEN knowledge.type = 'doc'
+                  AND COALESCE(knowledge.origin, '') NOT IN ('human','harvest','loop')
+                  AND COALESCE(knowledge.inject, 0) = 0 THEN 1
+                ELSE 0
+              END ASC,
+              rank
             LIMIT ?
             """,
             params,
@@ -1386,8 +1451,13 @@ def log_retrieval_use(
     task_ref: str | None = None,
     outcome: str = "served",
     note: str | None = None,
+    query_text: str | None = None,
+    served_ids: list[str] | tuple[str, ...] | None = None,
+    session_id: str | None = None,
+    feedback_source: str | None = None,
 ) -> str:
     created_at = now_iso()
+    served_ids_json = json.dumps(list(served_ids or []), sort_keys=True, separators=(",", ":"))
     sequence = conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
     retrieval_id = stable_id(
         "ret",
@@ -1396,17 +1466,35 @@ def log_retrieval_use(
         task_ref or "",
         outcome,
         note or "",
+        query_text or "",
+        served_ids_json,
+        session_id or "",
         created_at,
         str(sequence),
     )
     conn.execute(
         """
         INSERT INTO retrieval_uses (
-          id, knowledge_id, served_to_runtime, task_ref, outcome, note, served_at
+          id, knowledge_id, served_to_runtime, task_ref, outcome, note,
+          query_text, served_ids_json, session_id, feedback_source, feedback_at,
+          served_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (retrieval_id, knowledge_id, runtime, task_ref, outcome, note, created_at),
+        (
+            retrieval_id,
+            knowledge_id,
+            runtime,
+            task_ref,
+            outcome,
+            note,
+            query_text,
+            served_ids_json,
+            session_id,
+            feedback_source,
+            created_at if feedback_source else None,
+            created_at,
+        ),
     )
     return retrieval_id
 
@@ -1421,10 +1509,10 @@ def update_retrieval_use_feedback(
     cursor = conn.execute(
         """
         UPDATE retrieval_uses
-        SET outcome = ?, note = ?
+        SET outcome = ?, note = ?, feedback_source = 'explicit', feedback_at = ?
         WHERE id = ?
         """,
-        (outcome, note, retrieval_use_id),
+        (outcome, note, now_iso(), retrieval_use_id),
     )
     return cursor.rowcount > 0
 

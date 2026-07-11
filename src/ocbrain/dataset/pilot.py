@@ -85,20 +85,29 @@ def _eligible_rows(
     dataset: str,
     *,
     min_grade: float,
+    train_class: str | None = None,
+    selected_only: bool = False,
 ) -> list[sqlite3.Row]:
+    class_clause = " AND train_class = ?" if train_class else ""
+    selected_clause = " AND train_selected = 1" if selected_only else ""
+    params: tuple[Any, ...] = (
+        (dataset, min_grade, train_class) if train_class else (dataset, min_grade)
+    )
     return list(
         conn.execute(
-            """
+            f"""
             SELECT id, dataset, content_hash, example_json, grade_score,
-                   grade_model, grade_prompt_version
+                   grade_model, grade_prompt_version, train_class
             FROM dataset_examples
             WHERE dataset = ?
               AND quality_label = 'good'
               AND privacy_scope != 'private'
               AND grade_score >= ?
+              {class_clause}
+              {selected_clause}
             ORDER BY id
-            """,
-            (dataset, min_grade),
+            """,  # noqa: S608 - optional clause is a fixed internal literal
+            params,
         )
     )
 
@@ -169,6 +178,9 @@ def prepare_pilot(
     base_model_revision: str | None = None,
     eval_from: str | Path | None = None,
     training_iterations: int = 25,
+    quality_gates: bool = False,
+    minimum_train_counts: dict[str, int] | None = None,
+    sentinel_from: str | Path | None = None,
 ) -> dict[str, Any]:
     """Write a deterministic private pilot pack, refusing train-first states."""
     cfg = cfg or load_config()
@@ -185,10 +197,57 @@ def prepare_pilot(
         raise ValueError("training_iterations must be positive")
 
     root = (
-        Path(output_dir).expanduser()
-        if output_dir is not None
-        else _default_output_dir(conn, cfg)
+        Path(output_dir).expanduser() if output_dir is not None else _default_output_dir(conn, cfg)
     )
+    required_classes = {
+        "sft": "train_skill",
+        "dpo": "train_judgment",
+        "persona": "train_voice",
+    }
+    minimums = dict(minimum_train_counts or {"sft": 1000, "dpo": 200, "persona": 300})
+    sentinel_hashes: set[str] = set()
+    sentinel_eval: dict[str, Any] | None = None
+    if sentinel_from is not None:
+        sentinel_root = Path(sentinel_from).expanduser()
+        sentinel_prompts = (sentinel_root / "eval" / "prompts.jsonl").read_text(encoding="utf-8")
+        sentinel_references = (sentinel_root / "eval" / "references.jsonl").read_text(
+            encoding="utf-8"
+        )
+        sentinel_rubric = (sentinel_root / "eval" / "rubric.json").read_text(encoding="utf-8")
+        sentinel_prompt_rows = _load_jsonl(sentinel_root / "eval" / "prompts.jsonl")
+        sentinel_reference_rows = _load_jsonl(sentinel_root / "eval" / "references.jsonl")
+        if len(sentinel_prompt_rows) < 20 or len(sentinel_prompt_rows) != len(
+            sentinel_reference_rows
+        ):
+            raise RuntimeError("legacy sentinel must contain matched prompts/references")
+        if json.loads(sentinel_rubric) != RUBRIC:
+            raise RuntimeError("legacy sentinel rubric changed")
+        sentinel_source_ids = [row.get("source_example_id") for row in sentinel_reference_rows]
+        if any(not isinstance(value, str) for value in sentinel_source_ids):
+            raise RuntimeError("legacy sentinel references lost source example ids")
+        placeholders = ",".join("?" for _ in sentinel_source_ids)
+        sentinel_rows = conn.execute(
+            f"SELECT id, content_hash FROM dataset_examples WHERE id IN ({placeholders})",  # noqa: S608
+            tuple(sentinel_source_ids),
+        ).fetchall()
+        if len(sentinel_rows) != len(set(sentinel_source_ids)):
+            raise RuntimeError("legacy sentinel source examples are missing")
+        sentinel_hashes = {str(row["content_hash"]) for row in sentinel_rows}
+        sentinel_files = {
+            "prompts": _atomic_write(
+                root / "eval" / "legacy-sentinel-prompts.jsonl", sentinel_prompts
+            ),
+            "references": _atomic_write(
+                root / "eval" / "legacy-sentinel-references.jsonl", sentinel_references
+            ),
+            "rubric": _atomic_write(root / "eval" / "legacy-sentinel-rubric.json", sentinel_rubric),
+        }
+        sentinel_eval = {
+            "source_name": sentinel_root.name,
+            "prompt_count": len(sentinel_prompt_rows),
+            "files": sentinel_files,
+            "content_hash": sha256_text(canonical_json(sorted(sentinel_hashes))),
+        }
     frozen_eval: dict[str, Any] | None = None
     if eval_from is not None:
         source_root = Path(eval_from).expanduser()
@@ -241,7 +300,12 @@ def prepare_pilot(
             "file_sha256": {name: value["sha256"] for name, value in eval_files.items()},
         }
     else:
-        persona_rows = _eligible_rows(conn, "persona", min_grade=threshold)
+        persona_rows = _eligible_rows(
+            conn,
+            "persona",
+            min_grade=threshold,
+            train_class=required_classes["persona"] if quality_gates else None,
+        )
         eval_candidates: list[tuple[str, sqlite3.Row, list[dict[str, Any]], str]] = []
         for row in persona_rows:
             record = json.loads(row["example_json"])
@@ -250,7 +314,8 @@ def prepare_pilot(
                 continue
             prompt, reference = parts
             rank = sha256_text(f"{seed}:{row['content_hash']}")
-            eval_candidates.append((rank, row, prompt, reference))
+            if row["content_hash"] not in sentinel_hashes:
+                eval_candidates.append((rank, row, prompt, reference))
         eval_candidates.sort(key=lambda item: item[0])
         if len(eval_candidates) < eval_prompts:
             raise RuntimeError(
@@ -276,13 +341,49 @@ def prepare_pilot(
         # The heldout set exists in memory before any training path is opened.
         eval_files = {
             "prompts": _atomic_write(root / "eval" / "prompts.jsonl", _jsonl(prompts)),
-            "references": _atomic_write(
-                root / "eval" / "references.jsonl", _jsonl(references)
-            ),
-            "rubric": _atomic_write(
-                root / "eval" / "rubric.json", canonical_json(RUBRIC) + "\n"
-            ),
+            "references": _atomic_write(root / "eval" / "references.jsonl", _jsonl(references)),
+            "rubric": _atomic_write(root / "eval" / "rubric.json", canonical_json(RUBRIC) + "\n"),
         }
+
+    heldout_hashes |= sentinel_hashes
+    if quality_gates:
+        selected_grade_gaps = {
+            str(row["dataset"]): int(row["n"])
+            for row in conn.execute(
+                """
+                SELECT dataset, COUNT(*) AS n
+                FROM dataset_examples
+                WHERE train_selected = 1 AND grade_score IS NULL
+                GROUP BY dataset
+                """
+            )
+        }
+        if selected_grade_gaps:
+            raise RuntimeError(
+                "v0.4 selected pack is not 100% locally graded: "
+                + canonical_json(selected_grade_gaps)
+            )
+        preflight_counts = {
+            dataset: sum(
+                1
+                for row in _eligible_rows(
+                    conn,
+                    dataset,
+                    min_grade=threshold,
+                    train_class=required_classes[dataset],
+                    selected_only=True,
+                )
+                if row["content_hash"] not in heldout_hashes
+            )
+            for dataset in required_classes
+        }
+        missing = {
+            dataset: {"required": int(minimums[dataset]), "found": preflight_counts[dataset]}
+            for dataset in required_classes
+            if preflight_counts[dataset] < int(minimums[dataset])
+        }
+        if missing:
+            raise RuntimeError("v0.4 corpus quality gate failed: " + canonical_json(missing))
 
     train_files: dict[str, dict[str, Any]] = {}
     train_counts: dict[str, int] = {}
@@ -292,7 +393,13 @@ def prepare_pilot(
     mlx_rejected = 0
     for dataset in ("sft", "dpo", "persona"):
         records: list[dict[str, Any]] = []
-        eligible = _eligible_rows(conn, dataset, min_grade=threshold)
+        eligible = _eligible_rows(
+            conn,
+            dataset,
+            min_grade=threshold,
+            train_class=required_classes[dataset] if quality_gates else None,
+            selected_only=quality_gates,
+        )
         sources = {
             (str(row["grade_model"] or "unknown"), str(row["grade_prompt_version"] or "unknown"))
             for row in eligible
@@ -315,9 +422,7 @@ def prepare_pilot(
                 rank = sha256_text(f"{seed}:mlx-valid:{canonical_json(mlx_body)}")
                 chat_records.append((rank, mlx_body))
         train_counts[dataset] = len(records)
-        train_files[dataset] = _atomic_write(
-            root / "train" / f"{dataset}.jsonl", _jsonl(records)
-        )
+        train_files[dataset] = _atomic_write(root / "train" / f"{dataset}.jsonl", _jsonl(records))
 
     chat_records.sort(key=lambda item: item[0])
     valid_count = min(50, max(1, len(chat_records) // 10)) if len(chat_records) >= 10 else 0
@@ -327,18 +432,18 @@ def prepare_pilot(
         "train": _atomic_write(root / "mlx" / "train.jsonl", _jsonl(train_chat)),
     }
     if valid_chat:
-        mlx_files["valid"] = _atomic_write(
-            root / "mlx" / "valid.jsonl", _jsonl(valid_chat)
-        )
+        mlx_files["valid"] = _atomic_write(root / "mlx" / "valid.jsonl", _jsonl(valid_chat))
 
-    mlx_source = (
-        "mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@"
-        f"{MLX_LM_GIT_COMMIT}"
+    mlx_source = f"mlx-lm[train] @ git+https://github.com/ml-explore/mlx-lm.git@{MLX_LM_GIT_COMMIT}"
+    training_ready = bool(
+        base_model
+        and train_chat
+        and len(prompts) >= eval_prompts
+        and (not quality_gates or all(train_counts[key] >= minimums[key] for key in minimums))
     )
-    training_ready = bool(base_model and train_chat and len(prompts) >= 20)
 
     manifest = {
-        "version": 1,
+        "version": 2 if quality_gates else 1,
         "seed": seed,
         "min_grade": threshold,
         "eval_built_before_train": True,
@@ -397,6 +502,13 @@ def prepare_pilot(
         },
         "eval_files": eval_files,
         "frozen_eval": frozen_eval,
+        "legacy_sentinel": sentinel_eval,
+        "quality_gate": {
+            "enabled": quality_gates,
+            "minimum_train_counts": minimums if quality_gates else None,
+            "required_classes": required_classes if quality_gates else None,
+            "passed": bool(quality_gates),
+        },
         "train_files": train_files,
         "blind_protocol": {
             "candidate_format": {"eval_id": "eval_...", "response": "model text"},
@@ -407,9 +519,7 @@ def prepare_pilot(
             },
         },
     }
-    manifest_file = _atomic_write(
-        root / "pilot-manifest.json", canonical_json(manifest) + "\n"
-    )
+    manifest_file = _atomic_write(root / "pilot-manifest.json", canonical_json(manifest) + "\n")
     return {
         "action": "dataset-pilot-prepare",
         "changed": len(train_files) + len(eval_files) + len(mlx_files) + 1,
@@ -478,6 +588,120 @@ def prepare_blind_pairs(
     }
 
 
+def prepare_multiblind(
+    pilot_dir: str | Path,
+    response_sets: dict[str, str | Path],
+    *,
+    seed: str = "ocbrain-multiblind-v1",
+) -> dict[str, Any]:
+    """Randomize Jonathan/base/tuned/frontier answers into a four-way blind pack."""
+    required = {"base", "tuned", "frontier"}
+    if set(response_sets) != required:
+        raise ValueError("four-way blind eval requires base, tuned, and frontier responses")
+    root = Path(pilot_dir).expanduser()
+    references = {
+        row["eval_id"]: row["reference_response"]
+        for row in _load_jsonl(root / "eval" / "references.jsonl")
+    }
+    prompts = _load_jsonl(root / "eval" / "prompts.jsonl")
+    answers: dict[str, dict[str, str]] = {
+        eval_id: {"jonathan": text} for eval_id, text in references.items()
+    }
+    for source, path in response_sets.items():
+        rows = _load_jsonl(Path(path).expanduser())
+        values = {str(row.get("eval_id")): row.get("response") for row in rows}
+        if set(values) != set(references) or any(
+            not isinstance(value, str) for value in values.values()
+        ):
+            raise ValueError(f"{source} responses do not match the frozen eval ids")
+        for eval_id, value in values.items():
+            answers[eval_id][source] = str(value)
+
+    items: list[dict[str, Any]] = []
+    key: dict[str, dict[str, str]] = {}
+    labels = ["a", "b", "c", "d"]
+    for prompt in prompts:
+        eval_id = str(prompt["eval_id"])
+        sources = sorted(answers[eval_id], key=lambda name: sha256_text(f"{seed}:{eval_id}:{name}"))
+        mapping = dict(zip(labels, sources, strict=True))
+        key[eval_id] = mapping
+        items.append(
+            {
+                "eval_id": eval_id,
+                "messages": prompt["messages"],
+                "responses": {label: answers[eval_id][source] for label, source in mapping.items()},
+            }
+        )
+    item_file = _atomic_write(root / "eval" / "multiblind-items.jsonl", _jsonl(items))
+    key_file = _atomic_write(
+        root / "eval" / "multiblind-key.json",
+        canonical_json({"seed": seed, "items": key}) + "\n",
+    )
+    return {
+        "action": "dataset-pilot-multiblind",
+        "items": len(items),
+        "sources": sorted({"jonathan", *required}),
+        "item_file": item_file,
+        "key_file": key_file,
+    }
+
+
+def score_multiblind(
+    pilot_dir: str | Path,
+    ratings_path: str | Path,
+) -> dict[str, Any]:
+    root = Path(pilot_dir).expanduser()
+    key = json.loads((root / "eval" / "multiblind-key.json").read_text(encoding="utf-8"))
+    mappings = key.get("items") if isinstance(key, dict) else None
+    if not isinstance(mappings, dict):
+        raise ValueError("multiblind key is missing")
+    ratings = _load_jsonl(Path(ratings_path).expanduser())
+    if {str(row.get("eval_id")) for row in ratings} != set(mappings):
+        raise ValueError("multiblind ratings do not match the frozen eval ids")
+    sources = {source for mapping in mappings.values() for source in mapping.values()}
+    first_place = {source: 0 for source in sorted(sources)}
+    rank_sum = {source: 0.0 for source in sorted(sources)}
+    score_sum: dict[str, dict[str, float]] = {source: {} for source in sorted(sources)}
+    score_count: dict[str, dict[str, int]] = {source: {} for source in sorted(sources)}
+    for rating in ratings:
+        eval_id = str(rating["eval_id"])
+        mapping = mappings[eval_id]
+        ranking = rating.get("ranking")
+        if not isinstance(ranking, list) or set(ranking) != set(mapping):
+            raise ValueError(f"invalid four-way ranking for {eval_id}")
+        for index, label in enumerate(ranking, 1):
+            source = mapping[label]
+            rank_sum[source] += index
+            if index == 1:
+                first_place[source] += 1
+        raw_scores = rating.get("scores") or {}
+        for label, dimensions in raw_scores.items():
+            if label not in mapping or not isinstance(dimensions, dict):
+                continue
+            source = mapping[label]
+            for dimension, value in dimensions.items():
+                score_sum[source][dimension] = score_sum[source].get(dimension, 0.0) + float(value)
+                score_count[source][dimension] = score_count[source].get(dimension, 0) + 1
+    report = {
+        "items": len(ratings),
+        "first_place": first_place,
+        "mean_rank": {
+            source: round(rank_sum[source] / len(ratings), 4) for source in sorted(sources)
+        },
+        "dimensions": {
+            source: {
+                dimension: round(total / score_count[source][dimension], 4)
+                for dimension, total in sorted(score_sum[source].items())
+            }
+            for source in sorted(sources)
+        },
+    }
+    report_file = _atomic_write(
+        root / "eval" / "multiblind-report.json", canonical_json(report) + "\n"
+    )
+    return {"action": "dataset-pilot-multiscore", **report, "report_file": report_file}
+
+
 def score_blind_ratings(
     pilot_dir: str | Path,
     ratings_path: str | Path,
@@ -535,9 +759,7 @@ def score_blind_ratings(
         else None,
         "dimensions": dimensions,
     }
-    report_file = _atomic_write(
-        root / "eval" / "blind_report.json", canonical_json(report) + "\n"
-    )
+    report_file = _atomic_write(root / "eval" / "blind_report.json", canonical_json(report) + "\n")
     return {
         "action": "dataset-pilot-score",
         "changed": 1,

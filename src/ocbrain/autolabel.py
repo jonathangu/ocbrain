@@ -139,9 +139,7 @@ def get_watermark(conn: sqlite3.Connection, domain: str, stream: str) -> str | N
     return row["watermark"] if row else None
 
 
-def set_watermark(
-    conn: sqlite3.Connection, domain: str, stream: str, watermark: str
-) -> None:
+def set_watermark(conn: sqlite3.Connection, domain: str, stream: str, watermark: str) -> None:
     conn.execute(
         """
         INSERT INTO harvest_watermarks (domain, stream, watermark, updated_at)
@@ -303,9 +301,7 @@ def mine_event_signals(
     for row in evidence_rows:
         if _out_of_time(deadline):
             break
-        polarity, weight = (
-            ("good", 0.5) if row["verifier_status"] == "passed" else ("bad", 0.6)
-        )
+        polarity, weight = ("good", 0.5) if row["verifier_status"] == "passed" else ("bad", 0.6)
         record_signal(
             conn,
             Signal(
@@ -358,17 +354,12 @@ def mine_learning_db(
     ext.row_factory = sqlite3.Row
     try:
         tables = {
-            r["name"]
-            for r in ext.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            r["name"] for r in ext.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         if "learnings" in tables:
             emitted += _mine_learnings_table(conn, ext, limit=limit, deadline=deadline)
         if "gate_violations" in tables:
-            emitted += _mine_gate_violations_table(
-                conn, ext, limit=limit, deadline=deadline
-            )
+            emitted += _mine_gate_violations_table(conn, ext, limit=limit, deadline=deadline)
     finally:
         ext.close()
     return {"action": "mine_learning_db", "changed": emitted}
@@ -735,11 +726,7 @@ def fold_labels(
         if not signals:
             continue
         label, confidence, _s, _m = label_from_signals(signals, cfg, now=now)
-        drop_inject = (
-            label == "bad"
-            and krow["inject"] == 1
-            and krow["origin"] != "human"
-        )
+        drop_inject = label == "bad" and krow["inject"] == 1 and krow["origin"] != "human"
         if write_batch is not None:
             write_batch.ensure()
         conn.execute(
@@ -793,13 +780,13 @@ def autolabel(
             return None
         return max(0.0, time_budget_seconds - (time.monotonic() - started))
 
-    stages["retrieval"] = mine_retrieval_signals(
-        conn, time_budget_seconds=remaining_budget()
-    )
+    from ocbrain.feedback import infer_retrieval_outcomes
+
+    stages["feedback_infer"] = infer_retrieval_outcomes(conn, now=now)
     conn.commit()
-    stages["events"] = mine_event_signals(
-        conn, time_budget_seconds=remaining_budget()
-    )
+    stages["retrieval"] = mine_retrieval_signals(conn, time_budget_seconds=remaining_budget())
+    conn.commit()
+    stages["events"] = mine_event_signals(conn, time_budget_seconds=remaining_budget())
     conn.commit()
     stages["learning_db"] = mine_learning_db(
         conn,
@@ -807,9 +794,7 @@ def autolabel(
         time_budget_seconds=remaining_budget(),
     )
     conn.commit()
-    stages["commitments"] = mine_commitments(
-        conn, commitments_path=cfg.dataset.commitments_path
-    )
+    stages["commitments"] = mine_commitments(conn, commitments_path=cfg.dataset.commitments_path)
     conn.commit()
     stages["cron"] = mine_cron_state(conn, cron_state_path=cfg.dataset.cron_state_path)
     conn.commit()
@@ -842,7 +827,10 @@ def autolabel(
         try:
             from ocbrain.judge import judge_ambiguous
 
-            kwargs: dict[str, Any] = {"now": now}
+            kwargs: dict[str, Any] = {
+                "now": now,
+                "time_budget_seconds": remaining_budget(),
+            }
             if judge_call is not None:
                 kwargs["call"] = judge_call
             stages["judge"] = judge_ambiguous(conn, cfg, **kwargs)
@@ -951,9 +939,7 @@ def _loads(raw: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _load_json_records(
-    path: str | None, *, container_keys: tuple[str, ...]
-) -> list[Any] | None:
+def _load_json_records(path: str | None, *, container_keys: tuple[str, ...]) -> list[Any] | None:
     if not path:
         return None
     from pathlib import Path

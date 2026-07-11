@@ -26,6 +26,7 @@ DATASET_RUBRICS: dict[str, tuple[str, ...]] = {
     "dpo": ("preference_validity", "chosen_quality", "rejected_defect", "contrast_strength"),
     "persona": ("voice_fidelity", "taste_alignment", "naturalness", "specificity"),
 }
+MAX_GRADE_CONTEXT_CHARS = 6000
 
 GradeTransport = Callable[[str, str, list[dict[str, str]], int], Any]
 
@@ -44,6 +45,43 @@ def require_loopback_endpoint(endpoint: str) -> str:
 
 def _body_without_metadata(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if key != "metadata"}
+
+
+def _bounded_messages(value: Any, *, max_chars: int) -> Any:
+    if not isinstance(value, list):
+        return value
+    kept: list[Any] = []
+    used = 0
+    for message in reversed(value):
+        if not isinstance(message, dict):
+            continue
+        size = len(str(message.get("content") or ""))
+        if kept and used + size > max_chars:
+            break
+        kept.append(message)
+        used += size
+    return list(reversed(kept))
+
+
+def _grade_view(record: dict[str, Any]) -> dict[str, Any]:
+    """Bound old prompt context while preserving every target/preference output."""
+    body = _body_without_metadata(record)
+    if isinstance(body.get("messages"), list):
+        messages = body["messages"]
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
+            body["messages"] = [
+                *_bounded_messages(messages[:-1], max_chars=MAX_GRADE_CONTEXT_CHARS),
+                messages[-1],
+            ]
+    input_value = body.get("input")
+    if isinstance(input_value, dict) and isinstance(input_value.get("messages"), list):
+        body["input"] = {
+            **input_value,
+            "messages": _bounded_messages(
+                input_value["messages"], max_chars=MAX_GRADE_CONTEXT_CHARS
+            ),
+        }
+    return body
 
 
 def _messages(dataset: str, record: dict[str, Any]) -> list[dict[str, str]]:
@@ -67,7 +105,7 @@ def _messages(dataset: str, record: dict[str, Any]) -> list[dict[str, str]]:
                 "flags": ["short_slug"],
                 "explanation": "short string",
             },
-            "example": _body_without_metadata(record),
+            "example": _grade_view(record),
             "rubric_summary": rubric,
         }
     )
@@ -80,13 +118,36 @@ def _ollama_transport(
     messages: list[dict[str, str]],
     timeout: int,
 ) -> Any:
+    request_data = json.loads(messages[-1]["content"])
+    dataset = str(request_data.get("dataset") or "")
+    dimensions = DATASET_RUBRICS.get(dataset)
+    if dimensions is None:
+        raise ValueError("local grader request has an unknown dataset")
+    score_schema = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+    response_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["overall_score", "dimensions", "verdict", "flags", "explanation"],
+        "properties": {
+            "overall_score": score_schema,
+            "dimensions": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": list(dimensions),
+                "properties": {name: score_schema for name in dimensions},
+            },
+            "verdict": {"type": "string", "enum": ["pass", "review", "fail"]},
+            "flags": {"type": "array", "maxItems": 8, "items": {"type": "string"}},
+            "explanation": {"type": "string", "maxLength": 240},
+        },
+    }
     payload = canonical_json(
         {
             "model": model,
             "messages": messages,
             "stream": False,
             "think": False,
-            "format": "json",
+            "format": response_schema,
             "options": {"temperature": 0},
         }
     ).encode("utf-8")
@@ -119,11 +180,16 @@ def normalize_grade(dataset: str, raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("local grader response is not an object")
     dimensions_raw = raw.get("dimensions")
+    # Some loopback models honor every schema field but flatten the nested
+    # dimensions object. Accept that equivalent shape; all names and numeric
+    # bounds are still validated below.
+    if not isinstance(dimensions_raw, dict) and all(
+        name in raw for name in DATASET_RUBRICS[dataset]
+    ):
+        dimensions_raw = {name: raw[name] for name in DATASET_RUBRICS[dataset]}
     if not isinstance(dimensions_raw, dict):
         raise ValueError("local grader response has no dimensions object")
-    dimensions = {
-        name: _score(dimensions_raw.get(name), name) for name in DATASET_RUBRICS[dataset]
-    }
+    dimensions = {name: _score(dimensions_raw.get(name), name) for name in DATASET_RUBRICS[dataset]}
     overall = _score(raw.get("overall_score"), "overall")
     verdict = str(raw.get("verdict") or "").lower()
     if verdict not in {"pass", "review", "fail"}:
@@ -182,6 +248,8 @@ def _candidate_rows(
     force: bool,
     limit: int,
     source_uri_prefix: str | None = None,
+    train_classes: Sequence[str] | None = None,
+    selected_only: bool = False,
 ) -> list[sqlite3.Row]:
     placeholders = ",".join("?" for _ in datasets)
     clauses = [
@@ -193,10 +261,14 @@ def _candidate_rows(
         escaped = source_uri_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         clauses.append("source_uri LIKE ? ESCAPE '\\'")
         params.append(f"{escaped}%")
+    if train_classes:
+        class_placeholders = ",".join("?" for _ in train_classes)
+        clauses.append(f"train_class IN ({class_placeholders})")  # noqa: S608
+        params.extend(train_classes)
+    if selected_only:
+        clauses.append("train_selected = 1")
     if not force:
-        clauses.append(
-            "(grade_model IS NULL OR grade_model != ? OR grade_prompt_version != ?)"
-        )
+        clauses.append("(grade_model IS NULL OR grade_model != ? OR grade_prompt_version != ?)")
         params.extend([model, prompt_version])
     params.append(limit)
     return list(
@@ -301,6 +373,8 @@ def _grade_examples_unlocked(
     now: datetime | None = None,
     transport: GradeTransport | None = None,
     source_uri_prefix: str | None = None,
+    train_classes: Sequence[str] | None = None,
+    selected_only: bool = False,
 ) -> dict[str, Any]:
     """Grade a bounded batch and persist normalized metadata.
 
@@ -357,6 +431,8 @@ def _grade_examples_unlocked(
         force=force,
         limit=batch_limit,
         source_uri_prefix=source_uri_prefix,
+        train_classes=train_classes,
+        selected_only=selected_only,
     )
     if not rows:
         return {
@@ -377,6 +453,8 @@ def _grade_examples_unlocked(
                 "model": model,
                 "prompt_version": grade_cfg.prompt_version,
                 "source_filter": bool(source_uri_prefix),
+                "train_classes": list(train_classes or []),
+                "selected_only": selected_only,
             }
         )
     )
@@ -502,6 +580,8 @@ def grade_examples(
     now: datetime | None = None,
     transport: GradeTransport | None = None,
     source_uri_prefix: str | None = None,
+    train_classes: Sequence[str] | None = None,
+    selected_only: bool = False,
 ) -> dict[str, Any]:
     """Acquire the DB-adjacent single-grader lock, then grade a bounded batch."""
     lock_dir = db_side_dir(conn, "locks")
@@ -517,6 +597,8 @@ def grade_examples(
             now=now,
             transport=transport,
             source_uri_prefix=source_uri_prefix,
+            train_classes=train_classes,
+            selected_only=selected_only,
         )
     with file_lock(lock_dir / "dataset-grade.lock") as acquired:
         if not acquired:
@@ -540,4 +622,6 @@ def grade_examples(
             now=now,
             transport=transport,
             source_uri_prefix=source_uri_prefix,
+            train_classes=train_classes,
+            selected_only=selected_only,
         )

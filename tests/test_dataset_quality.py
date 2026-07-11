@@ -148,7 +148,12 @@ def test_store_prepares_example_before_acquiring_writer_lock(tmp_path: Path, mon
     assert observed is True
     assert conn.in_transaction is False
     assert batch.metrics()["operations"] == 1
+    # v0.4 buffers the already-prepared INSERT without holding SQLite. The
+    # caller's file/session boundary flush makes the batch durable.
+    assert batch.metrics()["batches_committed"] == 0
+    batch.flush()
     assert batch.metrics()["batches_committed"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM dataset_examples").fetchone()[0] == 1
 
 
 # --- ParseCache / DB-anchored side dir (v0.3 incremental mining) --------------

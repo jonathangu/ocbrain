@@ -195,6 +195,8 @@ def release_quarantine(
     autonomous path afterwards. Returns ``False`` if the row is missing or not
     currently quarantined.
     """
+    if actor != "human" and not actor.startswith("human:"):
+        raise PermissionError("quarantine release requires an explicit human actor")
     row = get_knowledge(conn, knowledge_id)
     if row is None or row["quarantine_reason"] is None:
         return False

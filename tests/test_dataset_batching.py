@@ -33,6 +33,26 @@ def test_dataset_write_batch_commits_at_operation_bound(tmp_path):
     assert metrics["max_writer_lock_seconds"] >= 0
 
 
+def test_dataset_write_batch_keeps_unexpired_multirow_transaction(tmp_path):
+    path = tmp_path / "batch.sqlite"
+    conn = connect(path)
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT)")
+    conn.commit()
+    batch = DatasetWriteBatch(conn, max_operations=3, max_seconds=60)
+
+    for value in ("one", "two"):
+        batch.flush_if_expired()
+        batch.ensure()
+        conn.execute("INSERT INTO probe (value) VALUES (?)", (value,))
+        batch.operation()
+
+    assert conn.in_transaction is True
+    assert batch.metrics()["batches_committed"] == 0
+    batch.flush()
+    assert batch.metrics()["operations"] == 2
+    assert batch.metrics()["batches_committed"] == 1
+
+
 def test_checkpoint_requires_writer_exit_and_truncates_wal(tmp_path):
     path = tmp_path / "checkpoint.sqlite"
     conn = connect(path)

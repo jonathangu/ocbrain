@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from ocbrain.autolabel import Signal, decayed_mass, record_signal, signals_for
@@ -52,12 +53,6 @@ from ocbrain.text import redact_secrets
 logger = logging.getLogger(__name__)
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
-
-# One bounded retry with backoff on transient read timeouts (the heavy run's
-# 'read operation timed out'). The call is otherwise best-effort — permanent
-# failures still propagate to the autolabel stage's guard, which records them.
-_TIMEOUT_MAX_RETRIES = 1
-_TIMEOUT_BACKOFF_SECONDS = 2.0
 
 _JUDGE_SYSTEM = (
     "You are a strict knowledge-quality judge. For each item decide whether the "
@@ -86,9 +81,7 @@ _VERDICT_POLARITY = {"good": "good", "bad": "bad", "neutral": "neutral"}
 # * ``session_derived`` — distilled (non-``doc``) knowledge (values / capabilities
 #   surfaced from working sessions), as opposed to raw catalog documents.
 _TARGETING_PREDICATES: dict[str, str] = {
-    "retrieval_touched": (
-        "EXISTS (SELECT 1 FROM retrieval_uses ru WHERE ru.knowledge_id = k.id)"
-    ),
+    "retrieval_touched": ("EXISTS (SELECT 1 FROM retrieval_uses ru WHERE ru.knowledge_id = k.id)"),
     "lesson": "k.origin IN ('harvest', 'loop')",
     "session_derived": "k.type <> 'doc'",
 }
@@ -117,9 +110,7 @@ def _targeting_clause(cfg: Any) -> str:
 
     clauses: list[str] = []
     predicates = [
-        _TARGETING_PREDICATES[token]
-        for token in sources
-        if token in _TARGETING_PREDICATES
+        _TARGETING_PREDICATES[token] for token in sources if token in _TARGETING_PREDICATES
     ]
     if predicates:
         clauses.append("(" + " OR ".join(predicates) + ")")
@@ -303,8 +294,11 @@ def _call_with_timeout_retry(
     api_key: str,
     model: str,
     sleep: Callable[[float], None] = time.sleep,
+    max_retries: int = 1,
+    backoff_seconds: float = 2.0,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Invoke ``call`` with one bounded, backed-off retry on timeout errors.
+    """Invoke ``call`` with bounded exponential retry on timeout errors.
 
     Non-timeout failures (and a timeout that persists past the retry budget)
     propagate unchanged.
@@ -314,23 +308,24 @@ def _call_with_timeout_retry(
         try:
             return call(payload, api_key=api_key, model=model)
         except Exception as exc:  # noqa: BLE001 - re-raised unless a retryable timeout
-            if attempt >= _TIMEOUT_MAX_RETRIES or not _is_timeout_error(exc):
+            if attempt >= max_retries or not _is_timeout_error(exc):
+                raise
+            delay = backoff_seconds * (2**attempt)
+            if deadline is not None and time.monotonic() + delay >= deadline:
                 raise
             attempt += 1
             logger.warning(
                 "judge: hosted call timed out (attempt %d/%d); retrying after backoff",
                 attempt,
-                _TIMEOUT_MAX_RETRIES + 1,
+                max_retries + 1,
             )
-            sleep(_TIMEOUT_BACKOFF_SECONDS * attempt)
+            sleep(delay)
 
 
 def _knowledge_exists(conn: sqlite3.Connection, knowledge_id: Any) -> bool:
     """Whether ``knowledge_id`` still names a live ``knowledge`` row."""
     return (
-        conn.execute(
-            "SELECT 1 FROM knowledge WHERE id = ? LIMIT 1", (knowledge_id,)
-        ).fetchone()
+        conn.execute("SELECT 1 FROM knowledge WHERE id = ? LIMIT 1", (knowledge_id,)).fetchone()
         is not None
     )
 
@@ -341,9 +336,8 @@ def _cost_usd(cfg: Any, model: str, usage: dict[str, Any]) -> float:
         return 0.0
     prompt = float(usage.get("prompt_tokens", 0) or 0)
     completion = float(usage.get("completion_tokens", 0) or 0)
-    return (
-        prompt / 1_000_000 * float(prices.get("prompt", 0.0))
-        + completion / 1_000_000 * float(prices.get("completion", 0.0))
+    return prompt / 1_000_000 * float(prices.get("prompt", 0.0)) + completion / 1_000_000 * float(
+        prices.get("completion", 0.0)
     )
 
 
@@ -416,6 +410,7 @@ def judge_ambiguous(
     now: datetime | None = None,
     env: Mapping[str, str] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    time_budget_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Judge ambiguous rows within budget; fold verdicts as ``llm_judge`` signals.
 
@@ -428,6 +423,7 @@ def judge_ambiguous(
     # ``None``.
     resolved_env: Mapping[str, str] = os.environ if env is None else env
     model = cfg.judge.model
+    deadline = None if time_budget_seconds is None else time.monotonic() + time_budget_seconds
 
     if not cfg.judge.enabled:
         _record_run(conn, status="skipped", model=model)
@@ -471,8 +467,18 @@ def judge_ambiguous(
 
         payload = _build_payload(cfg, model, included)
         request_hash = sha256_text(canonical_json(payload))
+        provider_call = call
+        if call is call_openai:
+            provider_call = partial(call_openai, timeout=max(1.0, float(cfg.judge.timeout_seconds)))
         response = _call_with_timeout_retry(
-            call, payload, api_key=api_key, model=model, sleep=sleep
+            provider_call,
+            payload,
+            api_key=api_key,
+            model=model,
+            sleep=sleep,
+            max_retries=max(0, int(cfg.judge.timeout_max_retries)),
+            backoff_seconds=max(0.0, float(cfg.judge.retry_backoff_seconds)),
+            deadline=deadline,
         )
         usage = response.get("usage", {}) if isinstance(response, dict) else {}
         cost = _cost_usd(cfg, model, usage)
@@ -550,8 +556,7 @@ def _write_egress_audit(
         "context": {},
         "query": None,
         "included": [
-            {"id": item["id"], "scope": item["scope"], "body": item["text"]}
-            for item in included
+            {"id": item["id"], "scope": item["scope"], "body": item["text"]} for item in included
         ],
         "rejected": rejected,
         "payload_hash": sha256_text(payload_text),
