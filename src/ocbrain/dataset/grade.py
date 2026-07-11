@@ -362,6 +362,39 @@ def _store_grade(
     )
 
 
+def _store_grade_with_retry(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    grade: dict[str, Any],
+    *,
+    model: str,
+    prompt_version: str,
+    graded_at: str,
+    retries: int = 3,
+) -> None:
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            _store_grade(
+                conn,
+                row,
+                grade,
+                model=model,
+                prompt_version=prompt_version,
+                graded_at=graded_at,
+            )
+            return
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "database is locked" not in str(exc).lower():
+                raise
+            last_error = exc
+            if attempt < retries - 1:
+                time.sleep(0.1 * (2**attempt))
+    if last_error is not None:
+        raise last_error
+
+
 def _store_grade_error(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -546,7 +579,7 @@ def _grade_examples_unlocked(
                     raise inference_error
                 if grade is None:  # pragma: no cover - infer invariant
                     raise ValueError("local grader produced no normalized result")
-                _store_grade(
+                _store_grade_with_retry(
                     conn,
                     row,
                     grade,

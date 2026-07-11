@@ -380,10 +380,10 @@ def test_transient_progress_lock_retries_and_continues_batch(tmp_path: Path):
     result = grade_examples(conn, cfg=_cfg(), limit=2, transport=briefly_locked)
     if release_timer is not None:
         release_timer.join()
-    assert result["status"] == "partial"
+    assert result["status"] == "ok"
     assert result["ledger_pending"] is False
-    assert result["graded"] == 1
-    assert result["errors"] == 1
+    assert result["graded"] == 2
+    assert result["errors"] == 0
 
 
 def test_export_min_grade_withholds_low_and_ungraded_rows(tmp_path: Path):
