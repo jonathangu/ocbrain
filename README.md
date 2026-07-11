@@ -161,6 +161,11 @@ evaluation remains a byte-for-byte legacy sentinel. Four-way blind evaluation
 compares Jonathan, the untuned base, the tuned candidate, and a frontier agent;
 the bar does not move after training begins.
 
+Local grading is a filter, not human approval. Before any pilot-v3 trainer is
+run, a human must audit a deterministic stratified 10% of the final pack across
+all three training classes. The audit stays private and local; preparation may
+produce a training command, but that command is not authorization to execute it.
+
 Selection is two-phase so failed grades do not become nominal training rows.
 `dataset-pack-select` creates the bounded candidate pool; the local grader works
 only on that pool; `dataset-pack-finalize` deterministically keeps the required

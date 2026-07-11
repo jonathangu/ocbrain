@@ -373,6 +373,10 @@ has deterministically reserved at least twenty graded persona prompts. It writes
 prompts, private references, and the voice/taste rubric before any training
 file, then removes the held-out content hashes from every training stream. The
 manifest records `eval_built_before_train=true` and `training_started=false`.
+Preparation is not training authorization: a human must first audit a
+deterministic stratified 10% of the final SFT, persona, and DPO pack. That audit
+remains local and private, and its completion is operator evidence rather than
+an inference from the local grader's score.
 Candidate responses are randomized against the real references by
 `dataset-pilot-blind`; `dataset-pilot-score` resolves completed ratings through
 the separate blind key. The supplied local rating helper rejects non-loopback
