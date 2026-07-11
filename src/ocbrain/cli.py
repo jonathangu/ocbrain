@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from ocbrain import __version__
 from ocbrain.autolabel import Signal, record_signal
 from ocbrain.autopilot import run_autopilot
 from ocbrain.config import load_config
@@ -55,6 +56,7 @@ from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ocbrain", description="OCBrain final-spec brain")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
     subparsers = parser.add_subparsers(dest="command")
