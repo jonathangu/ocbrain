@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 import urllib.request
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -238,6 +239,40 @@ def _repair_interrupted_runs(conn: sqlite3.Connection) -> int:
         conn.rollback()
         return -1
     return int(cursor.rowcount)
+
+
+def _commit_run_progress(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str,
+    attempted: int,
+    errors: int,
+    error_types: dict[str, int],
+    retries: int = 3,
+) -> bool:
+    for attempt in range(max(1, retries)):
+        try:
+            conn.execute(
+                """
+                UPDATE dataset_grade_runs
+                SET item_count = ?, error_count = ?, error = ?
+                WHERE id = ?
+                """,
+                (
+                    attempted,
+                    errors,
+                    canonical_json(error_types) if error_types else None,
+                    run_id,
+                ),
+            )
+            conn.commit()
+            return True
+        except sqlite3.OperationalError as exc:
+            conn.rollback()
+            if "database is locked" not in str(exc).lower() or attempt == retries - 1:
+                return False
+            time.sleep(0.1 * (2**attempt))
+    return False  # pragma: no cover - loop always returns
 
 
 def _candidate_rows(
@@ -538,25 +573,15 @@ def _grade_examples_unlocked(
                         prompt_version=grade_cfg.prompt_version,
                         graded_at=timestamp,
                     )
-            try:
-                conn.execute(
-                    """
-                    UPDATE dataset_grade_runs
-                    SET item_count = ?, error_count = ?, error = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        attempted,
-                        errors,
-                        canonical_json(error_types) if error_types else None,
-                        run_id,
-                    ),
-                )
-                # The worker pool does local inference only. This main thread is
-                # still the sole SQLite writer and commits each completed item.
-                conn.commit()
-            except sqlite3.OperationalError:
-                conn.rollback()
+            # The worker pool does local inference only. This main thread is
+            # still the sole SQLite writer and commits each completed item.
+            if not _commit_run_progress(
+                conn,
+                run_id=run_id,
+                attempted=attempted,
+                errors=errors,
+                error_types=error_types,
+            ):
                 blocked = True
                 ledger_pending = True
                 break

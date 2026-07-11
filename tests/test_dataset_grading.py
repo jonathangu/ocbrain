@@ -351,6 +351,41 @@ def test_progress_lock_returns_blocked_and_next_run_repairs(tmp_path: Path):
     assert statuses == {"interrupted", "ok"}
 
 
+def test_transient_progress_lock_retries_and_continues_batch(tmp_path: Path):
+    import sqlite3
+
+    conn = _db(tmp_path)
+    _store(conn, "sft", 1)
+    _store(conn, "sft", 2)
+    conn.commit()
+    conn.execute("PRAGMA busy_timeout=1")
+    calls = 0
+    release_timer = None
+
+    def briefly_locked(endpoint, model, messages, timeout):
+        nonlocal calls, release_timer
+        calls += 1
+        if calls == 1:
+            locker = sqlite3.connect(tmp_path / "db.sqlite", check_same_thread=False)
+            locker.execute("BEGIN IMMEDIATE")
+
+            def release():
+                locker.rollback()
+                locker.close()
+
+            release_timer = threading.Timer(0.05, release)
+            release_timer.start()
+        return _transport(endpoint, model, messages, timeout)
+
+    result = grade_examples(conn, cfg=_cfg(), limit=2, transport=briefly_locked)
+    if release_timer is not None:
+        release_timer.join()
+    assert result["status"] == "partial"
+    assert result["ledger_pending"] is False
+    assert result["graded"] == 1
+    assert result["errors"] == 1
+
+
 def test_export_min_grade_withholds_low_and_ungraded_rows(tmp_path: Path):
     conn = _db(tmp_path)
     high = _store(conn, "sft", 1)
