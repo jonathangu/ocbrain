@@ -53,6 +53,11 @@ _CANONICAL_RETRIEVAL_COLUMNS = {
     "corrected",
     "outcome",
     "note",
+    "query_text",
+    "served_ids_json",
+    "session_id",
+    "feedback_source",
+    "feedback_at",
     "served_at",
 }
 

@@ -6,9 +6,11 @@ from pathlib import Path
 from ocbrain.config import OcbrainConfig
 from ocbrain.dataset.pilot import (
     prepare_blind_pairs,
+    prepare_multiblind,
     prepare_pilot,
     record_training_result,
     score_blind_ratings,
+    score_multiblind,
 )
 from ocbrain.dataset.quality import store_example
 from ocbrain.db import connect, init_db
@@ -170,9 +172,7 @@ def test_second_pilot_reuses_frozen_eval_bytes_and_heldout_bar(tmp_path: Path):
     }
     heldout_hashes = {
         row["content_hash"]
-        for row in conn.execute(
-            "SELECT id, content_hash FROM dataset_examples"
-        ).fetchall()
+        for row in conn.execute("SELECT id, content_hash FROM dataset_examples").fetchall()
         if row["id"] in heldout_ids
     }
     for split in ("sft", "dpo", "persona"):
@@ -182,6 +182,53 @@ def test_second_pilot_reuses_frozen_eval_bytes_and_heldout_bar(tmp_path: Path):
             from ocbrain.ids import content_hash
 
             assert content_hash(canonical_json(record)) not in heldout_hashes
+
+
+def test_v04_quality_gate_preserves_legacy_sentinel_and_requires_train_classes(tmp_path: Path):
+    conn = _db(tmp_path)
+    for i in range(45):
+        _store_chat(conn, "persona", i)
+    _store_chat(conn, "sft", 99)
+    _store_dpo(conn, 1)
+    conn.execute(
+        "UPDATE dataset_examples SET train_class = CASE dataset "
+        "WHEN 'persona' THEN 'train_voice' WHEN 'sft' THEN 'train_skill' "
+        "WHEN 'dpo' THEN 'train_judgment' END, "
+        "train_selected = CASE WHEN dataset = 'persona' THEN 0 ELSE 1 END"
+    )
+    conn.execute(
+        "UPDATE dataset_examples SET train_selected = 1 WHERE id IN "
+        "(SELECT id FROM dataset_examples WHERE dataset = 'persona' ORDER BY id LIMIT 5)"
+    )
+    conn.commit()
+    sentinel = tmp_path / "pilot-v2"
+    prepare_pilot(conn, cfg=OcbrainConfig(), output_dir=sentinel, min_grade=0.8)
+
+    root = tmp_path / "pilot-v3"
+    result = prepare_pilot(
+        conn,
+        cfg=OcbrainConfig(),
+        output_dir=root,
+        min_grade=0.8,
+        eval_prompts=20,
+        quality_gates=True,
+        minimum_train_counts={"sft": 1, "dpo": 1, "persona": 5},
+        sentinel_from=sentinel,
+        base_model="local/test-4bit",
+    )
+
+    assert result["training_ready"] is True
+    for source_name, copied_name in (
+        ("prompts.jsonl", "legacy-sentinel-prompts.jsonl"),
+        ("references.jsonl", "legacy-sentinel-references.jsonl"),
+        ("rubric.json", "legacy-sentinel-rubric.json"),
+    ):
+        assert (root / "eval" / copied_name).read_bytes() == (
+            sentinel / "eval" / source_name
+        ).read_bytes()
+    manifest = json.loads((root / "pilot-manifest.json").read_text())
+    assert manifest["quality_gate"]["passed"] is True
+    assert manifest["legacy_sentinel"]["prompt_count"] == 20
 
 
 def test_blind_randomization_and_scoring(tmp_path: Path):
@@ -230,6 +277,56 @@ def test_blind_randomization_and_scoring(tmp_path: Path):
     assert report["dimensions"]["voice_fidelity"] == {
         "reference": 3.0,
         "candidate": 4.0,
+    }
+
+
+def test_four_way_blind_pack_and_scoring(tmp_path: Path):
+    conn = _db(tmp_path)
+    for i in range(22):
+        _store_chat(conn, "persona", i)
+    _store_chat(conn, "sft", 99)
+    _store_dpo(conn, 1)
+    conn.commit()
+    root = tmp_path / "pilot"
+    prepare_pilot(conn, cfg=OcbrainConfig(), output_dir=root, min_grade=0.8)
+    prompts = _read_jsonl(root / "eval" / "prompts.jsonl")
+    response_sets = {}
+    for source in ("base", "tuned", "frontier"):
+        path = tmp_path / f"{source}.jsonl"
+        path.write_text(
+            "\n".join(
+                canonical_json({"eval_id": row["eval_id"], "response": f"{source} response"})
+                for row in prompts
+            )
+            + "\n"
+        )
+        response_sets[source] = path
+    result = prepare_multiblind(root, response_sets)
+    assert result["items"] == 20
+    key = json.loads((root / "eval" / "multiblind-key.json").read_text())
+    ratings = tmp_path / "multiratings.jsonl"
+    ratings.write_text(
+        "\n".join(
+            canonical_json(
+                {
+                    "eval_id": eval_id,
+                    "ranking": [
+                        next(label for label, source in mapping.items() if source == wanted)
+                        for wanted in ("tuned", "jonathan", "frontier", "base")
+                    ],
+                }
+            )
+            for eval_id, mapping in key["items"].items()
+        )
+        + "\n"
+    )
+    report = score_multiblind(root, ratings)
+    assert report["first_place"]["tuned"] == 20
+    assert report["mean_rank"] == {
+        "base": 4.0,
+        "frontier": 3.0,
+        "jonathan": 2.0,
+        "tuned": 1.0,
     }
 
 

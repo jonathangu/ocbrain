@@ -74,6 +74,7 @@ def dataset_stats(conn: sqlite3.Connection) -> dict[str, Any]:
         label_counts = _group_counts(conn, dataset, "quality_label")
         scope_counts = _group_counts(conn, dataset, "privacy_scope")
         source_counts = _group_counts(conn, dataset, "source_kind")
+        train_class_counts = _group_counts(conn, dataset, "train_class")
         total = sum(label_counts.values())
         excluded = label_counts.get("excluded", 0)
         good = label_counts.get("good", 0)
@@ -88,11 +89,25 @@ def dataset_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "WHERE dataset = ? AND grade_score IS NOT NULL",
             (dataset,),
         ).fetchone()
+        selected = sum(
+            count for name, count in train_class_counts.items() if name.startswith("train_")
+        )
+        selected_graded = conn.execute(
+            "SELECT COUNT(*) AS n FROM dataset_examples WHERE dataset = ? "
+            "AND train_class LIKE 'train_%' AND grade_score IS NOT NULL",
+            (dataset,),
+        ).fetchone()["n"]
+        selected_passing = conn.execute(
+            "SELECT COUNT(*) AS n FROM dataset_examples WHERE dataset = ? "
+            "AND train_class LIKE 'train_%' AND grade_score >= 0.8",
+            (dataset,),
+        ).fetchone()["n"]
         datasets[dataset] = {
             "total": total,
             "by_label": label_counts,
             "by_scope": scope_counts,
             "by_source_kind": source_counts,
+            "by_train_class": train_class_counts,
             "by_iso_week": _by_iso_week(conn, dataset),
             "excluded": excluded,
             "exclusion_rate": round(excluded / total, 4) if total else 0.0,
@@ -100,6 +115,12 @@ def dataset_stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "good_rate": round(good / total, 4) if total else 0.0,
             "graded": int(graded),
             "grade_coverage": round(int(graded) / total, 4) if total else 0.0,
+            "selected_for_weights": selected,
+            "selected_graded": int(selected_graded),
+            "selected_grade_coverage": (
+                round(int(selected_graded) / selected, 4) if selected else 0.0
+            ),
+            "selected_passing_0_8": int(selected_passing),
             "grade_score": {
                 "average": round(float(grade_row["avg_score"]), 4)
                 if grade_row["avg_score"] is not None

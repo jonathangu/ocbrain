@@ -1,6 +1,6 @@
 # ocbrain
 
-Current release: **v0.3.3**. Licensed under Apache-2.0.
+Current release: **v0.4.0**. Licensed under Apache-2.0.
 
 Lightweight shared brain for ChatGPT/Codex, Claude Code, OpenClaw, and future
 runtimes.
@@ -16,6 +16,8 @@ For a full architecture walkthrough — the two-plane store, the five-movement
 pipeline, the 14 dispatched autopilot stages plus lock/finalize, the signal
 taxonomy, the safeguards, the privacy model, and the dataset factory — read
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The authority and privacy boundaries are defined in
+[`docs/CONTRACT.md`](docs/CONTRACT.md).
 
 ## Core Model
 
@@ -57,14 +59,24 @@ Current surfaces:
   `event-backfill`, `digest`, `loop-ingest`, `mark-stale`, `prune`, `heal`,
   `liveness-check`, `mcp`, `autopilot`, `quarantine`, `label`, `dataset-mine`,
   `dataset-grade`, `dataset-export`, `dataset-stats`, `dataset-pilot-prepare`,
-  `dataset-pilot-record-training`, `dataset-pilot-blind`,
-  `dataset-pilot-score`, `public-safety-check`, and `install-hooks`.
+  `dataset-classify`, `dataset-pack-select`, `dataset-pack-finalize`,
+  `dataset-pack-stats`,
+  `dataset-calibration-import`, `retrieval-feedback-stats`,
+  `retrieval-benchmark`, `dataset-pilot-record-training`,
+  `dataset-pilot-blind`, `dataset-pilot-score`, `dataset-pilot-multiblind`,
+  `dataset-pilot-multiscore`, `public-safety-check`, and `install-hooks`.
 - MCP: `brain.search`, `brain.preview`, `brain.egress_preview`, `brain.get`,
   `brain.teacher_request`, `brain.digest`, `brain.feedback`, write-gated
   `brain.ingest`, write-gated `brain.proposals`, write-gated `brain.forget`,
   and write-gated `brain.mark_stale`.
 - Resources: `brain://digest/current`, `brain://wiki/{slug}`,
   `brain://loop/families`.
+
+MCP schemas are provider-safe. Required arguments remain required; every
+optional argument is required-but-nullable, nested objects reject unknown keys,
+and the dispatcher strips explicit nulls at one boundary before tool logic.
+That gives OpenAI-family callers an honest alternative to inventing unused
+values without changing Claude Code or OpenClaw semantics.
 
 For agent runtime behavior, read
 [`docs/AGENT_USE_GUIDE.md`](docs/AGENT_USE_GUIDE.md). For the current product and
@@ -78,6 +90,7 @@ For the public install, upgrade, and model-driven verification path, use
 ## Quick Start
 
 ```bash
+uv run --with-editable . ocbrain --version
 uv run --with-editable . ocbrain init
 uv run --with-editable . ocbrain evidence --claim "Codex emitted evidence."
 uv run --with-editable . ocbrain value \
@@ -120,6 +133,45 @@ error detection.
 
 ## Dataset grading and eval-first pilot
 
+v0.4 makes learning quality explicit. `dataset-classify` separates stable model
+weights from changing memory with five classes: `train_voice`,
+`train_judgment`, `train_skill`, `retrieval_only`, and `exclude`. Persona rows
+enter `train_voice` only when the human author is verified; assistant text that
+merely imitates Jonathan is excluded. Accepted corrections become DPO
+`train_judgment` pairs, while successful instruction exchanges become SFT
+`train_skill` examples.
+
+Retrieval feedback is the flywheel. New retrieval rows retain the query,
+runtime, session, and served object ids. Explicit agent feedback remains the
+preferred signal; a conservative same-session evidence rule can label an
+otherwise unreported result as inferred `used`, with its source kept distinct.
+`retrieval-benchmark` runs the byte-frozen 100-case cross-runtime suite and
+reports top-five relevance, citations, privacy scope, negative probes,
+injection probes, and latency without returning corpus text.
+
+The hosted judge is allowed to decide only ambiguous knowledge quality as an
+optional, budget-capped tie-breaker. Its good/neutral/bad verdict becomes one
+ordinary weighted signal; it cannot override hard human feedback, widen scope,
+release quarantine, or decide what enters model weights.
+
+The v0.4 pilot gate requires a fully local graded pack before training: at
+least 1,000 SFT `train_skill`, 300 persona `train_voice`, 200 DPO
+`train_judgment`, and 100 frozen evaluation prompts. The original twenty-prompt
+evaluation remains a byte-for-byte legacy sentinel. Four-way blind evaluation
+compares Jonathan, the untuned base, the tuned candidate, and a frontier agent;
+the bar does not move after training begins.
+
+Local grading is a filter, not human approval. Before any pilot-v3 trainer is
+run, a human must audit a deterministic stratified 10% of the final pack across
+all three training classes. The audit stays private and local; preparation may
+produce a training command, but that command is not authorization to execute it.
+
+Selection is two-phase so failed grades do not become nominal training rows.
+`dataset-pack-select` creates the bounded candidate pool; the local grader works
+only on that pool; `dataset-pack-finalize` deterministically keeps the required
+passing rows. The expanded voice evaluation prefers separately graded rows
+outside the final pack, leaving its 300 authentic voice examples intact.
+
 Dataset grading is deliberately local-only. The command rejects every
 non-loopback endpoint before reading an example, applies stream-specific
 rubrics, stores the normalized grade in `metadata.llm_grade`, and records a
@@ -133,9 +185,14 @@ active, grading returns `blocked` instead of claiming success.
 ```bash
 uv run --with-editable . ocbrain dataset-persona-curate \
   --input data/curation/private-voice-examples.jsonl
+uv run --with-editable . ocbrain dataset-classify
+uv run --with-editable . ocbrain dataset-pack-select
 uv run --with-editable . ocbrain dataset-grade \
   --model your-local-grader-model \
+  --selected-only \
   --limit 100
+uv run --with-editable . ocbrain dataset-pack-finalize --min-grade 0.8
+uv run --with-editable . ocbrain dataset-pack-stats --min-grade 0.8
 uv run --with-editable . ocbrain dataset-export --min-grade 0.8
 ```
 

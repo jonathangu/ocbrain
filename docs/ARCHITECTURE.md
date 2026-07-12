@@ -3,8 +3,9 @@
 A repo-native map of how ocbrain turns the history your agents already
 produce into source-backed memory — and, as a byproduct, a fine-tuning dataset
 built from your own decisions. It runs unattended on two cadences — a fast
-`light` cycle every 15 minutes and a full `heavy` cycle hourly (v0.3) — and
-nothing leaves the machine.
+`light` cycle every 15 minutes and a full `heavy` cycle hourly. Private corpus
+text stays local; configured non-private judge/embedding calls are redacted,
+scope-checked, budget-capped, and egress-audited.
 
 This document is the engineering companion to the public explainers:
 
@@ -18,6 +19,7 @@ exact schema migration, module inventory, signal-fold math — the spec is
 authoritative. Everything the shipped system has added since v0.2 (targeted
 judge, embeddings, the light/heavy split, `excerpt_render`, the
 human-bootstrap pin, the stallcheck watchdog) is documented only here.
+The canonical authority boundary is [`CONTRACT.md`](CONTRACT.md).
 
 ---
 
@@ -33,6 +35,22 @@ autopilot loop that runs as two profiles (a fast `light` cycle and a full
 old human approval queue.
 
 One direction. Nothing overwritten. Every step skippable-and-safe.
+
+Learning quality is measured rather than inferred from corpus size. The
+selected pack is divided into `train_voice`, `train_judgment`, `train_skill`,
+`retrieval_only`, and `exclude`; only locally graded passing examples can enter
+the v0.4 pilot. The original blind evaluation remains frozen as a sentinel.
+
+Stallcheck treats a `partial` or failed autopilot run as unfinished work and
+pages it, detects a stuck `running` ledger row, and watches repeated judge
+sub-stage failures. The reciprocal deadman and optional daily pager canary make
+grit a structural heartbeat contract rather than motivational prompting.
+
+The MCP surface also normalizes provider behavior. Optional schema properties
+are exposed as required-but-nullable, unknown object keys are rejected, and
+explicit nulls are stripped at the dispatcher seam. This prevents an eager
+tool caller from turning an invented default into intended scope, privacy, or
+limit input.
 
 ---
 
@@ -355,6 +373,10 @@ has deterministically reserved at least twenty graded persona prompts. It writes
 prompts, private references, and the voice/taste rubric before any training
 file, then removes the held-out content hashes from every training stream. The
 manifest records `eval_built_before_train=true` and `training_started=false`.
+Preparation is not training authorization: a human must first audit a
+deterministic stratified 10% of the final SFT, persona, and DPO pack. That audit
+remains local and private, and its completion is operator evidence rather than
+an inference from the local grader's score.
 Candidate responses are randomized against the real references by
 `dataset-pilot-blind`; `dataset-pilot-score` resolves completed ratings through
 the separate blind key. The supplied local rating helper rejects non-loopback

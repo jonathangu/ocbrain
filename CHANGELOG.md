@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.0 — 2026-07-10
+
+- Add a frozen 100-case retrieval benchmark across Codex, ChatGPT, Claude Code,
+  and OpenClaw, including negative, injection, citation, scope, and latency
+  checks; improve repo-section ranking and demote raw catalog stubs.
+- Instrument retrieval uses with queries, runtimes, sessions, and served ids;
+  preserve explicit feedback provenance and conservatively infer later
+  same-session or exact-reference outcomes.
+- Make MCP tool schemas provider-safe with required-but-nullable optional
+  fields, closed object shapes, and one null-stripping dispatch seam so eager
+  tool callers cannot turn invented defaults into intended scope or flags.
+- Classify corpus rows into `train_voice`, `train_judgment`, `train_skill`,
+  `retrieval_only`, or `exclude`, with adversarial persona-author and injection
+  contamination guards.
+- Select a deterministic bounded training pack, locally grade only that pack,
+  and refuse pilot preparation until it is fully graded and meets unchanged
+  skill/voice/judgment/evaluation minimums.
+- Preserve the original 20-case evaluation as a byte-frozen sentinel and add
+  four-way blind base/tuned/Jonathan/frontier preparation and scoring.
+- Anchor the local judge to separate human labels, reasons, and ideal responses;
+  keep the 90% calibration bar fixed while teaching the rubric concise reasons,
+  quantified uncertainty, and explicit fictional assumptions.
+- Prepare dataset rows outside SQLite transactions and commit ordered bounded
+  batches; retry harvest locks and hosted-judge timeouts only within stage
+  deadlines.
+- Page partial/failed/stale autopilot runs and judge failure streaks, add an
+  optional pager canary, and require an explicitly human actor for quarantine
+  release.
+- Add `docs/CONTRACT.md` as the canonical autonomy, authority, and privacy
+  boundary.
+
 ## 0.3.3 — 2026-07-10
 
 - Replace the tripwire scan's timestamp-only watermark with a composite

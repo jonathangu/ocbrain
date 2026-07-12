@@ -55,6 +55,36 @@ WRITE_LOCK_RETRIES = 3
 WRITE_LOCK_BACKOFF_SECONDS = 0.25
 
 
+def strip_explicit_nulls(value: Any) -> Any:
+    """Remove provider null sentinels at the one seam every tool call crosses."""
+    if isinstance(value, dict):
+        return {key: strip_explicit_nulls(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        return [strip_explicit_nulls(item) for item in value]
+    return value
+
+
+def provider_safe_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Make omission explicit for providers that populate every schema field."""
+    transformed = dict(schema)
+    if schema.get("type") == "object":
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            originally_required = set(schema.get("required") or [])
+            safe_properties: dict[str, Any] = {}
+            for name, value in properties.items():
+                safe_value = provider_safe_schema(value) if isinstance(value, dict) else value
+                if name not in originally_required:
+                    safe_value = {"anyOf": [safe_value, {"type": "null"}]}
+                safe_properties[name] = safe_value
+            transformed["properties"] = safe_properties
+            transformed["required"] = list(properties)
+            transformed["additionalProperties"] = False
+    if schema.get("type") == "array" and isinstance(schema.get("items"), dict):
+        transformed["items"] = provider_safe_schema(schema["items"])
+    return transformed
+
+
 def serve(db_path: Path, *, allow_writes: bool = False) -> int:
     conn = connect(db_path)
     conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
@@ -143,6 +173,9 @@ def _log_retrieval_if_available(
     *,
     task_ref: str,
     note: str | None = None,
+    context: ScopeContext | None = None,
+    query_text: str | None = None,
+    served_ids: list[str] | None = None,
 ) -> tuple[str | None, str]:
     """Log a read without making it unavailable behind a long DB writer.
 
@@ -154,10 +187,13 @@ def _log_retrieval_if_available(
         retrieval_use_id = log_retrieval_use(
             conn,
             knowledge_id,
-            runtime="mcp",
+            runtime=(context.runtime if context and context.runtime else "mcp"),
             task_ref=task_ref,
             outcome="served",
             note=note,
+            query_text=query_text,
+            served_ids=served_ids,
+            session_id=(context.session if context else None),
         )
         conn.commit()
         return retrieval_use_id, "recorded"
@@ -170,7 +206,10 @@ def _log_retrieval_if_available(
 
 def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
-    arguments = params.get("arguments", {})
+    raw_arguments = params.get("arguments", {})
+    if not isinstance(raw_arguments, dict):
+        raise ValueError("tool arguments must be an object")
+    arguments = strip_explicit_nulls(raw_arguments)
     if name == "brain.search":
         query = require_string(arguments, "query")
         limit = min(max(int(arguments.get("limit", 10)), 1), 50)
@@ -188,22 +227,28 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
             retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
                 conn,
                 None,
-                task_ref=f"brain.search:{query}",
+                task_ref=context.task or f"brain.search:{query}",
                 note=f"scoped=true;limit={limit}",
+                context=context,
+                query_text=query,
+                served_ids=[str(item["belief_id"]) for item in payload["items"]],
             )
             payload["retrieval_use_id"] = retrieval_use_id
             payload["retrieval_use_status"] = retrieval_use_status
             return text_result(payload)
         rows = search(conn, query, limit, scopes=PUBLIC_SCOPES, filters=filters)
+        served_ids = [str(row["doc_id"]) for row in rows]
+        retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
+            conn,
+            served_ids[0] if len(served_ids) == 1 and served_ids[0].startswith("know") else None,
+            task_ref=f"brain.search:{query}",
+            note=f"limit={limit};filters={json.dumps(filters, sort_keys=True)}",
+            query_text=query,
+            served_ids=served_ids,
+        )
         result_rows = []
         for row in rows:
             row_dict = dict(row)
-            retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
-                conn,
-                row["doc_id"] if row["kind"].startswith("knowledge:") else None,
-                task_ref=f"brain.search:{query}",
-                note=f"limit={limit};filters={json.dumps(filters, sort_keys=True)}",
-            )
             row_dict["retrieval_use_id"] = retrieval_use_id
             row_dict["retrieval_use_status"] = retrieval_use_status
             result_rows.append(row_dict)
@@ -222,8 +267,11 @@ def call_tool(conn, params: dict[str, Any]) -> dict[str, Any]:
         retrieval_use_id, retrieval_use_status = _log_retrieval_if_available(
             conn,
             None,
-            task_ref=f"brain.preview:{query}",
+            task_ref=context_from_arguments(arguments).task or f"brain.preview:{query}",
             note=f"limit={limit}",
+            context=context_from_arguments(arguments),
+            query_text=query,
+            served_ids=[str(item["belief_id"]) for item in payload["items"]],
         )
         payload["retrieval_use_id"] = retrieval_use_id
         payload["retrieval_use_status"] = retrieval_use_status
@@ -494,6 +542,7 @@ def tool_list() -> list[dict[str, Any]]:
                         "type": "object",
                         "properties": {
                             "project": {"type": "string"},
+                            "repo": {"type": "string"},
                             "type": {"type": "string"},
                             "status": {"type": "string"},
                             "loop_id": {"type": "string"},
@@ -673,7 +722,39 @@ def tool_list() -> list[dict[str, Any]]:
                         "writer": {"type": "string"},
                         "session": {"type": "string"},
                         "artifact_ref": {"type": "string"},
-                        "scope": {"type": "object"},
+                        "scope": {
+                            "type": "object",
+                            "properties": {
+                                "scope_type": {
+                                    "type": "string",
+                                    "enum": [
+                                        "global",
+                                        "project",
+                                        "repo",
+                                        "client",
+                                        "personal_finance",
+                                        "task",
+                                        "session",
+                                        "legacy_unscoped",
+                                    ],
+                                },
+                                "scope_id": {"type": "string"},
+                                "visibility": {
+                                    "type": "string",
+                                    "enum": ["public", "internal", "confidential", "secret"],
+                                },
+                                "egress_policy": {
+                                    "type": "string",
+                                    "enum": [
+                                        "hosted_ok",
+                                        "local_only",
+                                        "approval_required",
+                                        "prohibited",
+                                    ],
+                                },
+                                "provenance": {"type": "string"},
+                            },
+                        },
                         "context": {
                             "type": "object",
                             "properties": {
@@ -774,6 +855,7 @@ def tool_list() -> list[dict[str, Any]]:
             tool["annotations"] = dict(destructive_write)
         else:
             tool["annotations"] = dict(local_write)
+        tool["inputSchema"] = provider_safe_schema(tool["inputSchema"])
     return tools
 
 
@@ -786,7 +868,7 @@ def checked_filters(value: Any) -> dict[str, Any]:
         return {}
     if not isinstance(value, dict):
         raise ValueError("filters must be an object")
-    allowed = {"project", "type", "status", "loop_id", "family"}
+    allowed = {"project", "repo", "type", "status", "loop_id", "family"}
     return {key: val for key, val in value.items() if key in allowed and isinstance(val, str)}
 
 

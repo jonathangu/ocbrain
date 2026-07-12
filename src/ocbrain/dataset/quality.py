@@ -140,10 +140,13 @@ def store_example(
         raise ValueError(f"unknown dataset: {dataset}")
 
     if write_batch is not None:
-        # A previous evidence/example write may still be inside a valid bounded
-        # batch. Close it before any redaction, serialization, quality scoring,
-        # or dedup reads for this example.
-        write_batch.flush()
+        # Evidence/source writers may enter with a short active transaction.
+        # Close it before redaction/dedup. Prepared dataset INSERTs are buffered
+        # separately and therefore do not own SQLite while this work runs.
+        if conn.in_transaction:
+            write_batch.flush()
+        else:
+            write_batch.flush_if_expired()
 
     # Final secret redaction pass over the target AND the stored body, so no raw
     # secret survives in the exported record (spec §7.4 rule 1). Redaction is
@@ -167,7 +170,9 @@ def store_example(
     if hard_scrub:
         label = "excluded"
         reasons.extend(hard_scrub)
-    elif _existing_dedup(conn, dataset, dedup_key):
+    elif _existing_dedup(conn, dataset, dedup_key) or (
+        write_batch is not None and write_batch.pending_dedup(dataset, dedup_key)
+    ):
         label = "excluded"
         reasons.append("near_dup")
     if "injection_flagged" in scrub:
@@ -201,10 +206,7 @@ def store_example(
     # Redaction, serialization, scrub rules, and dedup lookup can be expensive
     # for long persona examples. Do all of that before acquiring SQLite's
     # single-writer slot; the transaction owns only the final INSERT.
-    if write_batch is not None:
-        write_batch.ensure()
-    conn.execute(
-        """
+    statement = """
         INSERT INTO dataset_examples (
           id, dataset, content_hash, dedup_key, source_kind, source_uri,
           source_span, evidence_ids, privacy_scope, quality_label,
@@ -213,34 +215,36 @@ def store_example(
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(dataset, content_hash) DO NOTHING
-        """,
-        (
-            example_id,
-            dataset,
-            digest,
-            dedup_key,
-            source_kind,
-            source_uri,
-            canonical_json(source_span) if source_span is not None else None,
-            canonical_json(list(evidence_ids)),
-            privacy_scope,
-            label,
-            confidence,
-            canonical_json(reasons),
-            n_turns,
-            n_chars,
-            example_json,
-            session_id,
-            occurred_at,
-            ts,
-            ts,
-        ),
+        """
+    params = (
+        example_id,
+        dataset,
+        digest,
+        dedup_key,
+        source_kind,
+        source_uri,
+        canonical_json(source_span) if source_span is not None else None,
+        canonical_json(list(evidence_ids)),
+        privacy_scope,
+        label,
+        confidence,
+        canonical_json(reasons),
+        n_turns,
+        n_chars,
+        example_json,
+        session_id,
+        occurred_at,
+        ts,
+        ts,
     )
     if write_batch is not None:
-        write_batch.operation()
-        # Callers may parse/score the next candidate after this returns. Commit
-        # the INSERT now so that external work cannot inherit this writer lock.
-        write_batch.flush()
+        write_batch.queue(
+            statement,
+            params,
+            dedup=(dataset, dedup_key) if label != "excluded" else None,
+        )
+    else:
+        conn.execute(statement, params)
     return {
         "id": example_id,
         "dataset": dataset,

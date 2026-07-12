@@ -9,8 +9,82 @@ from ocbrain.retrieve import (
     blend_scores,
     cosine_similarity,
     hybrid_knowledge_search,
+    looks_like_catalog_stub,
+    retrieve,
     semantic_neighbors,
 )
+from ocbrain.scope import ScopeContext
+
+
+def test_catalog_stub_detection_is_narrow() -> None:
+    assert looks_like_catalog_stub("ocbrain /Users/example/.openclaw/workspace/ocbrain/README.md")
+    assert not looks_like_catalog_stub(
+        "The README path is /Users/example/project/README.md because agents need "
+        "a canonical contract with reasons."
+    )
+
+
+def test_scoped_retrieve_uses_repo_fts_when_event_results_are_catalog_stubs(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    useful = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="auto",
+        slug="learning-contract",
+        title="Learning quality contract",
+        body_uri=str(repo / "CONTRACT.md"),
+        doc_kind="guide",
+        status="current",
+        value_text=None,
+        origin="human",
+    )
+    conn.execute(
+        """
+        INSERT INTO current_beliefs (
+          belief_id, body, scope_type, scope_id, visibility, egress_policy,
+          confidence, confidence_band, evidence_ids, status, pinned,
+          approved_event_id, last_event_id, last_compiled_at
+        ) VALUES (
+          'legacy_catalog', ?, 'project', 'project:ocbrain', 'internal',
+          'local_only', 0.7, 'moderate', '[]', 'current', 0,
+          'evt_a', 'evt_a', '2026-07-10T00:00:00+00:00'
+        )
+        """,
+        (f"ocbrain {repo}/README.md",),
+    )
+    conn.commit()
+
+    payload = retrieve(
+        conn,
+        "learning quality contract",
+        context=ScopeContext(project="ocbrain", repo=str(repo)),
+        limit=5,
+    )
+    assert payload["items"][0]["belief_id"] == useful
+    assert payload["items"][0]["source"] == "fts_repo_fallback"
+
+
+def test_repo_source_cache_refreshes_when_document_changes(tmp_path: Path) -> None:
+    conn = _db(tmp_path)
+    repo = tmp_path / "repo-refresh"
+    repo.mkdir()
+    readme = repo / "README.md"
+    readme.write_text(
+        "# Alpha retention sentinel\n\n"
+        "Alpha retention sentinel design keeps this first documentation state visible.\n"
+    )
+    context = ScopeContext(project="ocbrain", repo=str(repo))
+    first = retrieve(conn, "alpha retention sentinel", context=context, limit=5)
+    assert "Alpha retention sentinel" in first["items"][0]["body"]
+
+    readme.write_text(
+        "# Beta retrieval freshness\n\n"
+        "Beta retrieval freshness proves a long-lived MCP process sees changed source files.\n"
+    )
+    second = retrieve(conn, "beta retrieval freshness", context=context, limit=5)
+    assert "Beta retrieval freshness" in second["items"][0]["body"]
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:
@@ -38,9 +112,7 @@ def _know(
         privacy_scope=scope,
     )
     if vector is not None:
-        conn.execute(
-            "UPDATE knowledge SET embedding=? WHERE id=?", (encode_embedding(vector), kid)
-        )
+        conn.execute("UPDATE knowledge SET embedding=? WHERE id=?", (encode_embedding(vector), kid))
     return kid
 
 

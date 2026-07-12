@@ -562,6 +562,11 @@ def mine_dpo(
     from ocbrain.dataset.transcripts import resolve_transcript_evidence
 
     started = time.monotonic()
+    deadline = None if time_budget_seconds is None else started + time_budget_seconds
+
+    def budget_exhausted() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     stored = 0
     excluded = 0
     examined = 0
@@ -593,11 +598,13 @@ def mine_dpo(
 
     if sessions is not None:
         for session in sessions:
+            if budget_exhausted():
+                break
             _emit_transcript(session)
             batch.flush()
     elif roots is not None:
         for path, fingerprint in iter_unmined_transcripts(conn, roots, "dpo"):
-            if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
+            if budget_exhausted():
                 break
             session = parse_transcript(
                 path,
@@ -615,8 +622,10 @@ def mine_dpo(
             if limit is not None and files_mined >= limit:
                 break
 
-    if include_events:
+    if include_events and not budget_exhausted():
         for pair in find_event_pairs(conn, cfg):
+            if budget_exhausted():
+                break
             examined += 1
             result = _store_pair(conn, pair, write_batch=batch)
             if result is None:

@@ -162,6 +162,7 @@ def commit_examples(
     *,
     limit: int | None = None,
     write_batch: DatasetWriteBatch | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Mine Jonathan's non-agent commits from one repo (upserts git_commit evidence)."""
     cfg = cfg or load_config()
@@ -184,6 +185,8 @@ def commit_examples(
     raw = _git(repo_path, *log_args)
     out: list[dict[str, Any]] = []
     for record in raw.split(sep):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         record = record.strip("\n")
         if not record.strip():
             continue
@@ -245,6 +248,7 @@ def doc_examples(
     cfg: OcbrainConfig | None = None,
     *,
     write_batch: DatasetWriteBatch | None = None,
+    deadline: float | None = None,
 ) -> list[dict[str, Any]]:
     """Authored-doc persona targets — OFF unless ``persona_authored_globs`` set."""
     cfg = cfg or load_config()
@@ -253,6 +257,8 @@ def doc_examples(
     out: list[dict[str, Any]] = []
     for pattern in cfg.dataset.persona_authored_globs:
         for path in sorted(Path().glob(pattern)):
+            if deadline is not None and time.monotonic() >= deadline:
+                return out
             if not path.is_file():
                 continue
             text = redact_secrets(path.read_text(encoding="utf-8", errors="replace").strip())
@@ -311,6 +317,11 @@ def mine_persona(
     from ocbrain.dataset.transcripts import record_source, resolve_transcript_evidence
 
     started = time.monotonic()
+    deadline = None if time_budget_seconds is None else started + time_budget_seconds
+
+    def budget_exhausted() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     stored = 0
     excluded = 0
     examined = 0
@@ -377,6 +388,8 @@ def mine_persona(
 
     if sessions is not None:
         for session in sessions:
+            if budget_exhausted():
+                break
             _emit_session(session)
             batch.flush()
     elif roots is not None:
@@ -394,7 +407,7 @@ def mine_persona(
             fids,
         )
         for path, fingerprint in iter_unmined_transcripts(conn, roots, "persona"):
-            if time_budget_seconds is not None and time.monotonic() - started > time_budget_seconds:
+            if budget_exhausted():
                 break
 
             def _load(p: object = path) -> Session | None:
@@ -432,7 +445,18 @@ def mine_persona(
     else:
         repo_list = discover_git_repos("~/.openclaw/workspace")
     for repo in repo_list:
-        for candidate in commit_examples(conn, repo, cfg, limit=limit, write_batch=batch):
+        if budget_exhausted():
+            break
+        for candidate in commit_examples(
+            conn,
+            repo,
+            cfg,
+            limit=limit,
+            write_batch=batch,
+            deadline=deadline,
+        ):
+            if budget_exhausted():
+                break
             _store(
                 candidate,
                 evidence_ids=candidate["evidence_ids"],
@@ -444,7 +468,9 @@ def mine_persona(
         batch.flush()
 
     # Authored docs (off by default).
-    for candidate in doc_examples(conn, cfg, write_batch=batch):
+    for candidate in doc_examples(conn, cfg, write_batch=batch, deadline=deadline):
+        if budget_exhausted():
+            break
         _store(
             candidate,
             evidence_ids=candidate["evidence_ids"],

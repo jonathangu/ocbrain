@@ -3,6 +3,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from ocbrain.db import (
     connect,
     get_knowledge,
@@ -145,6 +147,14 @@ def test_release_quarantine_returns_false_when_not_quarantined_or_missing(tmp_pa
     kid = _seed_value(conn, subject="s4", status="current")
     assert release_quarantine(conn, kid, actor="human", reason="n/a") is False
     assert release_quarantine(conn, "know_does_not_exist", actor="human", reason="n/a") is False
+
+
+def test_release_quarantine_rejects_nonhuman_actor(tmp_path):
+    conn = _db(tmp_path)
+    kid = _seed_value(conn, subject="quarantined", status="current")
+    quarantine_knowledge(conn, kid, reason="test")
+    with pytest.raises(PermissionError, match="human actor"):
+        release_quarantine(conn, kid, actor="ocbrain-autopilot", reason="unsafe")
 
 
 # --------------------------------------------------------------------------- #

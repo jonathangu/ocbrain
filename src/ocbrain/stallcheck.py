@@ -149,6 +149,11 @@ class StallCheckConfig:
     pager_account: str = "default"
     pager_chat_id: str | None = None
     pager_openclaw_json: str | None = None
+    autopilot_failure_window_hours: int = 48
+    autopilot_running_stale_minutes: int = 300
+    judge_failure_streak: int = 2
+    daily_canary_enabled: bool = False
+    daily_canary_hour_utc: int = 18
 
     @property
     def stale_threshold_seconds(self) -> int:
@@ -197,6 +202,11 @@ def load_config(config_path: Path | str | None = None) -> StallCheckConfig:
         self_interval_seconds=int(sc.get("self_interval_seconds", DEFAULT_SELF_INTERVAL_SECONDS)),
         max_pages_per_run=int(sc.get("max_pages_per_run", DEFAULT_MAX_PAGES_PER_RUN)),
         flag_zero_byte_output=bool(sc.get("flag_zero_byte_output", True)),
+        autopilot_failure_window_hours=int(sc.get("autopilot_failure_window_hours", 48)),
+        autopilot_running_stale_minutes=int(sc.get("autopilot_running_stale_minutes", 300)),
+        judge_failure_streak=int(sc.get("judge_failure_streak", 2)),
+        daily_canary_enabled=bool(sc.get("daily_canary_enabled", False)),
+        daily_canary_hour_utc=int(sc.get("daily_canary_hour_utc", 18)),
         pager_account=str(pg.get("account", "default")),
         pager_chat_id=(str(pg["chat_id"]) if pg.get("chat_id") is not None else None),
         pager_openclaw_json=(
@@ -688,6 +698,126 @@ def scan_brain_deadmans(brain: sqlite3.Connection, now: datetime) -> list[Findin
     return findings
 
 
+def _autopilot_stage_errors(stages_json: str | None) -> list[tuple[str, str]]:
+    """Return leaf stage/sub-stage errors from one run ledger payload."""
+    if not stages_json:
+        return []
+    try:
+        payload = json.loads(stages_json)
+    except (TypeError, json.JSONDecodeError):
+        return [("ledger", "malformed stages_json")]
+    found: list[tuple[str, str]] = []
+
+    def walk(value: Any, path: str) -> None:
+        if not isinstance(value, dict):
+            return
+        error = value.get("error")
+        if error:
+            found.append((path or "run", str(error)))
+        for key in ("stages",):
+            child = value.get(key)
+            if isinstance(child, dict):
+                for name, item in child.items():
+                    walk(item, f"{path}.{name}" if path else str(name))
+
+    for name, item in payload.items() if isinstance(payload, dict) else []:
+        walk(item, str(name))
+    return found
+
+
+def scan_autopilot_failures(
+    brain: sqlite3.Connection,
+    cfg: StallCheckConfig,
+    now: datetime,
+) -> list[Finding]:
+    """Page completed partial/error runs, stale running rows, and judge streaks."""
+    findings: list[Finding] = []
+    cutoff = now.timestamp() - max(1, cfg.autopilot_failure_window_hours) * 3600
+    rows = brain.execute(
+        """
+        SELECT id, started_at, finished_at, status, stages_json, error
+        FROM autopilot_runs
+        ORDER BY started_at DESC
+        LIMIT 200
+        """
+    ).fetchall()
+    recent = []
+    for row in rows:
+        started = _parse_iso(row["started_at"])
+        if started is None or started.timestamp() < cutoff:
+            continue
+        recent.append(row)
+        status = str(row["status"] or "unknown")
+        finished = _parse_iso(row["finished_at"])
+        errors = _autopilot_stage_errors(row["stages_json"])
+        if status in {"partial", "error", "failed"}:
+            detail = "; ".join(f"{path}: {error}" for path, error in errors[:3])
+            detail = detail or str(row["error"] or "run did not complete cleanly")
+            occurred = finished or started
+            findings.append(
+                Finding(
+                    stall_class="autopilot_failed",
+                    unit_id=str(row["id"]),
+                    terminal_signature=f"{status}:{content_hash(detail)[:16]}",
+                    snippet=f"scheduled run ended {status}: {detail}",
+                    artifact_path=f"brain:autopilot_runs/{row['id']}",
+                    age_seconds=max(0.0, (now - occurred).total_seconds()),
+                    occurred_at=occurred.isoformat(),
+                )
+            )
+        elif status == "running":
+            stale_after = max(1, cfg.autopilot_running_stale_minutes) * 60
+            age = max(0.0, (now - started).total_seconds())
+            if age >= stale_after:
+                findings.append(
+                    Finding(
+                        stall_class="autopilot_stuck_running",
+                        unit_id=str(row["id"]),
+                        terminal_signature=f"running:{row['started_at']}",
+                        snippet=(
+                            "scheduled run remains running beyond its allowed observation window"
+                        ),
+                        artifact_path=f"brain:autopilot_runs/{row['id']}",
+                        age_seconds=age,
+                        occurred_at=started.isoformat(),
+                    )
+                )
+
+    streak_target = max(2, cfg.judge_failure_streak)
+    completed = [row for row in recent if row["status"] != "running"]
+    judge_failures: list[tuple[sqlite3.Row, str]] = []
+    for row in completed:
+        matches = [
+            error
+            for path, error in _autopilot_stage_errors(row["stages_json"])
+            if path.endswith(".judge")
+        ]
+        if not matches:
+            break
+        judge_failures.append((row, matches[0]))
+        if len(judge_failures) >= streak_target:
+            latest, latest_error = judge_failures[0]
+            findings.append(
+                Finding(
+                    stall_class="judge_failure_streak",
+                    unit_id="autopilot/judge",
+                    terminal_signature=f"{latest['id']}:{content_hash(latest_error)[:16]}",
+                    snippet=(
+                        f"judge failed in {len(judge_failures)} consecutive completed "
+                        f"runs: {latest_error}"
+                    ),
+                    artifact_path=f"brain:autopilot_runs/{latest['id']}",
+                    age_seconds=max(
+                        0.0,
+                        (now - (_parse_iso(latest["finished_at"]) or now)).total_seconds(),
+                    ),
+                    occurred_at=(_parse_iso(latest["finished_at"]) or now).isoformat(),
+                )
+            )
+            break
+    return findings
+
+
 # --- Brain writes: deadman engine + pager ledger -------------------------------
 def open_brain(path: Path | str) -> sqlite3.Connection:
     conn = connect(Path(path))
@@ -774,6 +904,23 @@ def mark_first_run_done(conn: sqlite3.Connection, now: datetime) -> None:
         ON CONFLICT(fingerprint) DO UPDATE SET last_seen_at = excluded.last_seen_at
         """,
         (_FIRSTRUN_MARKER, stamp, stamp, stamp),
+    )
+
+
+def record_canary_delivery(conn: sqlite3.Connection, key: str, now: datetime) -> None:
+    stamp = now.isoformat()
+    conn.execute(
+        """
+        INSERT INTO stall_pages (
+          fingerprint, stall_class, unit_id, terminal_signature,
+          first_seen_at, last_seen_at, paged_at, run_count
+        ) VALUES (?, 'pager_canary', ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(fingerprint) DO UPDATE SET
+          last_seen_at=excluded.last_seen_at,
+          paged_at=excluded.paged_at,
+          run_count=stall_pages.run_count + 1
+        """,
+        (key, now.date().isoformat(), key, stamp, stamp, stamp),
     )
 
 
@@ -1010,6 +1157,7 @@ class RunReport:
     retired: list[Finding] = field(default_factory=list)
     first_run: bool = False
     page_status: int | None = None
+    canary_status: int | None = None
     evidence_ids: list[str] = field(default_factory=list)
 
     @property
@@ -1035,6 +1183,7 @@ def collect_findings(
         findings.extend(scan_ingress_timeouts(runner, cfg, now))
     if brain is not None:
         findings.extend(scan_brain_deadmans(brain, now))
+        findings.extend(scan_autopilot_failures(brain, cfg, now))
     # De-dup within one run by fingerprint (a unit can only be found once).
     unique: dict[str, Finding] = {}
     for f in findings:
@@ -1096,6 +1245,25 @@ def run(
         delivered = report.page_status is not None and 200 <= report.page_status < 300
         if delivered:
             delivered_fps = {f.fingerprint for f in to_page[:included]}
+
+    canary_key = f"__canary__:{now.date().isoformat()}"
+    canary_due = (
+        cfg.daily_canary_enabled
+        and now.hour >= min(max(cfg.daily_canary_hour_utc, 0), 23)
+        and not already_paged(brain, canary_key)
+    )
+    if canary_due and send:
+        digest_proved_delivery = bool(delivered_fps)
+        if digest_proved_delivery:
+            report.canary_status = report.page_status
+        elif not to_page:
+            report.canary_status = send_telegram(
+                cfg,
+                f"OCBrain pager canary — delivery path healthy for {now.date().isoformat()} UTC.",
+            )
+        canary_delivered = report.canary_status is not None and 200 <= report.canary_status < 300
+        if canary_delivered:
+            _write_with_lock_retry(brain, record_canary_delivery, brain, canary_key, now)
 
     # Ledger every new finding so run_count/last_seen advance; stamp paged_at ONLY
     # on genuine delivery, so an undelivered stall stays eligible for the next run.
