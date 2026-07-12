@@ -933,6 +933,28 @@ def test_private_evidence_tightens_public_doc_scope(tmp_path: Path) -> None:
     assert get_current_doc(conn, slug="public-derived-doc") is None
 
 
+def test_private_digest_can_explicitly_disable_scope_filter(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="human",
+        slug="private-digest-doc",
+        title="Private digest doc",
+        body_uri="/private/digest.md",
+        doc_kind="memory",
+        status="current",
+        privacy_scope="private",
+    )
+    conn.commit()
+
+    digest = knowledge_digest(conn, scopes=None)
+
+    assert digest["scopes"] is None
+    assert any(item["id"] == knowledge_id for item in digest["documents"])
+
+
 def test_heal_supersedes_conflicting_current_values_with_evidence(tmp_path: Path) -> None:
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
