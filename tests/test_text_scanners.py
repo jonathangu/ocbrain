@@ -101,3 +101,55 @@ def test_existing_secret_scanners_still_work() -> None:
     assert "openai_key" in find_probable_secret_leaks(leaky)
     assert "[REDACTED]" in redact_secrets(leaky)
     assert find_probable_secret_leaks("no secrets in this ordinary sentence") == []
+
+
+@pytest.mark.parametrize("escaped", [False, True])
+def test_json_quoted_secrets_are_detected_and_fully_redacted(escaped: bool) -> None:
+    key = "api_" + "key"
+    secret = "quoted-value-0123456789"
+    quote = r"\"" if escaped else '"'
+    leaky = "{" + quote + key + quote + ": " + quote + secret + quote + "}"
+
+    assert "json_quoted_secret" in find_probable_secret_leaks(leaky)
+    redacted = redact_secrets(leaky)
+    assert secret not in redacted
+    assert "[REDACTED]" in redacted
+    assert find_probable_secret_leaks(redacted) == []
+
+
+def test_namespaced_quoted_assignment_is_redacted_without_false_clean_result() -> None:
+    key = "OPENAI_API_" + "KEY"
+    secret = "quoted-value-abcdefghijklmnopqrstuvwxyz"
+    leaky = f'{key} = "{secret}"'
+
+    assert "assigned_secret" in find_probable_secret_leaks(leaky)
+    assert redact_secrets(leaky) == f'{key} = "[REDACTED]"'
+    assert find_probable_secret_leaks(redact_secrets(leaky)) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "OPENAI_API_KEY",
+        "access_token",
+        "openaiApiKey",
+        "refreshToken",
+        "clientSecret",
+        "Authorization",
+    ],
+)
+def test_real_snake_env_and_camel_secret_keys_remain_protected(key: str) -> None:
+    secret = "quoted-sensitive-value-0123456789"
+    leaky = '{"' + key + '": "' + secret + '"}'
+    assert find_probable_secret_leaks(leaky)
+    assert secret not in redact_secrets(leaky)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["token_budget", "tokenizer", "secretary", "secret_sauce", "public_token_budget"],
+)
+def test_benign_metadata_keys_are_not_secret_false_positives(key: str) -> None:
+    benign = '{"' + key + '": "ordinary metadata"}'
+    assert find_probable_secret_leaks(benign) == []
+    assert redact_secrets(benign) == benign

@@ -12,6 +12,7 @@ from ocbrain.core_ops import (
     FORBIDDEN_SYNC_STAGES,
     backup_database,
     database_status,
+    local_control_file_security,
     restore_database,
     sha256_file,
     stdio_mcp_smoke,
@@ -96,9 +97,7 @@ def test_sync_refuses_before_writing_when_event_cap_would_be_exceeded(tmp_path):
     assert check.execute("SELECT COUNT(*) FROM projection_cursor").fetchone()[0] == 0
 
 
-def test_cli_sync_never_loads_config_or_dispatches_companion_work(
-    tmp_path, monkeypatch, capsys
-):
+def test_cli_sync_never_loads_config_or_dispatches_companion_work(tmp_path, monkeypatch, capsys):
     path = tmp_path / "brain.sqlite"
     _database(path).close()
 
@@ -129,6 +128,31 @@ def test_real_stdio_mcp_subprocess_smoke():
     assert result["response_ids"] == [1, 2, 3]
     assert result["protocol_version"]
     assert result["tool_count"] >= 3
+
+
+def test_local_control_files_must_be_owner_only(tmp_path, monkeypatch):
+    pointer = tmp_path / "active-core.path"
+    config = tmp_path / "ocbrain.config.json"
+    pointer.write_text("/private/core.sqlite\n", encoding="utf-8")
+    config.write_text("{}\n", encoding="utf-8")
+    pointer.chmod(0o600)
+    config.chmod(0o644)
+    monkeypatch.setenv("OCBRAIN_ACTIVE_DB_FILE", str(pointer))
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(config))
+
+    insecure = local_control_file_security()
+    assert insecure["healthy"] is False
+    assert insecure["files"]["active_db_pointer"]["mode"] == "0600"
+    assert insecure["files"]["config"] == {
+        "status": "permissions_too_open",
+        "secure": False,
+        "mode": "0644",
+    }
+
+    config.chmod(0o600)
+    secure = local_control_file_security()
+    assert secure["healthy"] is True
+    assert secure["files"]["config"]["status"] == "owner_only"
 
 
 def test_backup_and_restore_are_verified_and_fresh_only(tmp_path):

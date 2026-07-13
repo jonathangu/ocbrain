@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from importlib.metadata import entry_points
 from pathlib import Path
 
 from ocbrain import __version__
+from ocbrain.bundle import export_bundle, import_bundle
 from ocbrain.core_ops import (
     backup_database,
     database_status,
@@ -66,7 +68,14 @@ from ocbrain.mcp_v1 import (
 )
 from ocbrain.retrieve import retrieve
 from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
-from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
+from ocbrain.text import (
+    compact_whitespace,
+    find_probable_secret_leaks,
+    redact_secrets,
+    title_from_text,
+)
+
+PRIVACY_SCOPES = ("private", "workspace", "project", "public")
 
 
 def _build_legacy_parser() -> argparse.ArgumentParser:
@@ -349,13 +358,18 @@ def _build_legacy_parser() -> argparse.ArgumentParser:
     )
     import_memory_parser.add_argument("paths", nargs="+", type=Path)
     import_memory_parser.add_argument("--project", default="workspace")
-    import_memory_parser.add_argument("--privacy-scope", default="workspace")
+    import_memory_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_memory_parser.add_argument("--limit", type=int)
     import_memory_parser.add_argument(
         "--max-bytes",
         type=int,
         default=50_000,
         help="Maximum UTF-8 bytes to index per file",
+    )
+    import_memory_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan, redact, and report planned imports without opening the database",
     )
     import_memory_parser.set_defaults(func=cmd_import_memory)
 
@@ -372,7 +386,7 @@ def _build_legacy_parser() -> argparse.ArgumentParser:
         help="Newline-delimited file containing history file paths",
     )
     import_history_parser.add_argument("--project", default="workspace")
-    import_history_parser.add_argument("--privacy-scope", default="workspace")
+    import_history_parser.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_history_parser.add_argument("--limit", type=int)
     import_history_parser.add_argument(
         "--max-bytes",
@@ -385,6 +399,11 @@ def _build_legacy_parser() -> argparse.ArgumentParser:
         type=int,
         default=500,
         help="Commit after this many imported files",
+    )
+    import_history_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Scan, redact, and report planned imports without opening the database",
     )
     import_history_parser.set_defaults(func=cmd_import_history)
 
@@ -776,6 +795,25 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--plan", action="store_true")
     migrate.set_defaults(func=cmd_core_migrate_v1)
 
+    export_parser = commands.add_parser(
+        "export-bundle",
+        help="Export selected strict-v1 evidence to a fresh local bundle file",
+    )
+    export_parser.add_argument("--output", type=Path, required=True)
+    export_parser.add_argument("--evidence-id", action="append", required=True)
+    export_parser.add_argument("--approve-egress", action="store_true")
+    add_context_args(export_parser)
+    export_parser.set_defaults(func=cmd_export_bundle)
+
+    import_parser = commands.add_parser(
+        "import-bundle",
+        help="Validate a local evidence bundle; append only with --apply",
+    )
+    import_parser.add_argument("path", type=Path)
+    import_parser.add_argument("--project", required=True)
+    import_parser.add_argument("--apply", action="store_true")
+    import_parser.set_defaults(func=cmd_import_bundle)
+
     evidence = commands.add_parser("evidence", help="Append source-backed evidence")
     evidence.add_argument("--claim")
     evidence.add_argument("--input", type=Path)
@@ -912,9 +950,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     import_memory.add_argument("paths", nargs="+", type=Path)
     import_memory.add_argument("--project", default="workspace")
-    import_memory.add_argument("--privacy-scope", default="workspace")
+    import_memory.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_memory.add_argument("--limit", type=int)
     import_memory.add_argument("--max-bytes", type=int, default=50_000)
+    import_memory.add_argument("--dry-run", action="store_true")
     import_memory.set_defaults(func=cmd_import_memory)
 
     import_history = commands.add_parser(
@@ -924,10 +963,11 @@ def build_parser() -> argparse.ArgumentParser:
     import_history.add_argument("paths", nargs="*", type=Path)
     import_history.add_argument("--manifest", action="append", type=Path, default=[])
     import_history.add_argument("--project", default="workspace")
-    import_history.add_argument("--privacy-scope", default="workspace")
+    import_history.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_history.add_argument("--limit", type=int)
     import_history.add_argument("--max-bytes", type=int, default=20_000)
     import_history.add_argument("--batch-size", type=int, default=500)
+    import_history.add_argument("--dry-run", action="store_true")
     import_history.set_defaults(func=cmd_import_history)
 
     digest = commands.add_parser("digest", help="Show current scoped knowledge")
@@ -942,6 +982,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deprecated alias for --profile admin",
     )
+    mcp_parser.add_argument("--active-db-file", type=Path, help=argparse.SUPPRESS)
     mcp_parser.set_defaults(func=cmd_mcp)
     parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
     return parser
@@ -1028,9 +1069,7 @@ def dispatch_companion_command(argv: list[str]) -> int | None:
         db_index = argv.index("--db")
         if db_index + 1 < position:
             db = Path(argv[db_index + 1])
-    matches = [
-        item for item in entry_points(group="ocbrain.commands.v1") if item.name == command
-    ]
+    matches = [item for item in entry_points(group="ocbrain.commands.v1") if item.name == command]
     if len(matches) > 1:
         print(
             json.dumps(
@@ -1110,8 +1149,7 @@ def open_db(args: argparse.Namespace):
         return conn
     has_tables = (
         conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
         ).fetchone()
         is not None
     )
@@ -1120,6 +1158,50 @@ def open_db(args: argparse.Namespace):
     else:
         init_core_v1(conn)
     return conn
+
+
+def open_existing_core_v1(path: Path):
+    """Open an existing strict-v1 core without creating or migrating a path."""
+    resolved = path.expanduser()
+    if not resolved.is_file():
+        raise ValueError(f"strict-v1 core database does not exist: {resolved}")
+    conn = connect(resolved)
+    if not is_core_v1(conn):
+        conn.close()
+        raise ValueError("bundle commands require an initialized strict-v1 core")
+    return conn
+
+
+def cmd_export_bundle(args: argparse.Namespace) -> int:
+    conn = open_existing_core_v1(args.db)
+    try:
+        result = export_bundle(
+            conn,
+            args.output,
+            evidence_ids=args.evidence_id,
+            context=context_from_args(args),
+            approve_egress=args.approve_egress,
+        )
+    finally:
+        conn.close()
+    output(args, result)
+    return 0
+
+
+def cmd_import_bundle(args: argparse.Namespace) -> int:
+    if not args.apply:
+        output(
+            args,
+            import_bundle(None, args.path, project=args.project, apply=False),
+        )
+        return 0
+    conn = open_existing_core_v1(args.db)
+    try:
+        result = import_bundle(conn, args.path, project=args.project, apply=True)
+    finally:
+        conn.close()
+    output(args, result)
+    return 0
 
 
 def v1_counts(conn) -> dict[str, int]:
@@ -2081,12 +2163,21 @@ def legacy_row_body(row) -> str:
 
 
 def cmd_import_memory(args: argparse.Namespace) -> int:
-    conn = open_db(args)
-    files = memory_files(args.paths)
+    selection_skipped: list[dict[str, str]] = []
+    files = memory_files(args.paths, skipped=selection_skipped)
     if args.limit is not None:
         files = files[: args.limit]
+    if args.dry_run:
+        return emit_import_dry_run(
+            args,
+            files,
+            history=False,
+            skipped=selection_skipped,
+        )
+
+    conn = open_db(args)
     imported: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = list(selection_skipped)
     for path in files:
         try:
             if is_core_v1(conn):
@@ -2116,6 +2207,7 @@ def cmd_import_memory(args: argparse.Namespace) -> int:
     payload = {
         "imported": sum(1 for item in imported if item.get("changed", True)),
         "existing": sum(1 for item in imported if item.get("changed") is False),
+        "skipped_count": len(skipped),
         "skipped": skipped,
         "files": imported,
         "counts": v1_counts(conn) if is_core_v1(conn) else counts(conn),
@@ -2125,22 +2217,35 @@ def cmd_import_memory(args: argparse.Namespace) -> int:
 
 
 def cmd_import_history(args: argparse.Namespace) -> int:
-    conn = open_db(args)
-    conn.execute("PRAGMA synchronous=OFF")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA cache_size=-200000")
-    files = history_files(args.paths, manifests=args.manifest)
-    if not files:
+    selection_skipped: list[dict[str, str]] = []
+    files = history_files(
+        args.paths,
+        manifests=args.manifest,
+        skipped=selection_skipped,
+    )
+    if not files and not selection_skipped:
         raise ValueError("pass at least one history path or --manifest")
     if args.limit is not None:
         files = files[: args.limit]
+    if args.dry_run:
+        return emit_import_dry_run(
+            args,
+            files,
+            history=True,
+            skipped=selection_skipped,
+        )
+
+    conn = open_db(args)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-200000")
     existing_sources = set() if is_core_v1(conn) else imported_history_sources(conn)
     current_fingerprints = current_history_fingerprints(conn)
     imported = 0
     existing = 0
     by_runtime: dict[str, int] = {}
     samples: list[dict[str, str]] = []
-    skipped: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = list(selection_skipped)
     batch_size = max(args.batch_size, 1)
     for path in files:
         source_key = (str(path), f"{history_runtime(path)}_history_file")
@@ -2198,14 +2303,37 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     return 0
 
 
-def memory_files(paths: list[Path]) -> list[Path]:
+def memory_files(paths: list[Path], *, skipped: list[dict[str, str]] | None = None) -> list[Path]:
     files: list[Path] = []
+    seen: set[str] = set()
+
+    def consider(candidate: Path, *, sweep_root: Path | None = None) -> None:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if sweep_root is not None:
+            root = sweep_root.resolve()
+            if not path_is_within(resolved, root):
+                if skipped is not None:
+                    skipped.append({"path": key, "reason": "outside_sweep_root"})
+                return
+            if has_hidden_descendant(candidate, root) or has_hidden_descendant(resolved, root):
+                if skipped is not None:
+                    skipped.append({"path": key, "reason": "hidden_path"})
+                return
+        if key in seen:
+            return
+        seen.add(key)
+        files.append(resolved)
+
     for path in paths:
         if path.is_dir():
-            files.extend(sorted(path.rglob("*.md")))
+            root = path.resolve()
+            for candidate in root.rglob("*.md"):
+                if candidate.is_file():
+                    consider(candidate, sweep_root=root)
         elif path.suffix.lower() == ".md":
-            files.append(path)
-    return sorted(dict.fromkeys(path.resolve() for path in files))
+            consider(path)
+    return sorted(files)
 
 
 HISTORY_SUFFIXES = (
@@ -2217,36 +2345,165 @@ HISTORY_SUFFIXES = (
 )
 HISTORY_GLOBS = ("*.jsonl", "*.trajectory.jsonl", "*.jsonl.codex-app-server.json", "*.json", "*.md")
 
+SENSITIVE_HISTORY_FILENAMES = frozenset(
+    {
+        "auth.json",
+        "credentials.json",
+        ".credentials.json",
+        "config.json",
+        "settings.json",
+        "secrets.json",
+        "mcp.json",
+        "keychain.json",
+    }
+)
+_PRIVATE_KEY_BEGIN_RE = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_PRIVATE_KEY_END_RE = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 
-def history_files(paths: list[Path], *, manifests: list[Path] | None = None) -> list[Path]:
+
+def is_sensitive_history_file(path: Path) -> bool:
+    """Return true for credential-shaped files that must never be harvested."""
+    names = {path.name.lower(), path.resolve().name.lower()}
+    return any(
+        name in SENSITIVE_HISTORY_FILENAMES
+        or name.startswith(".env")
+        or name.endswith((".pem", ".key"))
+        for name in names
+    )
+
+
+def has_hidden_descendant(candidate: Path, sweep_root: Path) -> bool:
+    relative = candidate.relative_to(sweep_root)
+    return any(part.startswith(".") for part in relative.parts)
+
+
+def path_is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def history_files(
+    paths: list[Path],
+    *,
+    manifests: list[Path] | None = None,
+    skipped: list[dict[str, str]] | None = None,
+) -> list[Path]:
     files: list[Path] = []
     seen: set[str] = set()
+
+    def consider(candidate: Path, *, sweep_root: Path | None = None) -> None:
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if sweep_root is not None:
+            root = sweep_root.resolve()
+            if not path_is_within(resolved, root):
+                if skipped is not None:
+                    skipped.append({"path": key, "reason": "outside_sweep_root"})
+                return
+            if has_hidden_descendant(candidate, root) or has_hidden_descendant(resolved, root):
+                if skipped is not None:
+                    skipped.append({"path": key, "reason": "hidden_path"})
+                return
+        if is_sensitive_history_file(candidate):
+            if skipped is not None:
+                skipped.append({"path": key, "reason": "sensitive_filename"})
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        files.append(resolved)
+
     for manifest in manifests or []:
         for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
             candidate = Path(line.strip())
-            key = str(candidate)
-            if key not in seen and candidate.is_file() and is_history_file(candidate):
-                files.append(candidate)
-                seen.add(key)
+            if line.strip() and candidate.is_file() and has_history_suffix(candidate):
+                consider(candidate)
     for path in paths:
         if path.is_dir():
+            root = path.resolve()
             for pattern in HISTORY_GLOBS:
-                for candidate in path.rglob(pattern):
-                    key = str(candidate)
-                    if key not in seen and candidate.is_file():
-                        files.append(candidate)
-                        seen.add(key)
-        elif path.is_file() and is_history_file(path):
-            key = str(path)
-            if key not in seen:
-                files.append(path)
-                seen.add(key)
+                for candidate in root.rglob(pattern):
+                    if candidate.is_file():
+                        consider(candidate, sweep_root=root)
+        elif path.is_file() and has_history_suffix(path):
+            consider(path)
     return sorted(files)
 
 
-def is_history_file(path: Path) -> bool:
+def has_history_suffix(path: Path) -> bool:
     name = path.name.lower()
     return any(name.endswith(suffix) for suffix in HISTORY_SUFFIXES)
+
+
+def is_history_file(path: Path) -> bool:
+    return has_history_suffix(path) and not is_sensitive_history_file(path)
+
+
+def emit_import_dry_run(
+    args: argparse.Namespace,
+    files: list[Path],
+    *,
+    history: bool,
+    skipped: list[dict[str, str]] | None = None,
+) -> int:
+    """Inspect source files without opening, creating, or mutating SQLite."""
+    planned: list[dict[str, str]] = []
+    rejected: list[dict[str, str]] = list(skipped or [])
+    secret_leaks: list[dict[str, object]] = []
+    for path in files:
+        try:
+            nonempty, leaks, residue = inspect_import_source(path)
+        except (OSError, UnicodeError, MemoryError) as exc:
+            rejected.append({"path": str(path), "reason": str(exc)})
+            continue
+        if not nonempty:
+            rejected.append({"path": str(path), "reason": "empty"})
+            continue
+        if leaks or residue:
+            secret_leaks.append(
+                {
+                    "path": str(path),
+                    "leaks": leaks,
+                    "redaction_residue": residue,
+                }
+            )
+        item = {"path": str(path)}
+        if history:
+            item["runtime"] = history_runtime(path)
+        planned.append(item)
+    output(
+        args,
+        {
+            "dry_run": True,
+            "database_touched": False,
+            "privacy_scope": args.privacy_scope,
+            "would_import": len(planned),
+            "skipped_count": len(rejected),
+            "skipped": rejected[:50],
+            "secret_leak_count": len(secret_leaks),
+            "secret_leaks": secret_leaks[:50],
+            "files": planned[:50],
+        },
+    )
+    return 0
+
+
+def inspect_import_source(path: Path) -> tuple[bool, list[str], list[str]]:
+    """Stream a source to classify secrets without retaining its full contents."""
+    nonempty = False
+    leaks: set[str] = set()
+    residue: set[str] = set()
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for raw_line in handle:
+            nonempty = nonempty or bool(raw_line.strip())
+            leaks.update(find_probable_secret_leaks(raw_line))
+            if _PRIVATE_KEY_BEGIN_RE.search(raw_line):
+                leaks.add("private_key")
+            residue.update(find_probable_secret_leaks(redact_secrets(raw_line)))
+    return nonempty, sorted(leaks), sorted(residue)
 
 
 def import_memory_file_v1(
@@ -2260,10 +2517,11 @@ def import_memory_file_v1(
     raw = path.read_text(encoding="utf-8", errors="replace")
     if not raw.strip():
         return None
-    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode(
+    redacted = redact_secrets(raw)
+    truncated = redacted.encode("utf-8", errors="replace")[:max_bytes].decode(
         "utf-8", errors="replace"
     )
-    text = redact_secrets(truncated)
+    text = truncated
     return import_source_v1(
         conn,
         path=path,
@@ -2288,7 +2546,7 @@ def import_history_file_v1(
     if path.stat().st_size == 0:
         return None
     runtime = history_runtime(path)
-    text = redact_secrets(history_text_window(path, max_bytes=max_bytes))
+    text = history_text_window(path, max_bytes=max_bytes)
     return import_source_v1(
         conn,
         path=path,
@@ -2391,8 +2649,8 @@ def import_memory_file(
     raw = path.read_text(encoding="utf-8", errors="replace")
     if not raw.strip():
         return None
-    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode("utf-8", errors="replace")
-    text = redact_secrets(truncated)
+    redacted = redact_secrets(raw)
+    text = redacted.encode("utf-8", errors="replace")[:max_bytes].decode("utf-8", errors="replace")
     title = title_from_text(text, path.stem)
     source_uri = str(path)
     digest = content_hash(raw)
@@ -2450,7 +2708,7 @@ def import_history_file(
     source_uri = str(path)
     runtime = history_runtime(path)
     digest = file_fingerprint(path)
-    text = redact_secrets(history_text_window(path, max_bytes=max_bytes))
+    text = history_text_window(path, max_bytes=max_bytes)
     title = history_title(path, runtime)
     evidence_id = upsert_evidence(
         conn,
@@ -2533,8 +2791,9 @@ def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:
     if is_core_v1(conn):
         return {}
     return {
-        (row["body_uri"], f'{row["doc_kind"].removesuffix("_history")}_history_file'):
-        row["content_hash"]
+        (row["body_uri"], f"{row['doc_kind'].removesuffix('_history')}_history_file"): row[
+            "content_hash"
+        ]
         for row in conn.execute(
             """
             SELECT body_uri, doc_kind, content_hash
@@ -2549,21 +2808,72 @@ def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:
     }
 
 
+def iter_redacted_history(path: Path):
+    """Yield redacted history text without loading the whole file at once."""
+    in_private_key = False
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        for raw_line in handle:
+            remaining = raw_line
+            while remaining:
+                if in_private_key:
+                    end = _PRIVATE_KEY_END_RE.search(remaining)
+                    if end is None:
+                        break
+                    remaining = remaining[end.end() :]
+                    in_private_key = False
+                    continue
+
+                begin = _PRIVATE_KEY_BEGIN_RE.search(remaining)
+                if begin is None:
+                    yield redact_secrets(remaining)
+                    break
+
+                prefix = remaining[: begin.start()]
+                if prefix:
+                    yield redact_secrets(prefix)
+                yield "[REDACTED_PRIVATE_KEY]"
+                remaining = remaining[begin.end() :]
+                in_private_key = True
+
+
 def history_text_window(path: Path, *, max_bytes: int) -> str:
     if max_bytes <= 0:
         return ""
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size <= max_bytes:
-            data = handle.read()
-        else:
-            head_len = max_bytes // 2
-            tail_len = max_bytes - head_len
-            head = handle.read(head_len)
-            handle.seek(max(size - tail_len, 0))
-            tail = handle.read(tail_len)
-            marker = f"\n\n[... {size - max_bytes} bytes omitted from middle ...]\n\n".encode()
-            data = head + marker + tail
+    head_len = max_bytes // 2
+    tail_len = max_bytes - head_len
+    head = bytearray()
+    tail = bytearray()
+    complete = bytearray()
+    total = 0
+
+    for redacted in iter_redacted_history(path):
+        data = redacted.encode("utf-8", errors="replace")
+        prior_total = total
+        total += len(data)
+
+        if len(head) < head_len:
+            needed = head_len - len(head)
+            head.extend(data[:needed])
+
+        if tail_len:
+            if len(data) >= tail_len:
+                tail[:] = data[-tail_len:]
+            else:
+                overflow = max(len(tail) + len(data) - tail_len, 0)
+                if overflow:
+                    del tail[:overflow]
+                tail.extend(data)
+
+        if total <= max_bytes:
+            complete.extend(data)
+        elif prior_total <= max_bytes:
+            complete.clear()
+
+    if total <= max_bytes:
+        data = bytes(complete)
+    else:
+        marker = f"\n\n[... {total - max_bytes} bytes omitted from middle ...]\n\n".encode()
+        data = bytes(head) + marker + bytes(tail)
     return data.decode("utf-8", errors="replace")
 
 
@@ -2676,7 +2986,12 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    return serve(args.db, allow_writes=args.allow_writes, profile=args.profile)
+    return serve(
+        args.db,
+        allow_writes=args.allow_writes,
+        profile=args.profile,
+        active_db_file=getattr(args, "active_db_file", None),
+    )
 
 
 # --------------------------------------------------------------------------- #

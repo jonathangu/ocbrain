@@ -100,6 +100,12 @@ ADMIN_ONLY_TOOLS = {
     "brain.forget",
 }
 
+ACTIVE_DB_CHANGED_EXIT_CODE = 3
+ACTIVE_DB_CHANGED_ERROR_CODE = -32010
+ACTIVE_DB_CHANGED_MESSAGE = (
+    "active database pointer changed; reconnect the MCP client before retrying"
+)
+
 
 def strip_explicit_nulls(value: Any) -> Any:
     """Remove provider null sentinels at the one seam every tool call crosses."""
@@ -136,7 +142,14 @@ def serve(
     *,
     allow_writes: bool = False,
     profile: str | None = None,
+    active_db_file: Path | None = None,
 ) -> int:
+    if active_db_file is not None and not _active_db_pointer_matches(
+        db_path,
+        active_db_file,
+    ):
+        _report_active_db_change()
+        return ACTIVE_DB_CHANGED_EXIT_CODE
     conn = connect(db_path)
     conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     if is_core_v1(conn):
@@ -150,6 +163,12 @@ def serve(
     for line in sys.stdin:
         if not line.strip():
             continue
+        if active_db_file is not None and not _active_db_pointer_matches(
+            db_path,
+            active_db_file,
+        ):
+            _refuse_stale_active_db_request(line)
+            return ACTIVE_DB_CHANGED_EXIT_CODE
         try:
             request = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -170,6 +189,40 @@ def serve(
     return 0
 
 
+def _active_db_pointer_matches(db_path: Path, active_db_file: Path) -> bool:
+    try:
+        lines = active_db_file.read_text(encoding="utf-8").splitlines()
+        if len(lines) != 1 or not lines[0]:
+            return False
+        selected = Path(lines[0])
+        if not selected.is_absolute():
+            return False
+        return selected.resolve() == db_path.resolve()
+    except (OSError, UnicodeError):
+        return False
+
+
+def _report_active_db_change() -> None:
+    sys.stderr.write(f"ocbrain: {ACTIVE_DB_CHANGED_MESSAGE}\n")
+    sys.stderr.flush()
+
+
+def _refuse_stale_active_db_request(line: str) -> None:
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError:
+        request = None
+    if isinstance(request, dict) and "id" in request:
+        response = error_response(
+            request.get("id"),
+            ACTIVE_DB_CHANGED_ERROR_CODE,
+            ACTIVE_DB_CHANGED_MESSAGE,
+        )
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
+    _report_active_db_change()
+
+
 def _database_has_user_tables(conn: sqlite3.Connection) -> bool:
     return (
         conn.execute(
@@ -182,16 +235,25 @@ def _database_has_user_tables(conn: sqlite3.Connection) -> bool:
 
 def handle_request(
     conn,
-    request: dict[str, Any],
+    request: Any,
     *,
     allow_writes: bool = False,
     profile: str | None = None,
 ) -> dict[str, Any] | None:
+    if not isinstance(request, dict):
+        return error_response(
+            None,
+            -32600,
+            "invalid request: message must be a JSON object",
+        )
     resolved_profile = resolve_profile(profile=profile, allow_writes=allow_writes)
     method = request.get("method")
     request_id = request.get("id")
     is_notification = "id" not in request
     try:
+        params = request.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError("invalid params: params must be a JSON object")
         if method == "initialize":
             result = {
                 "protocolVersion": "2025-11-25",
@@ -208,24 +270,28 @@ def handle_request(
         elif method == "tools/call":
             result = _call_tool_with_lock_retry(
                 conn,
-                request.get("params", {}),
+                params,
                 profile=resolved_profile,
             )
         elif method == "resources/list":
             result = {"resources": resource_list(conn)}
         elif method == "resources/read":
-            result = read_resource(conn, request.get("params", {}).get("uri"))
+            result = read_resource(conn, params.get("uri"))
         else:
-            return error_response(request_id, -32601, f"unknown method: {method}")
-        if is_notification:
-            return None
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+            response = error_response(request_id, -32601, f"unknown method: {method}")
+            return None if is_notification else response
+        response = {"jsonrpc": "2.0", "id": request_id, "result": result}
     except KeyError as exc:
-        return error_response(request_id, -32602, f"missing argument: {exc.args[0]}")
+        response = error_response(request_id, -32602, f"missing argument: {exc.args[0]}")
     except PermissionError as exc:
-        return error_response(request_id, -32001, str(exc))
+        response = error_response(request_id, -32001, str(exc))
+    except ValueError as exc:
+        response = error_response(request_id, -32602, str(exc))
     except Exception as exc:  # noqa: BLE001 - MCP errors must be serialized.
-        return error_response(request_id, -32000, str(exc))
+        response = error_response(request_id, -32000, str(exc))
+    if is_notification:
+        return None
+    return response
 
 
 def _call_tool_with_lock_retry(
@@ -307,8 +373,7 @@ def _log_context_and_issue_if_available(
             task_ref=context.task or f"brain.context:{payload['query']}",
             outcome="served",
             note=(
-                f"schema={payload['schema_version']};"
-                f"limit={payload['coverage']['requested_limit']}"
+                f"schema={payload['schema_version']};limit={payload['coverage']['requested_limit']}"
             ),
             query_text=payload["query"],
             served_ids=[str(item["id"]) for item in payload["items"]],
@@ -695,9 +760,10 @@ def call_tool_v1(
     profile: str,
 ) -> dict[str, Any]:
     """Dispatch the stable MCP surface without consulting the v0.x archive."""
-    if name in {"brain.context", "brain.search", "brain.preview"} and arguments.get(
-        "at_ts"
-    ) is not None:
+    if (
+        name in {"brain.context", "brain.search", "brain.preview"}
+        and arguments.get("at_ts") is not None
+    ):
         raise ValueError("at_ts is not supported by ocbrain.core.v1; omit it")
     if name == "brain.context":
         query = require_string(arguments, "query")
@@ -863,9 +929,7 @@ def call_tool_v1(
             status=require_string(arguments, "status"),
             summary=require_string(arguments, "summary"),
             context=context,
-            retrieval_use_ids=string_list(
-                arguments.get("retrieval_use_ids"), "retrieval_use_ids"
-            ),
+            retrieval_use_ids=string_list(arguments.get("retrieval_use_ids"), "retrieval_use_ids"),
             decision_impact=optional_string(arguments, "decision_impact") or "unknown",
             decision_note=optional_string(arguments, "decision_note"),
             artifact_refs=object_list(arguments.get("artifact_refs"), "artifact_refs"),
@@ -1414,7 +1478,7 @@ def tool_list(*, profile: str = RUNTIME_PROFILE) -> list[dict[str, Any]]:
                         "target": {"type": "string"},
                         "layer": {
                             "type": "string",
-                            "enum": ["evidence", "knowledge", "belief"],
+                            "enum": ["knowledge", "belief"],
                         },
                         "op": {
                             "type": "string",

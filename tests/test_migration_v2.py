@@ -243,8 +243,23 @@ def test_list_current_knowledge_excludes_quarantined(tmp_path: Path) -> None:
 def test_legacy_drop_block_still_burns_down_old_tables(tmp_path: Path) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE events (id TEXT)")
-    conn.execute("CREATE TABLE candidate_decisions (id TEXT)")
+    conn.execute(
+        """
+        CREATE TABLE events (
+          id TEXT, source_type TEXT, source_uri TEXT, content_hash TEXT, title TEXT,
+          summary TEXT, body TEXT, scope TEXT, metadata_json TEXT, created_at TEXT,
+          ingested_at TEXT, triaged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE candidate_decisions (
+          id TEXT, candidate_id TEXT, action TEXT, actor TEXT, reason TEXT,
+          previous_status TEXT, next_status TEXT, created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 

@@ -3,16 +3,26 @@ from __future__ import annotations
 import math
 import re
 
+# Secret-bearing key names appear in ordinary assignments, JSON objects, and
+# JSON strings whose quotes are backslash-escaped. Keep secret terms terminal:
+# ``token_budget``, ``tokenizer``, and ``secretary`` are metadata, not secrets.
+# Snake/env variants may carry namespaces; camelCase variants use an explicit
+# capitalized suffix so real keys such as ``openaiApiKey`` still match.
+_SNAKE_SECRET_KEY = (
+    r"(?i:(?:[a-z0-9]+[_-])*(?:api[_-]?key|secret[_-]?key|private[_-]?key|"
+    r"token|secret|passwd|password|credentials?|authorization))"
+)
+_CAMEL_SECRET_KEY = (
+    r"(?:[A-Za-z0-9]*(?:ApiKey|SecretKey|PrivateKey|AccessToken|RefreshToken|"
+    r"AuthToken|BearerToken|ClientSecret|ClientPassword|Token|Secret|Password|"
+    r"Credential|Credentials|Authorization))"
+)
+_SECRET_KEY_ATOM = rf"(?:{_SNAKE_SECRET_KEY}|{_CAMEL_SECRET_KEY})"
+
+_JSON_QUOTED_SECRET = re.compile(rf'(\\?"{_SECRET_KEY_ATOM}\\?"\s*:\s*\\?")([^"]*?)(\\?")')
+_QUOTED_ASSIGNED_SECRET = re.compile(rf"\b({_SECRET_KEY_ATOM}\s*[:=]\s*)(\"[^\"\n]+\"|'[^'\n]+')")
+
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (
-        re.compile(r"(?i)(api[_-]?key|secret|token|password|credential)(\s*[:=]\s*)([^\s\"']+)"),
-        r"\1\2[REDACTED]",
-    ),
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), "[REDACTED]"),
-    (re.compile(r"ghp_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
-    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
-    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"), "[REDACTED]"),
     (
         re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
         "[REDACTED_PRIVATE_KEY]",
@@ -21,10 +31,21 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
         "[REDACTED_JWT]",
     ),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{16,}"), r"\1[REDACTED]"),
+    (re.compile(r"sk-[A-Za-z0-9_-]{16,}"), "[REDACTED]"),
+    (re.compile(r"ghp_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED]"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"), "[REDACTED]"),
+    (_JSON_QUOTED_SECRET, r"\1[REDACTED]\3"),
+    (_QUOTED_ASSIGNED_SECRET, r'\1"[REDACTED]"'),
+    (
+        re.compile(rf"({_SECRET_KEY_ATOM})(\s*[:=]\s*)([^\s\"']+)"),
+        r"\1\2[REDACTED]",
+    ),
 ]
 
 LEAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9_-]{16,}")),
     ("github_token", re.compile(r"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}")),
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}")),
     ("bearer_token", re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}")),
@@ -34,9 +55,14 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
     ),
     (
+        "json_quoted_secret",
+        re.compile(rf'\\?"{_SECRET_KEY_ATOM}\\?"\s*:\s*\\?"(?!\[REDACTED\])[^\"]+?\\?"'),
+    ),
+    (
         "assigned_secret",
         re.compile(
-            r"(?i)(api[_-]?key|secret|token|password|credential)\s*[:=]\s*(?!\[REDACTED\])[^\s\"']+"
+            rf"{_SECRET_KEY_ATOM}\s*[:=]\s*"
+            rf"(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]')[^\s]+"
         ),
     ),
 ]

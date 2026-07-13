@@ -114,6 +114,22 @@ stores. They may read a core snapshot or submit evidence through the core API;
 they are not additional brains, are never queried by the default MCP, and
 install no recurring schedule through the core package.
 
+Cross-machine exchange is explicit and file-only. `export-bundle` accepts an
+explicit list of evidence ids, applies scope and human-export egress gates,
+redacts secrets, records an egress audit, and publishes only a fresh `0600`
+JSON file. It refuses `local_only` and `prohibited` evidence and requires
+`--approve-egress` for `approval_required` evidence. There is no network,
+background sync, MCP bundle tool, or plugin installer.
+
+`import-bundle` fully validates the envelope, count, items, and canonical
+payload hash before touching SQLite. Its default is a database-free dry run;
+`--apply` appends content-derived local evidence events in one transaction and
+folds projections once. Sender ids are provenance only. Imported evidence is
+forced to a caller-selected project with `confidential` visibility,
+`local_only` egress, and explicit `bundle_import` provenance. Bundles never
+import beliefs, source handles, retrieval receipts, closeouts, or companion
+state.
+
 Migration is archive-first. The live v0.x database is opened read-only, copied
 to a verified immutable archive, transformed into fresh outputs, and never
 replaced or repointed automatically. A candidate is provisionally activated

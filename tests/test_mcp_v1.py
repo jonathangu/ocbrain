@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import sys
 
 from ocbrain.core_v1 import (
     append_core_event,
@@ -8,7 +10,12 @@ from ocbrain.core_v1 import (
     record_core_v1_evidence,
 )
 from ocbrain.db import connect
-from ocbrain.mcp import handle_request
+from ocbrain.mcp import (
+    ACTIVE_DB_CHANGED_ERROR_CODE,
+    ACTIVE_DB_CHANGED_EXIT_CODE,
+    handle_request,
+    serve,
+)
 from ocbrain.scope import ScopeTag
 
 
@@ -154,17 +161,18 @@ def test_v1_context_source_feedback_closeout_round_trip(tmp_path):
     )
     assert closeout["schema_version"] == "ocbrain.closeout.v1"
     assert closeout["verification_status"] == "verified"
-    assert conn.execute(
-        "SELECT affected_decision FROM retrieval_uses WHERE id=?",
-        (context["retrieval_use_id"],),
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT affected_decision FROM retrieval_uses WHERE id=?",
+            (context["retrieval_use_id"],),
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_v1_runtime_and_admin_profiles_are_distinct(tmp_path):
     conn = _seed_v1(tmp_path)
-    runtime = handle_request(
-        conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
-    )
+    runtime = handle_request(conn, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     runtime_names = {item["name"] for item in runtime["result"]["tools"]}
     assert runtime_names == {
         "brain.context",
@@ -184,8 +192,149 @@ def test_v1_runtime_and_admin_profiles_are_distinct(tmp_path):
     )
     admin_names = {item["name"] for item in admin["result"]["tools"]}
     assert {"brain.correct", "brain.proposal_decide", "brain.forget"} <= admin_names
+    correct_tool = next(
+        item for item in admin["result"]["tools"] if item["name"] == "brain.correct"
+    )
+    assert correct_tool["inputSchema"]["properties"]["layer"]["enum"] == [
+        "knowledge",
+        "belief",
+    ]
     assert "brain.teacher_request" not in admin_names
     assert "brain.mark_stale" not in admin_names
+
+
+def test_v1_non_object_jsonrpc_frames_are_invalid_requests(tmp_path):
+    conn = _seed_v1(tmp_path)
+
+    for frame in ([], [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], 5, "x", True, None):
+        response = handle_request(conn, frame)
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32600,
+                "message": "invalid request: message must be a JSON object",
+            },
+        }
+
+    assert handle_request(conn, {"jsonrpc": "2.0", "id": 9, "method": "ping"}) == {
+        "jsonrpc": "2.0",
+        "id": 9,
+        "result": {},
+    }
+
+
+def test_v1_non_object_params_are_invalid_params_not_internal_errors(tmp_path):
+    conn = _seed_v1(tmp_path)
+
+    for request_id, params in enumerate(([], "x", 5, True, None), start=1):
+        response = handle_request(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": params,
+            },
+        )
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32602,
+                "message": "invalid params: params must be a JSON object",
+            },
+        }
+        assert "attribute" not in response["error"]["message"].lower()
+
+    resource_response = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "resources/read",
+            "params": ["brain://wiki/runtime-integration"],
+        },
+    )
+    assert resource_response["error"]["code"] == -32602
+    assert "attribute" not in resource_response["error"]["message"].lower()
+
+
+def test_v1_malformed_notifications_are_never_answered(tmp_path):
+    conn = _seed_v1(tmp_path)
+
+    assert (
+        handle_request(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": [],
+            },
+        )
+        is None
+    )
+    assert handle_request(conn, {"jsonrpc": "2.0", "method": "unknown"}) is None
+
+
+def test_v1_stdio_loop_survives_malformed_frames_and_keeps_runtime_surface(tmp_path, monkeypatch):
+    frames = "\n".join(
+        [
+            "[]",
+            '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":[]}',
+            '{"jsonrpc":"2.0","id":3,"method":"tools/list"}',
+        ]
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(frames + "\n"))
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    assert serve(tmp_path / "stdio-v1.sqlite") == 0
+
+    responses = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert responses[0]["error"]["code"] == -32600
+    assert responses[1]["error"]["code"] == -32602
+    assert {tool["name"] for tool in responses[2]["result"]["tools"]} == {
+        "brain.context",
+        "brain.source",
+        "brain.search",
+        "brain.digest",
+        "brain.get",
+        "brain.feedback",
+        "brain.ingest",
+        "brain.closeout",
+    }
+
+
+def test_v1_pointer_selected_server_exits_before_serving_after_pointer_change(
+    tmp_path, monkeypatch
+):
+    first_db = tmp_path / "first.sqlite"
+    second_db = tmp_path / "second.sqlite"
+    active_db_file = tmp_path / "active-core.path"
+    active_db_file.write_text(f"{first_db}\n")
+
+    def frames():
+        yield '{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+        active_db_file.write_text(f"{second_db}\n")
+        yield '{"jsonrpc":"2.0","id":2,"method":"tools/list"}\n'
+
+    monkeypatch.setattr(sys, "stdin", frames())
+    output = io.StringIO()
+    errors = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(sys, "stderr", errors)
+
+    assert serve(first_db, active_db_file=active_db_file) == ACTIVE_DB_CHANGED_EXIT_CODE
+
+    responses = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert responses[0] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert responses[1]["jsonrpc"] == "2.0"
+    assert responses[1]["id"] == 2
+    assert responses[1]["error"]["code"] == ACTIVE_DB_CHANGED_ERROR_CODE
+    assert "reconnect" in responses[1]["error"]["message"]
+    assert "reconnect" in errors.getvalue()
+    assert not second_db.exists()
 
 
 def test_v1_initialize_teaches_the_shared_context_closeout_contract(tmp_path):

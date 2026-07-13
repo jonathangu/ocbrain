@@ -154,12 +154,8 @@ def database_status(path: Path) -> dict[str, Any]:
         "shm_bytes": shm.stat().st_size if shm.exists() else 0,
         "counts": counts,
         "core_schema": "ocbrain.core.v1" if v1 else "legacy",
-        "core_rows": sum(
-            counts.get(name, 0) for name in (CORE_V1_TABLES if v1 else CORE_TABLES)
-        ),
-        "companion_rows": (
-            0 if v1 else sum(counts.get(name, 0) for name in COMPANION_TABLES)
-        ),
+        "core_rows": sum(counts.get(name, 0) for name in (CORE_V1_TABLES if v1 else CORE_TABLES)),
+        "companion_rows": (0 if v1 else sum(counts.get(name, 0) for name in COMPANION_TABLES)),
     }
 
 
@@ -448,6 +444,31 @@ def runtime_client_checks(*, timeout_seconds: float = 12.0) -> list[dict[str, An
     return [_run_client_check(name, command, timeout_seconds) for name, command in commands]
 
 
+def local_control_file_security() -> dict[str, Any]:
+    """Check optional local control files without reading or exposing contents."""
+    candidates = {
+        "active_db_pointer": Path(
+            os.environ.get("OCBRAIN_ACTIVE_DB_FILE", "data/active-core.path")
+        ).expanduser(),
+        "config": Path(os.environ.get("OCBRAIN_CONFIG", "data/ocbrain.config.json")).expanduser(),
+    }
+    files: dict[str, dict[str, Any]] = {}
+    healthy = True
+    for name, path in candidates.items():
+        if not path.exists():
+            files[name] = {"status": "missing_optional", "secure": True}
+            continue
+        mode = path.stat().st_mode & 0o777
+        secure = path.is_file() and mode & 0o077 == 0
+        healthy = healthy and secure
+        files[name] = {
+            "status": "owner_only" if secure else "permissions_too_open",
+            "secure": secure,
+            "mode": f"{mode:04o}",
+        }
+    return {"healthy": healthy, "files": files}
+
+
 def doctor(
     path: Path,
     *,
@@ -458,7 +479,10 @@ def doctor(
     db = database_status(path)
     mcp = stdio_mcp_smoke(timeout_seconds=timeout_seconds, launcher=launcher)
     clients = runtime_client_checks(timeout_seconds=timeout_seconds) if check_clients else []
-    healthy = bool(db.get("healthy")) and bool(mcp.get("healthy"))
+    local_files = local_control_file_security()
+    healthy = (
+        bool(db.get("healthy")) and bool(mcp.get("healthy")) and bool(local_files.get("healthy"))
+    )
     if check_clients:
         healthy = healthy and all(item["healthy"] for item in clients)
     return {
@@ -468,6 +492,7 @@ def doctor(
         "database": db,
         "mcp_stdio": mcp,
         "clients": clients,
+        "local_control_files": local_files,
     }
 
 

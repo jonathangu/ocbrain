@@ -20,6 +20,7 @@ from ocbrain.core_v1 import (
     verify_event_chain,
 )
 from ocbrain.db import connect, init_db
+from ocbrain.mcp_v1 import correct_v1, decide_proposal_v1, forget_v1
 from ocbrain.scope import ScopeContext, ScopeTag
 
 
@@ -69,9 +70,10 @@ def test_fresh_v1_markers_and_legacy_init_refusal(tmp_path) -> None:
     assert conn.execute("PRAGMA user_version").fetchone()[0] == CORE_V1_USER_VERSION
     with pytest.raises(ValueError, match="legacy init_db"):
         init_db(conn)
-    assert list(
-        conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
-    ) == schema_before
+    assert (
+        list(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"))
+        == schema_before
+    )
     conn.close()
 
 
@@ -81,9 +83,10 @@ def test_init_core_v1_rejects_nonempty_or_mixed_database(tmp_path) -> None:
     conn.commit()
     with pytest.raises(ValueError, match="existing schema"):
         init_core_v1(conn)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='brain_events'"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='brain_events'").fetchone()[0]
+        == 0
+    )
     conn.close()
 
     conn = connect(tmp_path / "marked.sqlite")
@@ -92,9 +95,12 @@ def test_init_core_v1_rejects_nonempty_or_mixed_database(tmp_path) -> None:
     conn.commit()
     with pytest.raises(RuntimeError, match="inventory mismatch"):
         init_core_v1(conn)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE name='leaked_companion'"
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='leaked_companion'").fetchone()[
+            0
+        ]
+        == 1
+    )
     conn.close()
 
 
@@ -182,13 +188,19 @@ def test_full_projection_is_deterministic_and_preserves_runtime_receipts(tmp_pat
     assert first["last_event_hash"] == second["last_event_hash"]
     assert beliefs_first == beliefs_second
     assert cursor_first == cursor_second
-    assert conn.execute(
-        "SELECT COUNT(*) FROM retrieval_items WHERE retrieval_use_id=?", (retrieval_id,)
-    ).fetchone()[0] == 2
-    assert conn.execute(
-        "SELECT COUNT(*) FROM task_closeout_retrievals WHERE retrieval_use_id=?",
-        (retrieval_id,),
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM retrieval_items WHERE retrieval_use_id=?", (retrieval_id,)
+        ).fetchone()[0]
+        == 2
+    )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM task_closeout_retrievals WHERE retrieval_use_id=?",
+            (retrieval_id,),
+        ).fetchone()[0]
+        == 1
+    )
     conn.close()
 
 
@@ -220,4 +232,133 @@ def test_get_core_record_keeps_lifecycle_metadata_for_mcp_gate(tmp_path) -> None
     assert belief["status"] == "current"
     assert belief["serve"] == 1
     assert json.loads(belief["attributes_json"]) == {}
+    conn.close()
+
+
+@pytest.mark.parametrize("constraint", ["tombstone", "retraction"])
+def test_late_decision_cannot_revive_constrained_belief(tmp_path, constraint) -> None:
+    conn = connect(tmp_path / f"{constraint}.sqlite")
+    init_core_v1(conn)
+    belief_id = f"belief:late-{constraint}"
+    proposal_id = append_core_event(
+        conn,
+        "compilation_proposed",
+        {
+            "belief_id": belief_id,
+            "body": "This pending proposal must not override a later constraint.",
+            "evidence_ids": [],
+            "scope": ScopeTag("project", "project:ocbrain").to_dict(),
+        },
+        writer="test",
+    )
+    if constraint == "tombstone":
+        forget_v1(
+            conn,
+            target=belief_id,
+            mode="soft",
+            reason="withdrawn",
+            actor="human:test",
+        )
+    else:
+        correct_v1(
+            conn,
+            layer="belief",
+            target=belief_id,
+            op="retract",
+            body="withdrawn",
+            actor="human:test",
+            hard=False,
+        )
+
+    with pytest.raises(PermissionError, match="cannot approve"):
+        decide_proposal_v1(
+            conn,
+            proposal_event_id=proposal_id,
+            decision="approve",
+            actor="human:test",
+            edited_body=None,
+            reason=None,
+        )
+
+    # A raw/replayed decision bypassing the MCP guard still cannot win in the
+    # deterministic projection.
+    append_core_event(
+        conn,
+        "compilation_decided",
+        {
+            "proposal_event_id": proposal_id,
+            "decision": "approve",
+            "actor": "malformed-import",
+        },
+        writer="test",
+        project=True,
+    )
+    expected = "tombstoned" if constraint == "tombstone" else "retracted"
+    assert get_core_v1_belief(conn, belief_id)["status"] == expected
+    project_core_v1(conn, full=True)
+    assert get_core_v1_belief(conn, belief_id)["status"] == expected
+    conn.close()
+
+
+def test_evidence_correction_is_rejected_without_appending_event(tmp_path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    before = conn.execute("SELECT COUNT(*) FROM brain_events").fetchone()[0]
+
+    with pytest.raises(ValueError, match="evidence corrections are unsupported"):
+        correct_v1(
+            conn,
+            layer="evidence",
+            target="evd:test",
+            op="retract",
+            body=None,
+            actor="human:test",
+            hard=True,
+        )
+
+    assert conn.execute("SELECT COUNT(*) FROM brain_events").fetchone()[0] == before
+    conn.close()
+
+
+def test_any_post_proposal_correction_makes_the_pending_decision_stale(tmp_path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    belief_id = "belief:stale-after-pin"
+    proposal_id = append_core_event(
+        conn,
+        "compilation_proposed",
+        {
+            "belief_id": belief_id,
+            "body": "A pending proposal.",
+            "evidence_ids": [],
+            "scope": ScopeTag("project", "project:ocbrain").to_dict(),
+        },
+        writer="test",
+    )
+    correct_v1(
+        conn,
+        layer="belief",
+        target=belief_id,
+        op="pin",
+        body=None,
+        actor="human:test",
+        hard=False,
+    )
+
+    with pytest.raises(PermissionError, match="post-proposal correction"):
+        decide_proposal_v1(
+            conn,
+            proposal_event_id=proposal_id,
+            decision="approve",
+            actor="human:test",
+            edited_body=None,
+            reason=None,
+        )
+
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM brain_events WHERE kind='compilation_decided'"
+        ).fetchone()[0]
+        == 0
+    )
     conn.close()

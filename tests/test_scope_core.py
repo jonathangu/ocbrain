@@ -127,9 +127,7 @@ def test_scoped_retrieval_excludes_foreign_project_but_keeps_global(tmp_path: Pa
     assert "belief:global-rules-red" in ids
     assert "belief:pelican-options" not in ids
     assert "belief:cormorant-lanes" not in ids
-    assert {item["belief_id"] for item in payload["applied_global"]} == {
-        "belief:global-rules-red"
-    }
+    assert {item["belief_id"] for item in payload["applied_global"]} == {"belief:global-rules-red"}
 
 
 def test_cross_scope_is_explicit_and_still_blocks_confidential(tmp_path: Path) -> None:
@@ -194,8 +192,7 @@ def test_contradiction_ranking_respects_scope_boundaries(tmp_path: Path) -> None
 
     assert frozenset({"belief:bountiful-fly", "belief:bountiful-not-fly"}) in pairs
     assert all(
-        "personal_finance:pelican" not in json.dumps(item)
-        for item in payload["contradictions"]
+        "personal_finance:pelican" not in json.dumps(item) for item in payload["contradictions"]
     )
     assert payload["contradictions"][0]["score"] >= payload["contradictions"][-1]["score"]
 
@@ -262,6 +259,20 @@ def test_unscoped_ingest_is_quarantined_not_global(tmp_path: Path) -> None:
     assert body["scope"]["scope_type"] == "legacy_unscoped"
     assert body["scope"]["egress_policy"] == "local_only"
     assert body["scope"]["provenance"] == "quarantined"
+
+
+def test_specific_scope_preserves_client_confidentiality() -> None:
+    contexts = [
+        (ScopeContext(client="acme", task="audit"), "task", "task:audit"),
+        (ScopeContext(client="acme", session="s1"), "session", "session:s1"),
+        (ScopeContext(client="acme", repo="bridge"), "repo", "repo:bridge"),
+    ]
+
+    for context, expected_type, expected_id in contexts:
+        scope = resolve_write_scope(context)
+        assert (scope.scope_type, scope.scope_id) == (expected_type, expected_id)
+        assert scope.visibility == "confidential"
+        assert scope.egress_policy == "local_only"
 
 
 def test_pending_compilation_is_invisible_until_decided(tmp_path: Path) -> None:
@@ -417,8 +428,9 @@ def test_get_current_belief_includes_web_provenance_without_source_body(
         artifact_ref="https://bountiful.garden/api/health",
     )
     evidence_body = json.loads(
-        conn.execute("SELECT body_json FROM brain_events WHERE id = ?", (evidence_event,))
-        .fetchone()["body_json"]
+        conn.execute(
+            "SELECT body_json FROM brain_events WHERE id = ?", (evidence_event,)
+        ).fetchone()["body_json"]
     )
     proposal = propose_compilation(
         conn,
@@ -550,9 +562,7 @@ def test_dream_writes_pending_scoped_proposals_not_current_beliefs(tmp_path: Pat
 
     assert result["summary"]["proposals"] >= 2
     assert result["egress"]["audit_id"].startswith("egress_")
-    assert {item["reward_band"] for item in list_compilation_proposals(conn)} == {
-        "moderate"
-    }
+    assert {item["reward_band"] for item in list_compilation_proposals(conn)} == {"moderate"}
     assert payload["items"] == []
 
 
@@ -839,9 +849,7 @@ def test_mcp_event_gate_lists_and_decides_proposals(tmp_path: Path) -> None:
         allow_writes=True,
     )
     listed_payload = json.loads(listed["result"]["content"][0]["text"])
-    assert proposal_id in {
-        item["proposal_event_id"] for item in listed_payload["proposals"]
-    }
+    assert proposal_id in {item["proposal_event_id"] for item in listed_payload["proposals"]}
     assert listed_payload["approval_packet"]["send_performed"] is False
     assert f"/ocbrain_gate reject {proposal_id}" in listed_payload["approval_packet"]["text"]
 
