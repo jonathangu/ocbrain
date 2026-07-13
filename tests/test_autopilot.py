@@ -226,6 +226,42 @@ def test_stage_time_budget_zero_processes_nothing(tmp_path):
     assert result["changed"] == 0
 
 
+def test_harvest_prioritizes_exact_file_roots(tmp_path, monkeypatch):
+    from ocbrain import cli as cli_module
+
+    conn, path = _db(tmp_path)
+    cfg = _cfg(tmp_path)
+    tree = tmp_path / "a-tree"
+    tree.mkdir()
+    tree_file = tree / "first-by-global-sort.jsonl"
+    tree_file.write_text('{"role":"user","content":"tree"}\n', encoding="utf-8")
+    exact_file = tmp_path / "z-exact.jsonl"
+    exact_file.write_text('{"role":"user","content":"exact"}\n', encoding="utf-8")
+    seen: list[Path] = []
+
+    monkeypatch.setattr(cli_module, "history_files", lambda _roots: [tree_file, exact_file])
+    monkeypatch.setattr(cli_module, "imported_history_sources", lambda _conn: set())
+    monkeypatch.setattr(cli_module, "current_history_fingerprints", lambda _conn: {})
+
+    def record_import(_conn, current_path, **_kwargs):
+        seen.append(current_path)
+        return {"path": str(current_path), "runtime": "unknown"}
+
+    monkeypatch.setattr(cli_module, "import_history_file", record_import)
+    ctx = autopilot.AutopilotContext(
+        conn=conn,
+        cfg=cfg,
+        db_path=path,
+        roots=[str(tree), str(exact_file)],
+        stage_budget_seconds=None,
+    )
+
+    result = autopilot.stage_harvest(ctx)
+
+    assert result["imported"] == 2
+    assert seen == [exact_file, tree_file]
+
+
 def test_budget_for_resolves_per_stage_override(tmp_path):
     # R2: stage_budgets overrides one stage; every other budget-aware stage
     # falls back to the shared stage_budget_seconds.

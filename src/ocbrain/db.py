@@ -1460,13 +1460,13 @@ def knowledge_digest(
     conn: sqlite3.Connection,
     *,
     project: str | None = None,
-    scopes: tuple[str, ...] = PUBLIC_SCOPES,
+    scopes: tuple[str, ...] | None = PUBLIC_SCOPES,
     limit: int = 12,
 ) -> dict[str, Any]:
     return {
         "counts": counts(conn),
         "project": project,
-        "scopes": list(scopes),
+        "scopes": list(scopes) if scopes is not None else None,
         "memory": [
             knowledge_summary(row)
             for row in list_current_knowledge(

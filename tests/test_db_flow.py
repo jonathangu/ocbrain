@@ -599,6 +599,56 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
     }
     assert len(search_payload["items"]) == 3
 
+    # A live append-only transcript path must refresh when its fingerprint
+    # changes, while keeping one current searchable knowledge document.
+    openclaw_path.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "runtime": "openclaw",
+                "content": "openclaw transcript contains refreshed sentinel",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "import-history",
+                str(openclaw_path),
+            ]
+        )
+        == 0
+    )
+    refresh_payload = json.loads(capsys.readouterr().out)
+    assert refresh_payload["imported"] == 1
+    assert refresh_payload["existing"] == 0
+    assert refresh_payload["counts"]["evidence"] == 4
+    assert refresh_payload["counts"]["knowledge"] == 3
+
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "search",
+                "refreshed sentinel",
+                "--project",
+                "workspace",
+            ]
+        )
+        == 0
+    )
+    refreshed_items = json.loads(capsys.readouterr().out)["items"]
+    refreshed_matches = [
+        item for item in refreshed_items if "refreshed sentinel" in item["excerpt"]
+    ]
+    assert len(refreshed_matches) == 1
+    assert refreshed_matches[0]["kind"] == "core_v1"
+
 
 def test_capability_no_longer_force_gated(tmp_path: Path) -> None:
     # v0.2 removed the gate-forcing block: a high-risk capability written with
@@ -912,6 +962,28 @@ def test_private_evidence_tightens_public_doc_scope(tmp_path: Path) -> None:
     assert row["privacy_scope"] == "private"
     assert not any(item["id"] == knowledge_id for item in digest["documents"])
     assert get_current_doc(conn, slug="public-derived-doc") is None
+
+
+def test_private_digest_can_explicitly_disable_scope_filter(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "ocbrain.sqlite")
+    init_db(conn)
+    knowledge_id = upsert_knowledge(
+        conn,
+        knowledge_type="doc",
+        gate="human",
+        slug="private-digest-doc",
+        title="Private digest doc",
+        body_uri="/private/digest.md",
+        doc_kind="memory",
+        status="current",
+        privacy_scope="private",
+    )
+    conn.commit()
+
+    digest = knowledge_digest(conn, scopes=None)
+
+    assert digest["scopes"] is None
+    assert any(item["id"] == knowledge_id for item in digest["documents"])
 
 
 def test_heal_supersedes_conflicting_current_values_with_evidence(tmp_path: Path) -> None:
