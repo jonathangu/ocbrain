@@ -104,4 +104,3 @@ def test_companion_stores_are_distinct_from_the_core_default() -> None:
     assert DEFAULT_TRAINING_DB != DEFAULT_OPS_DB
     assert DEFAULT_TRAINING_DB != cli.DEFAULT_DB_PATH
     assert DEFAULT_OPS_DB != cli.DEFAULT_DB_PATH
-
