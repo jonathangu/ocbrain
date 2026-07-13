@@ -8,12 +8,12 @@ acceptance.
 
 ## Safety Baseline
 
-- Source baseline: `v0.4.0` / `c5e73ec6cdb149d8c4fd1730bbde0f21e5aea1ab`.
+- Source baseline: `v0.4.0`; Git commit `c5e73ec6cdb149d8c4fd1730bbde0f21e5aea1ab`.
 - Existing uncommitted dataset/grader work was preserved in place before edits.
 - Light autopilot, heavy autopilot, and stallcheck launchd jobs were confirmed
   unloaded.
-- Pre-change database backup:
-  `data/snapshots/ocbrain-pre-core-roadmap-20260713.sqlite`.
+- A pre-change database snapshot was stored in the ignored, owner-only data
+  directory.
 - Backup permissions: owner read/write only.
 - Backup `PRAGMA integrity_check`: `ok`.
 - No live table will be dropped or vacuumed in place.
@@ -66,9 +66,8 @@ acceptance.
   Ruff reports no findings, and `git diff --check` passes.
 - Re-verified the combined legacy/v1 MCP and Shared Context contracts after the
   strict-core integration: all 20 focused tests pass.
-- Exported a fresh, unbiased named-human Markdown audit packet at
-  `../task-artifacts/ocbrain-v2-autonomy/pilot-v3-named-human-audit-handoff-20260713/`.
-  It contains all 150 frozen examples, omits the prior AI triage to avoid
+- Exported a fresh, unbiased named-human Markdown audit packet to the ignored,
+  owner-only task-artifact area. It contains all 150 frozen examples, omits the prior AI triage to avoid
   anchoring, and explicitly leaves both the human gate and training authorization
   false.
 - The physical v1 split is in progress: core MCP imports no training or watchdog
@@ -109,11 +108,9 @@ acceptance.
   search documents, the projection cursor, retrieval/audit ledgers, and all four
   closeout receipts. A representative five-item `OCBrain` context packet and
   its eight source handles also match exactly. SQLite, foreign-key, and FTS
-  integrity checks pass. Evidence is preserved in
-  `data/v1-rehearsal-20260713/projection-rebuild-verification.json`; the
-  migration candidate was not modified or activated.
-- Created a separate owner-only prospective live core at
-  `data/v1-live-20260713/ocbrain-core-v1.sqlite`. Its pre-activation SHA-256 is
+  integrity checks pass. Evidence is preserved in the ignored, owner-only
+  rehearsal report; the migration candidate was not modified or activated.
+- Created a separate owner-only prospective live core. Its pre-activation SHA-256 is
   byte-identical to the verified immutable candidate and its SQLite integrity
   and foreign-key checks pass. The activation pointer remains absent while the
   clean-install package gate completes.
@@ -125,16 +122,12 @@ acceptance.
   core/migration/MCP/adversarial suite passes 31/31. The verified rehearsal has
   zero affected collision imports or shadowing aliases, so its projection and
   manifest hashes remain valid.
-- Final source/package gate: all 627 tests pass; the adversarial subset is
+- Final source/package gate: all 630 tests pass; the adversarial subset is
   14/14; Ruff, diff, and compilation checks pass. Fresh Python 3.12 installs
   verified the core-only CLI, exact eight-tool stdio MCP, an actual
   archive-first migration, isolated training/ops stores, lazy companion
-  dispatch, and implicit-v1-mutation refusal. Final wheel SHA-256 values are
-  `1829d6c5f0e18ffbdc2c3e9b4669e9ba89c61160227da9d41248612aeea73b7b`
-  (core), `570637a476aa35b02305ff02ca44d9ad1f67fe612feb31c86afa2eca3c2c05fb`
-  (training), and
-  `3c10f0b157bb7cada093dd2610d42a06831149d0565300c2d576380cee808c7b`
-  (ops).
+  dispatch, and implicit-v1-mutation refusal. Final wheel digests are retained
+  in the ignored, owner-only release evidence.
 - Provisionally activated the separate v1 live copy for fresh-client
   acceptance at 2026-07-13T09:10:39Z. Migration did not perform this step; the
   ignored owner-only pointer did. Retention remains conditional on successful
@@ -142,9 +135,8 @@ acceptance.
 - Corrected the MCP initialization instructions themselves: fresh clients now
   receive the Shared Context contract (`context → source → feedback → closeout`)
   plus the on-demand safety boundary, rather than the retired search-first and
-  loop-family wording. The final suite passes 627 tests; the final core wheel
-  SHA-256 is
-  `1829d6c5f0e18ffbdc2c3e9b4669e9ba89c61160227da9d41248612aeea73b7b`.
+  loop-family wording. The final suite passes 630 tests; the final core-wheel
+  digest is retained in the ignored, owner-only release evidence.
 - Three-runtime acceptance passed against the same activated core. Fresh Codex
   (`ret_3272313222e5c7bb` / `close_e10efadbd024d638`), Claude Code
   (`ret_596c6bc80cbc774b` / `close_5fb53a5e30362451`), and OpenClaw
@@ -152,5 +144,5 @@ acceptance.
   hash-verified source expansion, feedback, and a verified closeout. OpenClaw
   additionally marked and linked the distinct source-expansion retrieval.
   Post-acceptance integrity and foreign-key checks pass, the pointer is
-  retained, and owner-only evidence is recorded in
-  `data/v1-live-20260713/three-client-acceptance.json`.
+  retained, and the receipt inventory is recorded beside the owner-only live
+  database.

@@ -25,7 +25,8 @@ run_check() {
   if [[ -n "${range}" ]]; then
     args+=(--diff-range "${range}")
   fi
-  PYTHONPATH="${ROOT}/src" "${PY}" -m ocbrain.cli public-safety-check "${args[@]}"
+  PYTHONPATH="${ROOT}/src:${ROOT}/packages/ops/src" \
+    "${PY}" -m ocbrain_ops.cli public-safety-check "${args[@]}"
 }
 
 zero="0000000000000000000000000000000000000000"

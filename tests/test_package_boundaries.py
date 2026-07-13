@@ -13,6 +13,7 @@ from ocbrain_training.store import DEFAULT_TRAINING_DB
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE_SRC = ROOT / "src"
+OPS_SRC = ROOT / "packages/ops/src"
 
 RETIRED_CORE_MODULES = {
     "autolabel.py",
@@ -104,3 +105,10 @@ def test_companion_stores_are_distinct_from_the_core_default() -> None:
     assert DEFAULT_TRAINING_DB != DEFAULT_OPS_DB
     assert DEFAULT_TRAINING_DB != cli.DEFAULT_DB_PATH
     assert DEFAULT_OPS_DB != cli.DEFAULT_DB_PATH
+
+
+def test_public_safety_hook_calls_the_checked_out_ops_companion() -> None:
+    hook = (ROOT / "ops/hooks/pre-push").read_text()
+    assert '${ROOT}/packages/ops/src' in hook
+    assert "-m ocbrain_ops.cli public-safety-check" in hook
+    assert "-m ocbrain.cli public-safety-check" not in hook

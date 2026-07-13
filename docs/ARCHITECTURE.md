@@ -111,7 +111,7 @@ project claim.
 
 `ocbrain.context.v1` is deliberately model-neutral. It returns:
 
-- query and resolved runtime/project/repo/client/task/session context;
+- query plus resolved runtime, project, repository, client, task, and session context;
 - ranked current serving beliefs with confidence and evidence IDs;
 - visible contradictions;
 - bounded OCBrain-issued source handles;

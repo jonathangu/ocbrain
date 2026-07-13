@@ -77,6 +77,7 @@ def test_source_distribution_explicitly_excludes_runtime_private_roots() -> None
     assert {"/data/**", "/logs/**", "/uv.lock"} <= excluded
     ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "data/" in ignored and "logs/" in ignored
+    assert ps.content_scan_excluded("packages/ops/src/ocbrain_ops/publicsafety.py")
 
 
 # --- clean tree passes ---------------------------------------------------- #
@@ -292,6 +293,30 @@ def test_quoted_python_entropy_still_fails(repo: Path) -> None:
     rng = _commit_added_line(repo, "settings.py", f'VALUE = "{suspicious}"')
     result = ps.scan(repo, diff_range=rng)
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_explicit_human_readable_python_version_is_not_entropy(repo: Path) -> None:
+    rng = _commit_added_line(
+        repo,
+        "settings.py",
+        'prompt_version: str = "dataset-rubric-v3-human-calibration-anchors"',
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_version_exception_does_not_hide_random_or_unscoped_entropy(repo: Path) -> None:
+    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    for line in (
+        f'prompt_version = "{suspicious}"',
+        'VALUE = "dataset-rubric-v3-human-calibration-anchors"',
+        'other_version = "dataset-rubric-v3-human-calibration-anchors"',
+        'api_version = "leaked-v2-private-secret-credential-material"',
+        'conversion = "internal-v7-customer-private-access-material"',
+    ):
+        rng = _commit_added_line(repo, "versioned.py", line)
+        result = ps.scan(repo, diff_range=rng)
+        assert any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
 def test_diff_range_ignores_removed_lines(repo: Path) -> None:

@@ -56,7 +56,12 @@ _FORBIDDEN_PREFIXES = ("data/", "logs/")
 _FORBIDDEN_SUFFIXES = (".jsonl",)
 
 # Files excluded from *content* scans (b/c/d) — see module docstring.
-_CONTENT_SKIP_EXACT = {"uv.lock", "src/ocbrain/publicsafety.py", DENYLIST_REL}
+_CONTENT_SKIP_EXACT = {
+    "uv.lock",
+    "src/ocbrain/publicsafety.py",
+    "packages/ops/src/ocbrain_ops/publicsafety.py",
+    DENYLIST_REL,
+}
 
 # Absolute /Users/ path tokens, and the project-container segment inside them.
 _USERS_PATH_RE = re.compile(r"/Users/[^\s:\"'()\[\]<>|]+")
@@ -82,6 +87,16 @@ _QUOTED_SECRET_ASSIGN_RE = re.compile(
 _FULL_GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}$")
 _GIT_REVISION_CONTEXT_RE = re.compile(
     r"(?i)(?:git.{0,24}(?:commit|revision)|(?:commit|revision).{0,24}git)"
+)
+
+# One reviewed, public prompt-version label exceeds the generic entropy
+# threshold. Suppress only that exact literal when assigned to the exact
+# ``prompt_version`` field. Random strings, quoted blobs, similarly shaped
+# values, and values assigned to other names remain findings.
+_PUBLIC_VERSION_VALUES = {"dataset-rubric-v3-human-calibration-anchors"}
+_PUBLIC_VERSION_ASSIGN_RE = re.compile(
+    r"\bprompt_version\s*(?::[^=]+)?=\s*"
+    r'''["'](?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+){2,})["']'''
 )
 
 
@@ -254,6 +269,19 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
     return kept
 
 
+def filter_public_version_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop an explicitly assigned, human-readable Python version slug."""
+
+    if not rel.endswith(".py") or not spans:
+        return spans
+    public_values = {
+        match.group("value")
+        for match in _PUBLIC_VERSION_ASSIGN_RE.finditer(line)
+        if match.group("value") in _PUBLIC_VERSION_VALUES
+    }
+    return [span for span in spans if span not in public_values]
+
+
 def refine_secret_leaks(content: str, leaks: list[str]) -> list[str]:
     """Re-derive the heuristic ``assigned_secret`` finding under the guard's
     stricter, quoted-literal rule. Every other (format/entropy-anchored) leak
@@ -405,6 +433,7 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
             if not entropy_pathcheck_excluded(rel):
                 spans = filter_public_git_revision_spans(content, find_high_entropy_spans(content))
                 spans = filter_python_identifier_spans(rel, content, spans)
+                spans = filter_public_version_spans(rel, content, spans)
                 if spans:
                     result.findings.append(
                         Finding(

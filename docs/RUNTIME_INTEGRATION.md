@@ -7,8 +7,7 @@ acceptance requires a real tool round trip from a fresh process.
 Current local status: **accepted on 2026-07-13**. Codex, Claude Code, and
 OpenClaw completed the full round trip against the same v1 core, SQLite and
 foreign-key checks passed afterward, and the activation pointer was retained.
-The owner-only receipt inventory is
-`data/v1-live-20260713/three-client-acceptance.json`.
+The owner-only receipt inventory is stored beside the live database.
 
 ## Launcher
 
