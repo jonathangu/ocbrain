@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from ocbrain.db import connect, init_db, log_retrieval_use, update_retrieval_use_feedback
 from ocbrain.events import record_evidence
-from ocbrain.feedback import feedback_coverage, infer_retrieval_outcomes
 from ocbrain.scope import ScopeContext
+from ocbrain_ops.feedback import feedback_coverage, infer_retrieval_outcomes
 
 
 def _db(tmp_path):

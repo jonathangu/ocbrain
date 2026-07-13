@@ -4,9 +4,9 @@ import json
 from pathlib import Path
 
 from ocbrain.config import load_config
-from ocbrain.dataset.mine_sft import label_exchange, mine_sft, segment_exchanges
-from ocbrain.dataset.transcripts import Session, Turn
 from ocbrain.db import connect, init_db, upsert_evidence
+from ocbrain_training.dataset.mine_sft import label_exchange, mine_sft, segment_exchanges
+from ocbrain_training.dataset.transcripts import Session, Turn
 
 CFG = load_config()
 TARGET = "This is a sufficiently long assistant answer that clears the eighty-char SFT floor."
@@ -50,6 +50,26 @@ def test_segment_basic_and_min_assistant():
     assert exchanges[0].context[-1] == {"role": "user", "content": "please do X"}
     # too-short assistant target yields no exchange
     assert segment_exchanges(_sess(_u("hi"), _a("ok")), CFG) == []
+
+
+def test_segment_uses_cleaned_target_for_length_and_context():
+    # A transport token cannot inflate a sub-floor answer into eligibility.
+    short_after_cleanup = "[[reply_to_current]] " + ("x" * 70)
+    assert segment_exchanges(_sess(_u("please do X"), _a(short_after_cleanup)), CFG) == []
+
+    envelope = (
+        "Sender (untrusted metadata):\n```json\n"
+        '{"id":"8518484672"}\n```\n\n'
+        "Please summarize this for person@example.test."
+    )
+    clean_target = "[[reply_to_current]] " + TARGET
+    exchange = segment_exchanges(_sess(_u(envelope), _a(clean_target)), CFG)[0]
+    assert exchange.target_text == TARGET
+    context = exchange.context[-1]["content"]
+    assert "untrusted metadata" not in context
+    assert "8518484672" not in context
+    assert "person@example.test" not in context
+    assert "[REDACTED_EMAIL]" in context
 
 
 def test_segment_context_turn_bound():
@@ -143,8 +163,15 @@ def _write_openclaw_session(root: Path, sid: str, *messages: dict) -> Path:
     """Write a minimal on-disk openclaw session transcript under agents/main."""
     path = root / "agents" / "main" / "sessions" / f"{sid}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [{"type": "session", "id": sid, "version": 1, "cwd": "/w",
-              "timestamp": "2026-07-01T00:00:00Z"}]
+    lines = [
+        {
+            "type": "session",
+            "id": sid,
+            "version": 1,
+            "cwd": "/w",
+            "timestamp": "2026-07-01T00:00:00Z",
+        }
+    ]
     for msg in messages:
         lines.append({"type": "message", "message": msg})
     path.write_text("\n".join(json.dumps(o) for o in lines), encoding="utf-8")
@@ -190,7 +217,8 @@ def test_mine_sft_roots_reparses_only_changed_file(tmp_path: Path):
 
     # Mutate exactly one transcript so its fingerprint (size/mtime) advances.
     _write_openclaw_session(
-        root, "s1",
+        root,
+        "s1",
         {"role": "user", "content": "please run the updated release checklist now"},
         {"role": "assistant", "content": TARGET + " Extra."},
     )

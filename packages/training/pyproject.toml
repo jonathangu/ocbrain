@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocbrain-training"
+version = "1.0.0"
+description = "Optional local dataset curation and training tools for OCBrain"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Jonathan Gu" }]
+dependencies = ["ocbrain>=1,<2"]
+
+[project.scripts]
+ocbrain-training = "ocbrain_training.cli:main"
+
+[project.entry-points."ocbrain.commands.v1"]
+dataset-mine = "ocbrain_training.cli:legacy_dispatch"
+dataset-persona-curate = "ocbrain_training.cli:legacy_dispatch"
+dataset-calibration-import = "ocbrain_training.cli:legacy_dispatch"
+dataset-grade = "ocbrain_training.cli:legacy_dispatch"
+dataset-classify = "ocbrain_training.cli:legacy_dispatch"
+dataset-pack-select = "ocbrain_training.cli:legacy_dispatch"
+dataset-pack-finalize = "ocbrain_training.cli:legacy_dispatch"
+dataset-pack-stats = "ocbrain_training.cli:legacy_dispatch"
+dataset-export = "ocbrain_training.cli:legacy_dispatch"
+dataset-stats = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-prepare = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-blind = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-score = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-multiblind = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-multiscore = "ocbrain_training.cli:legacy_dispatch"
+dataset-pilot-record-training = "ocbrain_training.cli:legacy_dispatch"
+retrieval-benchmark = "ocbrain_training.cli:legacy_dispatch"
+retrieval-benchmark-expand = "ocbrain_training.cli:legacy_dispatch"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocbrain_training"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

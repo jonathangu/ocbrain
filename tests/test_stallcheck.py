@@ -19,8 +19,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from ocbrain import stallcheck
 from ocbrain.db import connect, init_db
+from ocbrain_ops import stallcheck
 
 # Verbatim terminal text of the third lane that died passive-waiting tonight and
 # EVADED the exact-substring seed lexicon. Regression fixture: it MUST be flagged
@@ -395,7 +395,7 @@ def test_reader_c_handler_timeout_in_window(tmp_path):
 
 
 # --- deadman engine writes -----------------------------------------------------
-def test_feed_deadman_writes_liveness_and_evidence(tmp_path):
+def test_feed_deadman_writes_liveness_and_companion_finding(tmp_path):
     brain = _brain(tmp_path)
     now = datetime.now(UTC)
     finding = stallcheck.Finding(
@@ -407,7 +407,7 @@ def test_feed_deadman_writes_liveness_and_evidence(tmp_path):
         age_seconds=5400.0,
         occurred_at=now.isoformat(),
     )
-    evidence_id = stallcheck.feed_deadman(brain, finding, now)
+    finding_id = stallcheck.feed_deadman(brain, finding, now)
     brain.commit()
 
     live = brain.execute(
@@ -416,15 +416,15 @@ def test_feed_deadman_writes_liveness_and_evidence(tmp_path):
     ).fetchone()
     assert live is not None and live["deadman_due_at"] is not None
 
-    ev = brain.execute(
-        "SELECT source_type, claim FROM evidence WHERE id=?", (evidence_id,)
+    recorded = brain.execute(
+        "SELECT stall_class, snippet FROM watchdog_findings WHERE id=?", (finding_id,)
     ).fetchone()
-    assert ev["source_type"] == "loop_tripwire"
-    assert "Stall detected" in ev["claim"]
+    assert recorded["stall_class"] == "workflow_passive_wait"
+    assert recorded["snippet"] == "standing by"
 
-    # Idempotent: same fingerprint -> same evidence row (upsert, no duplicate).
+    # Idempotent: same fingerprint -> same companion finding (upsert, no duplicate).
     again = stallcheck.feed_deadman(brain, finding, now)
-    assert again == evidence_id
+    assert again == finding_id
 
 
 # --- full run: dedup + self-heartbeat -----------------------------------------
@@ -693,7 +693,7 @@ def test_pager_network_call_never_holds_sqlite_writer_lock(tmp_path, monkeypatch
     def observing_send(_cfg, _text):
         observer = sqlite3.connect(tmp_path / "brain.sqlite", timeout=0)
         observer.execute("BEGIN IMMEDIATE")
-        assert observer.execute("SELECT COUNT(*) FROM evidence").fetchone()[0] >= 1
+        assert observer.execute("SELECT COUNT(*) FROM watchdog_findings").fetchone()[0] >= 1
         observer.rollback()
         observer.close()
         return 200
@@ -820,7 +820,7 @@ def test_mcp_retries_on_database_locked(monkeypatch):
 
     calls = {"n": 0}
 
-    def flaky_call_tool(conn, params):
+    def flaky_call_tool(conn, params, *, profile="runtime"):
         calls["n"] += 1
         if calls["n"] < 3:
             raise sqlite3.OperationalError("database is locked")
@@ -841,7 +841,7 @@ def test_mcp_retries_on_database_locked(monkeypatch):
 def test_mcp_reraises_after_exhausting_retries(monkeypatch):
     from ocbrain import mcp
 
-    def always_locked(conn, params):
+    def always_locked(conn, params, *, profile="runtime"):
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(mcp, "call_tool", always_locked)
@@ -855,7 +855,7 @@ def test_mcp_non_lock_error_not_retried(monkeypatch):
 
     calls = {"n": 0}
 
-    def other_error(conn, params):
+    def other_error(conn, params, *, profile="runtime"):
         calls["n"] += 1
         raise sqlite3.OperationalError("no such table: widgets")
 
@@ -952,14 +952,14 @@ def test_feed_deadman_and_heartbeat_wait_out_a_concurrent_writer_lock(tmp_path, 
     cfg = _cfg(workflow_globs=(), task_output_globs=(), runner_db="/nonexistent")
 
     # Both writes must succeed (retry survives the lock) rather than raising.
-    evidence_id = stallcheck._write_with_lock_retry(
+    finding_id = stallcheck._write_with_lock_retry(
         brain, stallcheck.feed_deadman, brain, finding, now
     )
     stallcheck._write_with_lock_retry(brain, stallcheck.upsert_self_heartbeat, brain, cfg, now)
     brain.commit()
     thread.join(timeout=2)
 
-    assert evidence_id
+    assert finding_id
     live = brain.execute(
         "SELECT deadman_due_at FROM loop_liveness WHERE loop_id=? AND run_id=?",
         (finding.loop_id, "lock-contend"),

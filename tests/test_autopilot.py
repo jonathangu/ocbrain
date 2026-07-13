@@ -8,10 +8,10 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ocbrain import autopilot
 from ocbrain.config import load_config
 from ocbrain.db import connect, init_db
 from ocbrain.fsutil import file_lock, snapshot_sqlite
+from ocbrain_ops import autopilot
 
 
 def _cfg(tmp_path: Path):

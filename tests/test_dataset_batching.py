@@ -4,9 +4,9 @@ import sqlite3
 
 import pytest
 
-from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import connect
 from ocbrain.fsutil import checkpoint_sqlite_wal
+from ocbrain.write_batch import DatasetWriteBatch
 
 
 def test_dataset_write_batch_commits_at_operation_bound(tmp_path):

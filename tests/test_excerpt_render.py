@@ -1,6 +1,6 @@
 """excerpt_render stage helpers — idempotent managed-block rendering (spec §4, v0.3).
 
-Covers :func:`ocbrain.excerpt.render_excerpt_file` and the char-budget /
+Covers :func:`ocbrain_ops.excerpt.render_excerpt_file` and the char-budget /
 composition helpers it builds on: block creation, in-place update preserving
 surrounding content, refusal of quarantined rows, byte-idempotency (no rewrite,
 mtime preserved on an unchanged block), and the char budget.
@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ocbrain.db import connect, init_db, upsert_knowledge
-from ocbrain.excerpt import (
+from ocbrain_ops.excerpt import (
     BEGIN,
     END,
     build_excerpt,

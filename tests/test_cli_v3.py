@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import pytest
 
-from ocbrain import cli
-from ocbrain.cli import build_parser, main
 from ocbrain.db import connect, init_db
+from ocbrain_ops import cli
+from ocbrain_ops.cli import build_parser, main
 
 
 def _parse(argv):
@@ -49,11 +49,14 @@ def test_cmd_autopilot_threads_profile_through(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_autopilot", fake_run_autopilot)
 
     db = tmp_path / "cli.sqlite"
+    ops_db = tmp_path / "ops.sqlite"
     conn = connect(db)
     init_db(conn)
     conn.commit()
 
-    rc = main(["--db", str(db), "autopilot", "--profile", "light"])
+    rc = main(
+        ["--ops-db", str(ops_db), "--legacy-db", str(db), "autopilot", "--profile", "light"]
+    )
     assert rc == 0
     assert captured["profile"] == "light"
     assert captured["stages"] is None
@@ -70,11 +73,12 @@ def test_cmd_autopilot_default_has_no_profile(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_autopilot", fake_run_autopilot)
 
     db = tmp_path / "cli.sqlite"
+    ops_db = tmp_path / "ops.sqlite"
     conn = connect(db)
     init_db(conn)
     conn.commit()
 
-    rc = main(["--db", str(db), "autopilot"])
+    rc = main(["--ops-db", str(ops_db), "--legacy-db", str(db), "autopilot"])
     assert rc == 0
     assert captured["profile"] is None
     capsys.readouterr()

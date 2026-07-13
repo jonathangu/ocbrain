@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain"
-version = "0.4.0"
+version = "1.0.0"
 description = "Lightweight shared memory for ChatGPT/Codex, Claude Code, and OpenClaw"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,10 +21,17 @@ dev = [
 [project.scripts]
 ocbrain = "ocbrain.cli:main"
 ocbrain-closeout = "ocbrain.cli:main"
-brain-loop-ingest = "ocbrain.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [
+  "src",
+  "packages/training/src",
+  "packages/ops/src",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocbrain"]
 
 [tool.hatch.build]
 # Hatch's source archive may otherwise include untracked worktree files. Keep
@@ -43,6 +50,7 @@ exclude = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = ["src", "packages/training/src", "packages/ops/src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

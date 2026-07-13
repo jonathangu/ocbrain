@@ -5,10 +5,10 @@ import subprocess
 from pathlib import Path
 
 from ocbrain.config import load_config
-from ocbrain.dataset.mine_dpo import mine_dpo
-from ocbrain.dataset.mine_persona import mine_persona
-from ocbrain.dataset.transcripts import Session, Turn
 from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.mine_dpo import mine_dpo
+from ocbrain_training.dataset.mine_persona import mine_persona
+from ocbrain_training.dataset.transcripts import Session, Turn
 
 CFG = load_config(path=Path("/nonexistent/ocbrain-unit-test-config.json"))
 AGENT_PROMPT = "The agent completed the task and needs the operator's final decision."
@@ -71,7 +71,7 @@ def test_persona_budget_stops_before_git_tail(tmp_path: Path):
 
 
 def test_dpo_budget_skips_sessions_and_event_tail(tmp_path: Path, monkeypatch):
-    module = importlib.import_module("ocbrain.dataset.mine_dpo")
+    module = importlib.import_module("ocbrain_training.dataset.mine_dpo")
     conn = _conn(tmp_path)
 
     def should_not_scan_events(*args, **kwargs):

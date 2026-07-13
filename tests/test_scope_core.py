@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 
 from ocbrain.db import connect, init_db
-from ocbrain.dream import dream
 from ocbrain.egress import egress_preview
 from ocbrain.events import (
     approval_packet,
@@ -19,7 +18,8 @@ from ocbrain.events import (
 from ocbrain.mcp import handle_request
 from ocbrain.retrieve import retrieve
 from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
-from ocbrain.teacher import hosted_teacher_request
+from ocbrain_ops.dream import dream
+from ocbrain_ops.teacher import hosted_teacher_request
 
 
 def seeded_scoped_core(tmp_path: Path):
@@ -697,6 +697,7 @@ def test_mcp_preview_uses_same_scoped_retrieval_payload(tmp_path: Path) -> None:
                 },
             },
         },
+        allow_writes=True,
     )
     payload = json.loads(response["result"]["content"][0]["text"])
 
@@ -704,11 +705,13 @@ def test_mcp_preview_uses_same_scoped_retrieval_payload(tmp_path: Path) -> None:
     assert payload["applied_global"] == expected["applied_global"]
 
 
-def test_mcp_connector_write_tools_are_ungated_and_append_events(tmp_path: Path) -> None:
+def test_mcp_connector_runtime_writes_are_narrow_and_admin_tools_are_gated(
+    tmp_path: Path,
+) -> None:
     conn = seeded_scoped_core(tmp_path)
 
-    # v0.2 §5.1-7: write tools are always listed, with or without the deprecated
-    # --allow-writes flag.
+    # Runtime clients can append evidence and closeouts, but destructive/admin
+    # mutations are neither advertised nor callable without the admin profile.
     listed = handle_request(
         conn,
         {
@@ -719,9 +722,24 @@ def test_mcp_connector_write_tools_are_ungated_and_append_events(tmp_path: Path)
         },
     )
     names = {tool["name"] for tool in listed["result"]["tools"]}
-    assert {"brain.ingest", "brain.forget"} <= names
+    assert "brain.ingest" in names
+    assert "brain.forget" not in names
 
-    # Ungated: brain.ingest now succeeds without allow_writes (was denied pre-v0.2).
+    denied = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.forget",
+                "arguments": {"target": "belief:bountiful-stack"},
+            },
+        },
+    )
+    assert denied["error"]["code"] == -32001
+
+    # Append-only evidence ingestion remains available to runtime clients.
     ungated = handle_request(
         conn,
         {
@@ -767,7 +785,7 @@ def test_mcp_connector_write_tools_are_ungated_and_append_events(tmp_path: Path)
             "id": 4,
             "method": "tools/call",
             "params": {
-                "name": "brain.feedback",
+                "name": "brain.correct",
                 "arguments": {
                     "layer": "belief",
                     "target": "belief:bountiful-stack",
@@ -834,7 +852,7 @@ def test_mcp_event_gate_lists_and_decides_proposals(tmp_path: Path) -> None:
             "id": 2,
             "method": "tools/call",
             "params": {
-                "name": "brain.feedback",
+                "name": "brain.proposal_decide",
                 "arguments": {
                     "proposal_event_id": proposal_id,
                     "decision": "approve",
@@ -870,7 +888,8 @@ def test_mcp_event_gate_lists_and_decides_proposals(tmp_path: Path) -> None:
     )
 
 
-def test_mcp_teacher_request_packages_without_dispatch(tmp_path: Path) -> None:
+def test_mcp_teacher_request_is_not_a_core_tool(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OCBRAIN_TEACHER_ENABLED", "true")
     conn = seeded_scoped_core(tmp_path)
     record_evidence(
         conn,
@@ -892,9 +911,7 @@ def test_mcp_teacher_request_packages_without_dispatch(tmp_path: Path) -> None:
                 },
             },
         },
+        allow_writes=True,
     )
-    payload = json.loads(response["result"]["content"][0]["text"])
-
-    assert payload["call_performed"] is False
-    assert payload["dispatch_state"] == "approval_required"
-    assert payload["summary"]["audit_id"].startswith("egress_")
+    assert response["error"]["code"] == -32001
+    assert "not available in admin profile" in response["error"]["message"]

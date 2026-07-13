@@ -4,10 +4,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ocbrain import cli
+from ocbrain.core_v1 import is_core_v1
 from ocbrain.db import (
     admit_knowledge,
     connect,
-    counts,
     get_current_doc,
     init_db,
     knowledge_digest,
@@ -18,8 +18,8 @@ from ocbrain.db import (
     upsert_evidence,
     upsert_knowledge,
 )
-from ocbrain.excerpt import write_excerpt
-from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
+from ocbrain_ops.excerpt import write_excerpt
+from ocbrain_ops.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 
 
 def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
@@ -390,8 +390,8 @@ def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, 
         == 0
     )
     search_payload = json.loads(capsys.readouterr().out)
-    assert search_payload["results"][0]["kind"] == "knowledge:doc"
-    assert "source-backed" in search_payload["results"][0]["snippet"]
+    assert search_payload["items"][0]["kind"] == "core_v1"
+    assert "source-backed" in search_payload["items"][0]["excerpt"]
 
     assert (
         cli.main(
@@ -406,7 +406,7 @@ def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, 
         == 0
     )
     digest_payload = json.loads(capsys.readouterr().out)
-    assert digest_payload["documents"][0]["title"] == "OCBrain product check"
+    assert digest_payload["current"][0]["body"].startswith("OCBrain product check")
 
 
 def test_event_backfill_batches_past_already_projected_rows(tmp_path: Path, capsys) -> None:
@@ -584,6 +584,8 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
                 str(db_path),
                 "search",
                 "harvest sentinel",
+                "--project",
+                "workspace",
                 "--type",
                 "doc",
             ]
@@ -591,9 +593,11 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
         == 0
     )
     search_payload = json.loads(capsys.readouterr().out)
-    assert {item["kind"] for item in search_payload["results"]} == {"knowledge:doc"}
-    assert {item["scope"] for item in search_payload["results"]} == {"workspace"}
-    assert len(search_payload["results"]) == 3
+    assert {item["kind"] for item in search_payload["items"]} == {"core_v1"}
+    assert {item["scope"]["scope_id"] for item in search_payload["items"]} == {
+        "project:workspace"
+    }
+    assert len(search_payload["items"]) == 3
 
 
 def test_capability_no_longer_force_gated(tmp_path: Path) -> None:
@@ -660,7 +664,20 @@ def test_search_filters_loop_tagged_knowledge(tmp_path: Path) -> None:
 def test_cli_evidence_and_value_digest(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
 
-    assert cli.main(["--db", str(db_path), "evidence", "--claim", "Codex emitted evidence."]) == 0
+    assert (
+        cli.main(
+            [
+                "--db",
+                str(db_path),
+                "evidence",
+                "--claim",
+                "Codex emitted evidence.",
+                "--project",
+                "ocbrain",
+            ]
+        )
+        == 0
+    )
     capsys.readouterr()
     assert (
         cli.main(
@@ -677,21 +694,24 @@ def test_cli_evidence_and_value_digest(tmp_path: Path, capsys) -> None:
                 "--status",
                 "current",
                 "--inject",
+                "--project",
+                "ocbrain",
             ]
         )
         == 0
     )
     capsys.readouterr()
-    assert cli.main(["--db", str(db_path), "--pretty", "digest"]) == 0
+    assert (
+        cli.main(["--db", str(db_path), "--pretty", "digest", "--project", "ocbrain"])
+        == 0
+    )
     payload = json.loads(capsys.readouterr().out)
 
     conn = connect(db_path)
-    init_db(conn)
-    summary = counts(conn)
-    assert summary["evidence"] == 1
-    assert summary["knowledge"] == 1
-    assert conn.execute("SELECT COUNT(*) FROM memory").fetchone()[0] == 1
-    assert payload["counts"]["knowledge"] == 1
+    assert is_core_v1(conn)
+    assert conn.execute("SELECT COUNT(*) FROM evidence_objects").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 1
+    assert len(payload["current"]) == 1
 
 
 def test_candidate_admit_and_stale(tmp_path: Path) -> None:

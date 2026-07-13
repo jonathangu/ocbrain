@@ -14,7 +14,7 @@ from ocbrain.db import (
     upsert_knowledge,
 )
 from ocbrain.ids import content_hash
-from ocbrain.maintenance import archive_unreferenced_catalog
+from ocbrain_ops.maintenance import archive_unreferenced_catalog
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:

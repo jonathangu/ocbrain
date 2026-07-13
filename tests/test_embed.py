@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ocbrain.config import load_config
 from ocbrain.db import connect, get_knowledge, init_db, now_iso, upsert_knowledge
-from ocbrain.embed import (
+from ocbrain_ops.embed import (
     build_embed_batch,
     decode_embedding,
     eligible_rows,
@@ -21,9 +21,10 @@ KEY_ENV = {"OPENAI_API_KEY": "sk-test-not-a-real-key-000000000000"}
 
 def _cfg(tmp_path: Path, **embed_overrides):
     base = load_config(tmp_path / "cfg.json")
-    if embed_overrides:
-        return replace(base, embed=replace(base.embed, **embed_overrides))
-    return base
+    # Functional embedding tests opt into the hosted lane explicitly; the
+    # product default is fail-closed.
+    settings = {"enabled": True, **embed_overrides}
+    return replace(base, embed=replace(base.embed, **settings))
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:

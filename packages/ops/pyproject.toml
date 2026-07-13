@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocbrain-ops"
+version = "1.0.0"
+description = "Optional manual operations and watchdog tools for OCBrain"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Jonathan Gu" }]
+dependencies = ["ocbrain>=1,<2"]
+
+[project.optional-dependencies]
+training = ["ocbrain-training>=1,<2"]
+
+[project.scripts]
+ocbrain-ops = "ocbrain_ops.cli:main"
+ocbrain-watchdog = "ocbrain_ops.stallcheck:main"
+brain-loop-ingest = "ocbrain_ops.cli:loop_ingest_main"
+
+[project.entry-points."ocbrain.commands.v1"]
+autopilot = "ocbrain_ops.cli:legacy_dispatch"
+quarantine = "ocbrain_ops.cli:legacy_dispatch"
+label = "ocbrain_ops.cli:legacy_dispatch"
+loop-ingest = "ocbrain_ops.cli:legacy_dispatch"
+prune = "ocbrain_ops.cli:legacy_dispatch"
+heal = "ocbrain_ops.cli:legacy_dispatch"
+liveness-check = "ocbrain_ops.cli:legacy_dispatch"
+event-dream = "ocbrain_ops.cli:legacy_dispatch"
+event-teacher-request = "ocbrain_ops.cli:legacy_dispatch"
+retrieval-feedback-stats = "ocbrain_ops.cli:legacy_dispatch"
+public-safety-check = "ocbrain_ops.cli:legacy_dispatch"
+install-hooks = "ocbrain_ops.cli:legacy_dispatch"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocbrain_ops"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

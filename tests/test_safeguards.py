@@ -19,7 +19,8 @@ from ocbrain.events import (
     propose_compilation,
     record_correction,
 )
-from ocbrain.safeguards import (
+from ocbrain.scope import ScopeTag
+from ocbrain_ops.safeguards import (
     TRIPWIRES,
     auto_decide_compilations,
     quarantine_knowledge,
@@ -27,7 +28,6 @@ from ocbrain.safeguards import (
     run_tripwires,
     scan_evidence_for_injection,
 )
-from ocbrain.scope import ScopeTag
 
 
 def _db(tmp_path: Path):
@@ -189,7 +189,7 @@ def test_tripwires_release_writer_before_next_expensive_predicate(tmp_path, monk
             observer.close()
         return "forced_tripwire"
 
-    monkeypatch.setattr("ocbrain.safeguards.TRIPWIRES", (("forced", forced),))
+    monkeypatch.setattr("ocbrain_ops.safeguards.TRIPWIRES", (("forced", forced),))
     result = run_tripwires(conn)
     assert result.changed == 2
     assert calls == 2

@@ -9,8 +9,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from ocbrain.dataset.grade import require_loopback_endpoint
 from ocbrain.events import canonical_json
+from ocbrain_training.dataset.grade import require_loopback_endpoint
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:

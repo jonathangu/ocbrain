@@ -1,4 +1,4 @@
-"""ocbrain v0.3 configuration surface.
+"""ocbrain configuration surface.
 
 One config module for every v0.2 tunable (spec §3, resolution R1). The public
 entry point is :func:`load_config`, which layers, in order:
@@ -39,9 +39,8 @@ class AutopilotConfig:
     # e.g. {"dataset_mine": 900}. Set via config JSON / OCBRAIN_AUTOPILOT_STAGE_BUDGETS.
     stage_budgets: dict[str, int] = field(default_factory=dict)
     runtimes_excerpt: list[str] = field(default_factory=list)
-    # Named stage sequences the autopilot driver can run instead of a hard-coded
-    # list. ``light`` is the fast 30-min-timer-safe cycle; ``heavy`` is the full
-    # fold+mine+export cycle. The driver picks a profile per run (v0.3).
+    # Named stage sequences retained for explicit, manual compatibility runs.
+    # No recurring light/heavy scheduler is installed or enabled by ocbrain.
     profiles: dict[str, list[str]] = field(
         default_factory=lambda: {
             "light": [
@@ -70,14 +69,12 @@ class AutopilotConfig:
             ],
         }
     )
-    # Locking discipline across profiles. ``shared`` == light and heavy runs
-    # contend for the same autopilot lock so they never overlap.
+    # Locking discipline across profiles. ``shared`` == manually requested
+    # light and heavy runs contend for the same autopilot lock.
     profile_locks: str = "shared"
     # A running profile checkpoints a durable deadman row after every completed
-    # stage. If the process disappears or stops making progress past this
-    # profile-specific window, the independent stallcheck job can page it.
-    # Values are deliberately wider than the normal cadence: a slow but healthy
-    # run should skip overlapping timer fires, not manufacture a stall.
+    # stage. These historical deadman windows remain available to an explicitly
+    # invoked observer; there is no default stallcheck schedule.
     profile_deadman_seconds: dict[str, int] = field(
         default_factory=lambda: {
             "light": 3600,
@@ -154,7 +151,9 @@ class PromoteConfig:
 
 @dataclass(frozen=True)
 class JudgeConfig:
-    enabled: bool = True
+    # Hosted inference is fail-closed. A local operator must explicitly enable
+    # it in untracked configuration in addition to supplying credentials.
+    enabled: bool = False
     api_key_env: str = "OPENAI_API_KEY"  # variable NAME only; value never persisted
     model: str = "gpt-5-mini"
     daily_usd_cap: float = 0.50
@@ -180,6 +179,10 @@ class JudgeConfig:
 
 @dataclass(frozen=True)
 class DatasetConfig:
+    # Training and training-pilot preparation are paused by default. Mining,
+    # classification, local grading, selection, export, and human audit can
+    # continue without enabling this authority boundary.
+    training_enabled: bool = False
     sft_min_assistant_chars: int = 80
     sft_max_context_turns: int = 12
     sft_max_context_chars: int = 16000
@@ -247,8 +250,27 @@ class DatasetGradingConfig:
     timeout_seconds: int = 180
     per_run_item_cap: int = 100
     daily_item_cap: int = 500
-    prompt_version: str = "dataset-rubric-v2-bounded-context"
+    prompt_version: str = "dataset-rubric-v3-human-calibration-anchors"
     parallel_requests: int = 1
+    # Optional owner-only JSONL used to calibrate the local grader before a
+    # grade/re-selection pass. Empty preserves ordinary local grading. A supplied
+    # file must carry per-row named-human provenance; AI/delegated triage labels
+    # can never satisfy this gate.
+    calibration_path: str = ""
+    calibration_min_agreement: float = 0.90
+    calibration_min_items: int = 150
+
+
+@dataclass(frozen=True)
+class TeacherConfig:
+    """Hosted-teacher request packaging authority.
+
+    The teacher helper never dispatches a network call itself. Keeping even the
+    egress package behind an explicit opt-in prevents a runtime from treating a
+    prepared request as authorization for hosted inference.
+    """
+
+    enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -266,7 +288,7 @@ class EmbedConfig:
     # Semantic embedding of knowledge rows for vector attribution (v0.3),
     # replacing FTS-only attribution. Secrets are never stored: ``api_key_env``
     # holds the NAME of an env var, never its value. ``daily_usd_cap`` bounds spend.
-    enabled: bool = True
+    enabled: bool = False
     provider: str = "openai"
     model: str = "text-embedding-3-small"
     daily_usd_cap: float = 0.25
@@ -303,6 +325,7 @@ class OcbrainConfig:
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     dataset: DatasetConfig = field(default_factory=DatasetConfig)
     dataset_grading: DatasetGradingConfig = field(default_factory=DatasetGradingConfig)
+    teacher: TeacherConfig = field(default_factory=TeacherConfig)
     archive: ArchiveConfig = field(default_factory=ArchiveConfig)
     embed: EmbedConfig = field(default_factory=EmbedConfig)
     excerpt_render: ExcerptRenderConfig = field(default_factory=ExcerptRenderConfig)

@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from ocbrain.dataset.curate import import_persona_curation
 from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.curate import import_persona_curation
 
 
 def test_persona_curation_imports_without_exposing_text_in_result(tmp_path):

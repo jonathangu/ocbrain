@@ -2,6 +2,11 @@
 
 Last updated: 2026-07-09
 
+> **Historical v0.x handoff.** Module paths, MCP tools, autonomous maintenance,
+> and the combined database described below are retired. Start with the v1
+> [`README`](../README.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and
+> [`SHARED_CONTEXT_V1.md`](SHARED_CONTEXT_V1.md) instead.
+
 This is the pickup guide for an agent changing ocbrain. It describes the
 current source, the boundaries that must survive a change, and the checks that
 turn a claim into evidence.

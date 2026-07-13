@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ocbrain import publicsafety as ps
+from ocbrain_ops import publicsafety as ps
 
 # A synthetic denylist entry (NOT a real Jonathan identifier).
 FAKE_DENY = "acme-private-marker-xyz"
@@ -255,7 +255,7 @@ def test_plist_still_subject_to_placement_and_denylist(repo: Path) -> None:
 
 
 def test_entropy_pathcheck_excluded_unit() -> None:
-    assert ps.entropy_pathcheck_excluded("ops/com.jonathangu.ocbrain.autopilot.light.plist")
+    assert ps.entropy_pathcheck_excluded("ops/com.jonathangu.ocbrain_ops.autopilot.light.plist")
     assert not ps.entropy_pathcheck_excluded("src/ocbrain/cli.py")
 
 

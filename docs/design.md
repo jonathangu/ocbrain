@@ -1,7 +1,8 @@
-# ocbrain design notes
+# Historical ocbrain v0.x design notes
 
-This is the compact version of the current architecture. For the complete
-walkthrough, use [`ARCHITECTURE.md`](ARCHITECTURE.md).
+This file preserves the retired two-plane/autopilot design. It is not current
+operating doctrine. For the event-authoritative v1 core, use
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Two planes, one brain
 

@@ -7,10 +7,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ocbrain.embed import decode_embedding, knowledge_text
 from ocbrain.events import projected_rows_as_of, sha256_text
 from ocbrain.scope import ScopeContext, ScopeTag, scope_match
 from ocbrain.text import find_probable_injection, redact_secrets
+from ocbrain.vector import decode_embedding, knowledge_text
 
 # Default lexical/semantic blend when a query vector is available (0.5/0.5).
 DEFAULT_SEMANTIC_WEIGHT = 0.5
