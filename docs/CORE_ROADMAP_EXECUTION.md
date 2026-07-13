@@ -122,7 +122,7 @@ acceptance.
   core/migration/MCP/adversarial suite passes 31/31. The verified rehearsal has
   zero affected collision imports or shadowing aliases, so its projection and
   manifest hashes remain valid.
-- Final source/package gate: all 630 tests pass; the adversarial subset is
+- Final source/package gate: all 632 tests pass; the adversarial subset is
   14/14; Ruff, diff, and compilation checks pass. Fresh Python 3.12 installs
   verified the core-only CLI, exact eight-tool stdio MCP, an actual
   archive-first migration, isolated training/ops stores, lazy companion
@@ -135,7 +135,7 @@ acceptance.
 - Corrected the MCP initialization instructions themselves: fresh clients now
   receive the Shared Context contract (`context → source → feedback → closeout`)
   plus the on-demand safety boundary, rather than the retired search-first and
-  loop-family wording. The final suite passes 630 tests; the final core-wheel
+  loop-family wording. The final suite passes 632 tests; the final core-wheel
   digest is retained in the ignored, owner-only release evidence.
 - Three-runtime acceptance passed against the same activated core. Fresh Codex
   (`ret_3272313222e5c7bb` / `close_e10efadbd024d638`), Claude Code

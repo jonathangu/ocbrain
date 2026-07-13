@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.0 — 2026-07-13
+
+- Make the append-only event chain the single semantic authority and keep
+  evidence, beliefs, links, aliases, and full-text search as deterministic
+  projections.
+- Add archive-first, fresh-path-only migration with exact legacy event-prefix
+  preservation, corruption refusal, strict schema inventory, projection
+  rebuild verification, and separate activation.
+- Split local training and legacy operations into optional `ocbrain-training`
+  and `ocbrain-ops` packages with independent databases and no recurring jobs.
+- Preserve action and outcome feature envelopes in closeout receipts so later
+  models can reinterpret local metrics without assuming that clicks,
+  subscriptions, deploys, and tests mean the same thing everywhere.
+- Pass fresh Codex, Claude Code, and OpenClaw context, source, feedback, and
+  closeout turns against the same verified core.
+
+## 0.5.0 — 2026-07-13
+
+- Add the stable `ocbrain.context.v1` packet with resolved scope, ranked
+  beliefs, contradictions, coverage, exclusions, and bounded source handles.
+- Add hash-verified `brain.source` expansion and append-only
+  `ocbrain.closeout.v1` receipts linked to retrieval feedback and decision
+  impact.
+- Separate the eight-tool runtime MCP profile from protected administrative
+  mutation and correct `--allow-writes` into a deprecated admin-profile alias.
+
+## 0.4.1 — 2026-07-13
+
+- Default hosted judging, embedding, and teacher authority off even when
+  credentials exist.
+- Block pilot training until the stratified named-human audit and a separate
+  local training opt-in are both complete.
+- Retire and disable the light-autopilot, heavy-autopilot, and stallcheck
+  schedules; retained plist labels are inert uninstall markers.
+- Keep MCP on demand and require a fresh client process after upgrades.
+
 ## 0.4.0 — 2026-07-10
 
 - Add a frozen 100-case retrieval benchmark across Codex, ChatGPT, Claude Code,
