@@ -50,7 +50,7 @@ def test_distribution_metadata_and_console_ownership() -> None:
         "ocbrain-training",
         "ocbrain-ops",
     )
-    assert core["version"] == training["version"] == ops["version"] == "1.0.0"
+    assert core["version"] == training["version"] == ops["version"] == "1.0.1"
     assert core["scripts"] == {
         "ocbrain": "ocbrain.cli:main",
         "ocbrain-closeout": "ocbrain.cli:main",
@@ -109,6 +109,6 @@ def test_companion_stores_are_distinct_from_the_core_default() -> None:
 
 def test_public_safety_hook_calls_the_checked_out_ops_companion() -> None:
     hook = (ROOT / "ops/hooks/pre-push").read_text()
-    assert '${ROOT}/packages/ops/src' in hook
+    assert "${ROOT}/packages/ops/src" in hook
     assert "-m ocbrain_ops.cli public-safety-check" in hook
     assert "-m ocbrain.cli public-safety-check" not in hook

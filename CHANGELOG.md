@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.1 — 2026-07-13
+
+- Add explicit, owner-only evidence bundles for manual cross-machine exchange;
+  imports are database-free dry runs by default, derive local content ids, and
+  cannot import beliefs, receipts, or companion state.
+- Redact credential-shaped material before truncation, reject credential files
+  and directory-sweep symlink escapes, and stream bounded history windows
+  instead of loading an unbounded transcript into memory.
+- Reject malformed MCP frames and stale active-database pointers while keeping
+  the default runtime contract at exactly eight tools.
+- Prevent late proposal decisions and projection rebuilds from reviving
+  tombstoned, retracted, or subsequently corrected beliefs.
+- Preserve confidentiality and `local_only` egress across scope refinement,
+  restrict legacy-table cleanup to exact retired OCBrain schemas, and make
+  insecure local pointer/config permissions fail runtime diagnostics.
+
 ## 1.0.0 — 2026-07-13
 
 - Make the append-only event chain the single semantic authority and keep

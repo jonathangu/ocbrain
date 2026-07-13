@@ -6,7 +6,7 @@ effectively unbounded private history, expands exact sources on demand, records
 whether the context mattered, and links the eventual outcome back to what the
 agent saw.
 
-Current core version: **v1.0.0**. License: Apache-2.0.
+Current core version: **v1.0.1**. License: Apache-2.0.
 
 The product is the evidence and outcome ledger, not a particular embedding
 model, vector database, prompt, or training pipeline. Search indexes,
@@ -177,6 +177,34 @@ Activation is separate. `scripts/ocbrain-mcp` uses `OCBRAIN_DB` when set;
 otherwise it reads the ignored local `data/active-core.path` when present, then
 falls back to `data/ocbrain.sqlite`. The pointer must contain one absolute path.
 The migration command never writes it.
+
+## Explicit cross-machine evidence bundles
+
+Bundle exchange is a manual file operation, never network sync or an MCP tool.
+Export requires explicit evidence ids and applies the current scope, egress,
+approval, size, and secret-redaction gates before publishing a fresh owner-only
+file:
+
+```bash
+ocbrain --db /absolute/core.sqlite export-bundle \
+  --evidence-id evd_example \
+  --project source-project \
+  --output /absolute/fresh.bundle.json
+```
+
+Evidence marked `local_only` or `prohibited` cannot be exported.
+`approval_required` evidence additionally needs `--approve-egress`. Import is a
+validation-only dry run unless `--apply` is supplied:
+
+```bash
+ocbrain import-bundle /absolute/fresh.bundle.json --project destination-project
+ocbrain --db /absolute/core.sqlite import-bundle \
+  /absolute/fresh.bundle.json --project destination-project --apply
+```
+
+Import ignores sender ids, derives local content ids, and appends evidence only.
+Imported evidence is always `confidential` and `local_only` with explicit bundle
+provenance; beliefs, retrieval receipts, and closeouts are never imported.
 
 ## What v1 stores
 

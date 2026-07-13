@@ -15,6 +15,7 @@ from ocbrain.core_v1 import (
     CORE_V1_SCHEMA_VERSION,
     append_core_event,
     canonical_json,
+    compilation_block_reason,
     get_core_v1_belief,
     get_core_v1_evidence,
     is_core_v1,
@@ -115,10 +116,7 @@ def record_context_v1(
         conn,
         query=str(packet["query"]),
         context=context.to_dict(),
-        items=[
-            {"belief_id": item["id"], "score": item["score"]}
-            for item in packet["items"]
-        ],
+        items=[{"belief_id": item["id"], "score": item["score"]} for item in packet["items"]],
         runtime=context.runtime or "mcp",
         task_ref=context.task or f"brain.context:{packet['query']}",
         session_id=context.session,
@@ -136,9 +134,7 @@ def expand_source_v1(
     max_chars: int,
 ) -> dict[str, Any]:
     _require_v1(conn)
-    row = conn.execute(
-        "SELECT * FROM context_source_handles WHERE id=?", (source_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM context_source_handles WHERE id=?", (source_id,)).fetchone()
     if row is None:
         raise ValueError(f"source handle not found: {source_id}")
     scope = ScopeTag.from_dict(json.loads(row["scope_json"]))
@@ -207,10 +203,7 @@ def search_v1(
         conn,
         query=query,
         context=context.to_dict(),
-        items=[
-            {"belief_id": item["id"], "score": item["score"]}
-            for item in packet["items"]
-        ],
+        items=[{"belief_id": item["id"], "score": item["score"]} for item in packet["items"]],
         runtime=context.runtime or "mcp",
         task_ref=context.task or f"brain.search:{query}",
         session_id=context.session,
@@ -426,8 +419,8 @@ def correct_v1(
     actor: str,
     hard: bool,
 ) -> dict[str, Any]:
-    if layer not in {"evidence", "knowledge", "belief"}:
-        raise ValueError("layer must be evidence, knowledge, or belief")
+    if layer not in {"knowledge", "belief"}:
+        raise ValueError("layer must be knowledge or belief; evidence corrections are unsupported")
     event_id = append_core_event(
         conn,
         "correction_recorded",
@@ -489,8 +482,7 @@ def proposals_v1(
     }
     result: list[dict[str, Any]] = []
     for row in conn.execute(
-        "SELECT * FROM brain_events WHERE kind='compilation_proposed' "
-        "ORDER BY rowid DESC LIMIT ?",
+        "SELECT * FROM brain_events WHERE kind='compilation_proposed' ORDER BY rowid DESC LIMIT ?",
         (max(limit * 4, 100),),
     ):
         is_decided = str(row["id"]) in decided
@@ -521,7 +513,7 @@ def decide_proposal_v1(
     if decision not in {"approve", "reject", "edit", "shadow"}:
         raise ValueError("decision must be approve, reject, edit, or shadow")
     proposal = conn.execute(
-        "SELECT 1 FROM brain_events WHERE id=? AND kind='compilation_proposed'",
+        "SELECT event_seq, body_json FROM brain_events WHERE id=? AND kind='compilation_proposed'",
         (proposal_event_id,),
     ).fetchone()
     if proposal is None:
@@ -533,6 +525,16 @@ def decide_proposal_v1(
     ).fetchone()
     if existing is not None:
         raise ValueError(f"proposal already decided: {proposal_event_id}")
+    if decision in {"approve", "edit"}:
+        proposal_body = json.loads(proposal["body_json"])
+        belief_id = str(proposal_body.get("belief_id") or "")
+        reason_blocked = compilation_block_reason(
+            conn,
+            belief_id,
+            proposal_event_seq=int(proposal["event_seq"]),
+        )
+        if reason_blocked is not None:
+            raise PermissionError(f"cannot {decision}: belief is {reason_blocked}: {belief_id}")
     event_id = append_core_event(
         conn,
         "compilation_decided",
@@ -580,7 +582,9 @@ def _source_handles_for_belief(
             _make_source_handle(
                 object_id=canonical_id,
                 source_kind="core_v1_evidence",
-                uri=row["source_uri"] or row["artifact_uri"] or f"ocbrain://evidence/{row['evidence_id']}",
+                uri=row["source_uri"]
+                or row["artifact_uri"]
+                or f"ocbrain://evidence/{row['evidence_id']}",
                 content_hash=sha256_text(content),
                 scope=scope,
                 locator={"evidence_id": str(row["evidence_id"])},

@@ -137,12 +137,23 @@ def resolve_write_scope(
     if isinstance(explicit, dict):
         return ScopeTag.from_dict(explicit)
     context = context or ScopeContext()
+    confidential = context.client is not None
+
+    def inferred(scope_type: str, scope_id: str) -> ScopeTag:
+        return ScopeTag(
+            scope_type,
+            scope_id,
+            visibility="confidential" if confidential else "internal",
+            egress_policy="local_only" if confidential else "approval_required",
+            provenance="inferred",
+        )
+
     if context.task:
-        return ScopeTag("task", f"task:{context.task}", provenance="inferred")
+        return inferred("task", f"task:{context.task}")
     if context.session:
-        return ScopeTag("session", f"session:{context.session}", provenance="inferred")
+        return inferred("session", f"session:{context.session}")
     if context.repo:
-        return ScopeTag("repo", f"repo:{context.repo}", provenance="inferred")
+        return inferred("repo", f"repo:{context.repo}")
     if context.client:
         return ScopeTag(
             "client",
@@ -152,7 +163,7 @@ def resolve_write_scope(
             provenance="inferred",
         )
     if context.project:
-        return ScopeTag("project", f"project:{context.project}", provenance="inferred")
+        return inferred("project", f"project:{context.project}")
     return legacy_unscoped_scope()
 
 

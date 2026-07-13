@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain-ops"
-version = "1.0.0"
+version = "1.0.1"
 description = "Optional manual operations and watchdog tools for OCBrain"
 readme = "README.md"
 requires-python = ">=3.11"

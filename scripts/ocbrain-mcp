@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${OCBRAIN_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 DB="${OCBRAIN_DB:-}"
 ACTIVE_DB_FILE="${OCBRAIN_ACTIVE_DB_FILE:-$ROOT/data/active-core.path}"
+DB_SELECTED_FROM_POINTER=0
 
 # A migration never repoints clients itself. Activation is the separate act of
 # writing one absolute database path to this ignored local file.
@@ -14,6 +15,7 @@ if [[ -z "$DB" && -r "$ACTIVE_DB_FILE" ]]; then
     echo "ocbrain: $ACTIVE_DB_FILE must contain one absolute database path" >&2
     exit 2
   fi
+  DB_SELECTED_FROM_POINTER=1
 fi
 DB="${DB:-$ROOT/data/ocbrain.sqlite}"
 
@@ -26,4 +28,7 @@ else
 fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+if [[ "$DB_SELECTED_FROM_POINTER" == 1 ]]; then
+  exec "$PYTHON" -m ocbrain.cli --db "$DB" mcp --active-db-file "$ACTIVE_DB_FILE" "$@"
+fi
 exec "$PYTHON" -m ocbrain.cli --db "$DB" mcp "$@"

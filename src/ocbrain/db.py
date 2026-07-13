@@ -25,13 +25,6 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
-DROP TABLE IF EXISTS events;
-DROP TABLE IF EXISTS candidates;
-DROP TABLE IF EXISTS artifact_links;
-DROP TABLE IF EXISTS invalidations;
-DROP TABLE IF EXISTS candidate_decisions;
-DROP TABLE IF EXISTS legacy_evidence;
-
 CREATE TABLE IF NOT EXISTS evidence (
   id TEXT PRIMARY KEY,
   source_type TEXT NOT NULL,
@@ -488,6 +481,89 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+_VERIFIED_LEGACY_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    # Children precede their referenced parents so this also works when the
+    # caller already enabled foreign-key enforcement.
+    "artifact_links": frozenset(
+        {
+            "id",
+            "candidate_id",
+            "surface",
+            "uri",
+            "line_start",
+            "line_end",
+            "applied_at",
+            "applied_by",
+        }
+    ),
+    "invalidations": frozenset(
+        {"id", "old_candidate_id", "new_candidate_id", "reason", "created_at"}
+    ),
+    "candidate_decisions": frozenset(
+        {
+            "id",
+            "candidate_id",
+            "action",
+            "actor",
+            "reason",
+            "previous_status",
+            "next_status",
+            "created_at",
+        }
+    ),
+    "candidates": frozenset(
+        {
+            "id",
+            "event_id",
+            "target",
+            "title",
+            "body",
+            "confidence",
+            "scope",
+            "risk",
+            "status",
+            "claim_key",
+            "hints_json",
+            "evidence_json",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "legacy_evidence": frozenset(
+        {"id", "event_id", "kind", "uri", "excerpt", "line_start", "line_end", "created_at"}
+    ),
+    "events": frozenset(
+        {
+            "id",
+            "source_type",
+            "source_uri",
+            "content_hash",
+            "title",
+            "summary",
+            "body",
+            "scope",
+            "metadata_json",
+            "created_at",
+            "ingested_at",
+            "triaged_at",
+        }
+    ),
+}
+
+
+def _drop_verified_legacy_tables(conn: sqlite3.Connection) -> None:
+    """Burn down only tables whose complete shape matches retired OCBrain tables."""
+    for table, expected_columns in _VERIFIED_LEGACY_TABLE_COLUMNS.items():
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if exists is None:
+            continue
+        actual_columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if actual_columns == expected_columns:
+            conn.execute(f"DROP TABLE {table}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     # A v1 database has a deliberately different, event-authoritative schema.
     # Never let a legacy compatibility initializer silently recreate the retired
@@ -501,6 +577,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if core_schema is not None and str(core_schema[0]) == "ocbrain.core.v1":
             raise ValueError("legacy init_db cannot initialize an OCBrain v1 core")
+    _drop_verified_legacy_tables(conn)
     conn.executescript(SCHEMA)
     _migrate_schema(conn)
     conn.commit()

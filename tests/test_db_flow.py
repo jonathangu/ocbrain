@@ -6,6 +6,7 @@ from pathlib import Path
 from ocbrain import cli
 from ocbrain.core_v1 import is_core_v1
 from ocbrain.db import (
+    _drop_verified_legacy_tables,
     admit_knowledge,
     connect,
     get_current_doc,
@@ -22,11 +23,17 @@ from ocbrain_ops.excerpt import write_excerpt
 from ocbrain_ops.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 
 
-def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
+def test_schema_preserves_unrelated_generic_tables(tmp_path: Path) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     conn = sqlite3.connect(db_path)
-    conn.execute("CREATE TABLE events (id TEXT)")
-    conn.execute("CREATE TABLE candidates (id TEXT)")
+    conn.execute("CREATE TABLE events (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+    conn.execute("INSERT INTO events VALUES ('user-row', 'keep me')")
+    conn.execute("CREATE TABLE candidates (id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+    conn.execute("INSERT INTO candidates VALUES ('candidate-row', 'keep me too')")
+    conn.commit()
+    # The burn-down guard must also accept plain sqlite3 connections, whose rows
+    # are tuples rather than sqlite3.Row objects.
+    _drop_verified_legacy_tables(conn)
     conn.commit()
     conn.close()
 
@@ -38,10 +45,62 @@ def test_schema_burns_down_legacy_tables(tmp_path: Path) -> None:
     }
 
     assert {"evidence", "knowledge", "knowledge_evidence", "memory"} <= names
-    assert "events" not in names
-    assert "candidates" not in names
+    assert "events" in names
+    assert "candidates" in names
     assert "invalidations" not in names
     assert "candidate_decisions" not in names
+    assert conn.execute("SELECT payload FROM events").fetchone()[0] == "keep me"
+    assert conn.execute("SELECT payload FROM candidates").fetchone()[0] == "keep me too"
+
+
+def test_schema_drops_verified_legacy_events_and_candidates_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE events (
+          id TEXT, source_type TEXT, source_uri TEXT, content_hash TEXT, title TEXT,
+          summary TEXT, body TEXT, scope TEXT, metadata_json TEXT, created_at TEXT,
+          ingested_at TEXT, triaged_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE candidates (
+          id TEXT, event_id TEXT, target TEXT, title TEXT, body TEXT,
+          confidence REAL, scope TEXT, risk TEXT, status TEXT, claim_key TEXT,
+          hints_json TEXT, evidence_json TEXT, created_at TEXT, updated_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    _drop_verified_legacy_tables(conn)
+    assert (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidates'"
+        ).fetchone()
+        is None
+    )
+    conn.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+
+    assert (
+        conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
+        is None
+    )
+    assert (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidates'"
+        ).fetchone()
+        is None
+    )
 
 
 _CANONICAL_RETRIEVAL_COLUMNS = {
@@ -594,9 +653,7 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
     )
     search_payload = json.loads(capsys.readouterr().out)
     assert {item["kind"] for item in search_payload["items"]} == {"core_v1"}
-    assert {item["scope"]["scope_id"] for item in search_payload["items"]} == {
-        "project:workspace"
-    }
+    assert {item["scope"]["scope_id"] for item in search_payload["items"]} == {"project:workspace"}
     assert len(search_payload["items"]) == 3
 
     # A live append-only transcript path must refresh when its fingerprint
@@ -751,10 +808,7 @@ def test_cli_evidence_and_value_digest(tmp_path: Path, capsys) -> None:
         == 0
     )
     capsys.readouterr()
-    assert (
-        cli.main(["--db", str(db_path), "--pretty", "digest", "--project", "ocbrain"])
-        == 0
-    )
+    assert cli.main(["--db", str(db_path), "--pretty", "digest", "--project", "ocbrain"]) == 0
     payload = json.loads(capsys.readouterr().out)
 
     conn = connect(db_path)

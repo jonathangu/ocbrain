@@ -371,9 +371,7 @@ def is_core_v1(conn: sqlite3.Connection) -> bool:
     ).fetchone()
     if row is None:
         return False
-    version = conn.execute(
-        "SELECT value FROM schema_meta WHERE key='core_schema'"
-    ).fetchone()
+    version = conn.execute("SELECT value FROM schema_meta WHERE key='core_schema'").fetchone()
     return version is not None and str(version[0]) == CORE_V1_SCHEMA_VERSION
 
 
@@ -467,9 +465,7 @@ def append_core_event(
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     else:
-        conn.execute(
-            "UPDATE schema_meta SET value=value WHERE key='__event_writer_reservation__'"
-        )
+        conn.execute("UPDATE schema_meta SET value=value WHERE key='__event_writer_reservation__'")
     try:
         timestamp = ts or now_iso()
         body_json = canonical_json(body)
@@ -589,9 +585,7 @@ def project_core_v1(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         anchor = conn.execute(
             "SELECT event_hash FROM brain_events WHERE rowid=?", (cursor,)
         ).fetchone()
-        if cursor and (
-            anchor is None or str(anchor["event_hash"]) != str(expected_previous)
-        ):
+        if cursor and (anchor is None or str(anchor["event_hash"]) != str(expected_previous)):
             raise RuntimeError("projection cursor anchor does not match the event chain")
     events = conn.execute(
         "SELECT rowid AS rid, * FROM brain_events WHERE rowid > ? ORDER BY rowid",
@@ -610,9 +604,7 @@ def project_core_v1(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         last_rowid = int(event["rid"])
         last_hash = str(event["event_hash"])
     cursor_updated_at = (
-        str(
-            conn.execute("SELECT ts FROM brain_events WHERE rowid=?", (last_rowid,)).fetchone()[0]
-        )
+        str(conn.execute("SELECT ts FROM brain_events WHERE rowid=?", (last_rowid,)).fetchone()[0])
         if last_rowid
         else "1970-01-01T00:00:00+00:00"
     )
@@ -678,9 +670,7 @@ def _constraint_cache(conn: sqlite3.Connection) -> dict[str, list[sqlite3.Row]]:
     ):
         body = json.loads(event["body_json"])
         target = (
-            body.get("target_id")
-            if event["kind"] == "correction_recorded"
-            else body.get("target")
+            body.get("target_id") if event["kind"] == "correction_recorded" else body.get("target")
         )
         if target:
             constraints.setdefault(str(target), []).append(event)
@@ -698,7 +688,7 @@ def _apply_event(
     if kind == "evidence_recorded":
         _project_recorded_evidence(conn, event, body)
     elif kind == "compilation_decided":
-        _project_compilation_decision(conn, event, body)
+        _project_compilation_decision(conn, event, body, constraints=constraints)
     elif kind == "correction_recorded":
         _project_correction(conn, event, body)
     elif kind == "tombstone_recorded":
@@ -741,13 +731,17 @@ def _project_recorded_evidence(
 
 
 def _project_compilation_decision(
-    conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]
+    conn: sqlite3.Connection,
+    event: sqlite3.Row,
+    body: dict[str, Any],
+    *,
+    constraints: dict[str, list[sqlite3.Row]],
 ) -> None:
     if body.get("decision") not in {"approve", "edit"}:
         return
     proposal_id = body.get("proposal_event_id")
     proposal = conn.execute(
-        "SELECT body_json FROM brain_events WHERE id=? AND kind='compilation_proposed'",
+        "SELECT event_seq, body_json FROM brain_events WHERE id=? AND kind='compilation_proposed'",
         (proposal_id,),
     ).fetchone()
     if proposal is None:
@@ -782,17 +776,25 @@ def _project_compilation_decision(
             event["ts"],
             event["id"],
         )
+    # A decision can arrive after its proposal has already been corrected or
+    # forgotten. Reapply those intervening constraints after materializing the
+    # belief so incremental projection and a full rebuild cannot resurrect it.
+    # Tombstones and hard restrictive corrections remain durable even when they
+    # predate the proposal.
+    _replay_compilation_constraints(
+        conn,
+        belief_id,
+        proposal_event_seq=int(proposal["event_seq"]),
+        before_event_seq=int(event["event_seq"]),
+        constraints=constraints,
+    )
 
 
-def _project_correction(
-    conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]
-) -> None:
+def _project_correction(conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]) -> None:
     if body.get("target_layer") not in {"knowledge", "belief"}:
         return
     belief_id = resolve_object_id(conn, str(body.get("target_id") or ""))
-    row = conn.execute(
-        "SELECT * FROM current_beliefs WHERE belief_id=?", (belief_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM current_beliefs WHERE belief_id=?", (belief_id,)).fetchone()
     if row is None:
         return
     updated = dict(row)
@@ -810,13 +812,9 @@ def _project_correction(
     _replace_belief_row(conn, updated)
 
 
-def _project_tombstone(
-    conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]
-) -> None:
+def _project_tombstone(conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]) -> None:
     belief_id = resolve_object_id(conn, str(body.get("target") or ""))
-    row = conn.execute(
-        "SELECT * FROM current_beliefs WHERE belief_id=?", (belief_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM current_beliefs WHERE belief_id=?", (belief_id,)).fetchone()
     if row is None:
         return
     updated = dict(row)
@@ -918,20 +916,14 @@ def _project_legacy_knowledge(
         final_status = _restrictive_status(str(existing["status"]), imported_status)
         belief_body = str(existing["body"])
         confidence = (
-            existing["confidence"]
-            if existing["confidence"] is not None
-            else row.get("confidence")
+            existing["confidence"] if existing["confidence"] is not None else row.get("confidence")
         )
         pinned = bool(existing["pinned"])
         approved_event_id = existing["approved_event_id"]
         compiled_at = str(existing["last_compiled_at"])
         existing_evidence = _json_list(existing["evidence_ids"])
     evidence_ids = list(dict.fromkeys([*existing_evidence, *original_evidence]))
-    attributes = {
-        key: value
-        for key, value in row.items()
-        if key not in {"embedding"}
-    }
+    attributes = {key: value for key, value in row.items() if key not in {"embedding"}}
     if body.get("embedding_sha256"):
         attributes["embedding_sha256"] = body["embedding_sha256"]
     _write_belief(
@@ -991,6 +983,94 @@ def _replay_prior_constraints(
             _project_correction(conn, prior, prior_body)
         else:
             _project_tombstone(conn, prior, prior_body)
+
+
+def _replay_compilation_constraints(
+    conn: sqlite3.Connection,
+    belief_id: str,
+    *,
+    proposal_event_seq: int,
+    before_event_seq: int,
+    constraints: dict[str, list[sqlite3.Row]],
+) -> None:
+    canonical_id = resolve_object_id(conn, belief_id)
+    aliases = {
+        str(row["alias_id"])
+        for row in conn.execute(
+            "SELECT alias_id FROM object_aliases WHERE canonical_id=?", (canonical_id,)
+        )
+    }
+    targets = {belief_id, canonical_id, *aliases}
+    prior_events = {
+        int(prior["event_seq"]): prior
+        for target in targets
+        for prior in constraints.get(target, [])
+        if int(prior["event_seq"]) < before_event_seq
+    }
+    for prior in (prior_events[key] for key in sorted(prior_events)):
+        prior_body = json.loads(prior["body_json"])
+        if prior["kind"] == "tombstone_recorded":
+            _project_tombstone(conn, prior, prior_body)
+            continue
+        is_intervening = int(prior["event_seq"]) > proposal_event_seq
+        is_hard_restrictive = bool(prior_body.get("hard")) and prior_body.get("op") in {
+            "mark_wrong",
+            "retract",
+            "demote",
+        }
+        if is_intervening or is_hard_restrictive:
+            _project_correction(conn, prior, prior_body)
+
+
+def compilation_block_reason(
+    conn: sqlite3.Connection,
+    belief_id: str,
+    *,
+    proposal_event_seq: int,
+) -> str | None:
+    """Return the durable/intervening constraint that blocks a proposal decision."""
+    canonical_id = resolve_object_id(conn, belief_id)
+    aliases = {
+        str(row["alias_id"])
+        for row in conn.execute(
+            "SELECT alias_id FROM object_aliases WHERE canonical_id=?", (canonical_id,)
+        )
+    }
+    targets = {belief_id, canonical_id, *aliases}
+    placeholders = ",".join("?" for _ in targets)
+    params = tuple(sorted(targets))
+    tombstone = conn.execute(
+        "SELECT 1 FROM brain_events WHERE kind='tombstone_recorded' "
+        f"AND json_extract(body_json, '$.target') IN ({placeholders}) LIMIT 1",
+        params,
+    ).fetchone()
+    if tombstone is not None:
+        return "tombstoned"
+    intervening = conn.execute(
+        "SELECT 1 FROM brain_events WHERE kind='correction_recorded' "
+        "AND json_extract(body_json, '$.target_layer') IN ('knowledge','belief') "
+        f"AND json_extract(body_json, '$.target_id') IN ({placeholders}) "
+        "AND event_seq > ? LIMIT 1",
+        (*params, proposal_event_seq),
+    ).fetchone()
+    if intervening is not None:
+        return "superseded by a post-proposal correction"
+    hard_correction = conn.execute(
+        "SELECT 1 FROM brain_events WHERE kind='correction_recorded' "
+        "AND json_extract(body_json, '$.target_layer') IN ('knowledge','belief') "
+        f"AND json_extract(body_json, '$.target_id') IN ({placeholders}) "
+        "AND json_extract(body_json, '$.hard')=1 "
+        "AND json_extract(body_json, '$.op') IN ('mark_wrong','retract','demote') LIMIT 1",
+        params,
+    ).fetchone()
+    if hard_correction is not None:
+        return "hard-corrected"
+    row = conn.execute(
+        "SELECT status FROM current_beliefs WHERE belief_id=?", (canonical_id,)
+    ).fetchone()
+    if row is not None and str(row["status"]) in {"retracted", "tombstoned"}:
+        return str(row["status"])
+    return None
 
 
 def _project_retrieval_snapshot(
@@ -1528,10 +1608,7 @@ def record_core_v1_retrieval(
             task_ref,
             query,
             canonical_json(
-                [
-                    item.get("belief_id") or item.get("object_id") or item.get("id")
-                    for item in rows
-                ]
+                [item.get("belief_id") or item.get("object_id") or item.get("id") for item in rows]
             ),
             canonical_json(context),
             packet_schema,
@@ -1659,6 +1736,7 @@ __all__ = [
     "append_core_event",
     "assert_core_v1_inventory",
     "canonical_json",
+    "compilation_block_reason",
     "conservative_legacy_scope",
     "core_v1_table_names",
     "get_core_v1_belief",
