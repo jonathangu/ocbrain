@@ -391,6 +391,88 @@ CREATE TABLE IF NOT EXISTS dataset_exports (
   manifest_json TEXT NOT NULL,
   egress_audit_id TEXT
 );
+
+-- v0.5 shared-context source handles.  A source can only be expanded after
+-- OCBrain has issued a handle for it, and the persisted scope/hash/locator is
+-- the authority used by brain.source.
+CREATE TABLE IF NOT EXISTS context_source_handles (
+  id TEXT PRIMARY KEY,
+  issued_at TEXT NOT NULL,
+  retrieval_use_id TEXT REFERENCES retrieval_uses(id),
+  object_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  uri TEXT,
+  content_hash TEXT NOT NULL,
+  scope_json TEXT NOT NULL,
+  locator_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_context_source_handles_retrieval
+  ON context_source_handles(retrieval_use_id);
+
+CREATE TABLE IF NOT EXISTS context_source_handle_issues (
+  source_id TEXT NOT NULL REFERENCES context_source_handles(id),
+  retrieval_use_id TEXT NOT NULL REFERENCES retrieval_uses(id),
+  issued_at TEXT NOT NULL,
+  PRIMARY KEY (source_id, retrieval_use_id)
+);
+CREATE INDEX IF NOT EXISTS idx_context_source_handle_issues_retrieval
+  ON context_source_handle_issues(retrieval_use_id);
+CREATE TRIGGER IF NOT EXISTS context_source_handle_issues_no_update
+BEFORE UPDATE ON context_source_handle_issues BEGIN
+  SELECT RAISE(ABORT, 'context_source_handle_issues is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS context_source_handle_issues_no_delete
+BEFORE DELETE ON context_source_handle_issues BEGIN
+  SELECT RAISE(ABORT, 'context_source_handle_issues is append-only');
+END;
+
+-- Generic, append-only task outcome receipts.  These deliberately live
+-- outside brain_events: closeouts describe agent execution outcomes rather
+-- than claims eligible for belief compilation.
+CREATE TABLE IF NOT EXISTS task_closeouts (
+  id TEXT PRIMARY KEY,
+  schema_version TEXT NOT NULL,
+  closed_at TEXT NOT NULL,
+  task_ref TEXT NOT NULL,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  decision_impact TEXT NOT NULL,
+  decision_note TEXT,
+  awaiting TEXT,
+  runtime TEXT,
+  session_id TEXT,
+  context_json TEXT NOT NULL,
+  artifact_refs_json TEXT NOT NULL,
+  verifier_refs_json TEXT NOT NULL,
+  provenance_json TEXT NOT NULL,
+  receipt_json TEXT NOT NULL,
+  content_hash TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS task_closeout_retrievals (
+  closeout_id TEXT NOT NULL REFERENCES task_closeouts(id),
+  retrieval_use_id TEXT NOT NULL REFERENCES retrieval_uses(id),
+  PRIMARY KEY (closeout_id, retrieval_use_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_closeout_retrievals_retrieval
+  ON task_closeout_retrievals(retrieval_use_id);
+
+CREATE TRIGGER IF NOT EXISTS task_closeouts_no_update
+BEFORE UPDATE ON task_closeouts BEGIN
+  SELECT RAISE(ABORT, 'task_closeouts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS task_closeouts_no_delete
+BEFORE DELETE ON task_closeouts BEGIN
+  SELECT RAISE(ABORT, 'task_closeouts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS task_closeout_retrievals_no_update
+BEFORE UPDATE ON task_closeout_retrievals BEGIN
+  SELECT RAISE(ABORT, 'task_closeout_retrievals is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS task_closeout_retrievals_no_delete
+BEFORE DELETE ON task_closeout_retrievals BEGIN
+  SELECT RAISE(ABORT, 'task_closeout_retrievals is append-only');
+END;
 """
 
 
@@ -407,6 +489,18 @@ def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    # A v1 database has a deliberately different, event-authoritative schema.
+    # Never let a legacy compatibility initializer silently recreate the retired
+    # relational/training/watchdog tables inside it.
+    meta_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+    ).fetchone()
+    if meta_exists is not None:
+        core_schema = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='core_schema'"
+        ).fetchone()
+        if core_schema is not None and str(core_schema[0]) == "ocbrain.core.v1":
+            raise ValueError("legacy init_db cannot initialize an OCBrain v1 core")
     conn.executescript(SCHEMA)
     _migrate_schema(conn)
     conn.commit()

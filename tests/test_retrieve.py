@@ -4,7 +4,6 @@ import sqlite3
 from pathlib import Path
 
 from ocbrain.db import connect, init_db, upsert_knowledge
-from ocbrain.embed import encode_embedding
 from ocbrain.retrieve import (
     blend_scores,
     cosine_similarity,
@@ -14,6 +13,7 @@ from ocbrain.retrieve import (
     semantic_neighbors,
 )
 from ocbrain.scope import ScopeContext
+from ocbrain_ops.embed import encode_embedding
 
 
 def test_catalog_stub_detection_is_narrow() -> None:

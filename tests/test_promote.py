@@ -5,7 +5,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ocbrain.autolabel import Signal, record_signal
 from ocbrain.config import load_config
 from ocbrain.db import (
     connect,
@@ -18,7 +17,8 @@ from ocbrain.db import (
     upsert_knowledge,
 )
 from ocbrain.ids import content_hash
-from ocbrain.promote import (
+from ocbrain_ops.autolabel import Signal, record_signal
+from ocbrain_ops.promote import (
     demote_and_decay,
     human_bootstrap_eligible,
     promote_score,
@@ -100,7 +100,7 @@ def test_promotion_finishes_scoring_before_opening_writer_transaction(
             observer.close()
         return original(inner_conn, row, cfg, now=now)
 
-    monkeypatch.setattr("ocbrain.promote.promote_score", observing_score)
+    monkeypatch.setattr("ocbrain_ops.promote.promote_score", observing_score)
     result = promote_to_memory(conn, _cfg(tmp_path))
     assert calls == 2
     assert result["writer_lock"]["batches_committed"] >= 1
@@ -413,7 +413,7 @@ def test_bootstrap_score_is_not_use_rate_decayed(tmp_path: Path) -> None:
 
 
 def test_bootstrap_does_not_survive_quarantine(tmp_path: Path) -> None:
-    from ocbrain.safeguards import quarantine_knowledge
+    from ocbrain_ops.safeguards import quarantine_knowledge
 
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)

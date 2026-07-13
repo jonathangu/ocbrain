@@ -5,7 +5,21 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from ocbrain.autolabel import (
+from ocbrain.config import load_config
+from ocbrain.db import (
+    connect,
+    get_knowledge,
+    init_db,
+    link_knowledge_evidence,
+    log_retrieval_use,
+    update_retrieval_use_feedback,
+    upsert_evidence,
+    upsert_knowledge,
+)
+from ocbrain.events import append_event
+from ocbrain.ids import content_hash
+from ocbrain.write_batch import DatasetWriteBatch
+from ocbrain_ops.autolabel import (
     Signal,
     attribute_signals,
     autolabel,
@@ -19,20 +33,6 @@ from ocbrain.autolabel import (
     mine_retrieval_signals,
     record_signal,
 )
-from ocbrain.config import load_config
-from ocbrain.dataset.batching import DatasetWriteBatch
-from ocbrain.db import (
-    connect,
-    get_knowledge,
-    init_db,
-    link_knowledge_evidence,
-    log_retrieval_use,
-    update_retrieval_use_feedback,
-    upsert_evidence,
-    upsert_knowledge,
-)
-from ocbrain.events import append_event
-from ocbrain.ids import content_hash
 
 
 def _cfg(tmp_path: Path):
@@ -332,7 +332,7 @@ def test_attribute_signals_releases_writer_before_next_fts_query(
             observer.close()
         return [{"doc_id": kid, "title": text, "snippet": text}]
 
-    monkeypatch.setattr("ocbrain.autolabel.search", observed_search)
+    monkeypatch.setattr("ocbrain_ops.autolabel.search", observed_search)
     batch = DatasetWriteBatch(conn, max_operations=1, max_seconds=60)
     attributed = attribute_signals(conn, write_batch=batch)
     assert attributed == {kid}

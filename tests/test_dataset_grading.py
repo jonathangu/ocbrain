@@ -10,17 +10,19 @@ from pathlib import Path
 import pytest
 
 from ocbrain.config import DatasetGradingConfig, OcbrainConfig
-from ocbrain.dataset.export import export_all
-from ocbrain.dataset.grade import (
+from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.export import export_all
+from ocbrain_training.dataset.grade import (
+    DATASET_RUBRIC_ANCHORS,
     DATASET_RUBRICS,
     MAX_GRADE_CONTEXT_CHARS,
     _messages,
+    calibrate_grader,
     grade_examples,
     normalize_grade,
     require_loopback_endpoint,
 )
-from ocbrain.dataset.quality import store_example
-from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.quality import store_example
 
 
 def _db(tmp_path: Path):
@@ -29,7 +31,14 @@ def _db(tmp_path: Path):
     return conn
 
 
-def _cfg(*, per_run: int = 100, daily: int = 500, parallel: int = 1) -> OcbrainConfig:
+def _cfg(
+    *,
+    per_run: int = 100,
+    daily: int = 500,
+    parallel: int = 1,
+    calibration_path: Path | None = None,
+    calibration_min_items: int = 10,
+) -> OcbrainConfig:
     base = OcbrainConfig()
     return dataclasses.replace(
         base,
@@ -39,6 +48,8 @@ def _cfg(*, per_run: int = 100, daily: int = 500, parallel: int = 1) -> OcbrainC
             per_run_item_cap=per_run,
             daily_item_cap=daily,
             parallel_requests=parallel,
+            calibration_path=str(calibration_path or ""),
+            calibration_min_items=calibration_min_items,
         ),
     )
 
@@ -95,6 +106,56 @@ def _transport(endpoint, model, messages, timeout):
     }
 
 
+def _grade_response(dataset: str, verdict: str) -> dict:
+    score = {"pass": 0.9, "review": 0.65, "fail": 0.2}[verdict]
+    return {
+        "overall_score": score,
+        "dimensions": {name: score for name in DATASET_RUBRICS[dataset]},
+        "verdict": verdict,
+        "flags": [],
+        "explanation": "Calibration response.",
+    }
+
+
+def _write_calibration(
+    path: Path,
+    verdicts: list[str],
+    *,
+    kind: str = "named_human",
+    reviewer: str = "Ada Reviewer",
+    personally_reviewed: bool = True,
+) -> None:
+    rows = []
+    for index, verdict in enumerate(verdicts):
+        rows.append(
+            {
+                "calibration_id": f"cal-{index}",
+                "dataset": "sft",
+                "example": {
+                    "messages": [
+                        {"role": "user", "content": f"calibration question {index}"},
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"Calibration answer {index} has enough substantive detail to "
+                                "be evaluated without exposing its private human label."
+                            ),
+                        },
+                    ]
+                },
+                "human_verdict": verdict,
+                "provenance": {
+                    "kind": kind,
+                    "reviewer_name": reviewer,
+                    "personally_reviewed": personally_reviewed,
+                    "reviewed_at": "2026-07-12T12:00:00Z",
+                },
+            }
+        )
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    path.chmod(0o600)
+
+
 def test_loopback_boundary_rejects_remote_endpoints():
     assert require_loopback_endpoint("http://localhost:11434/api/chat")
     assert require_loopback_endpoint("http://[::1]:11434/api/chat")
@@ -115,6 +176,173 @@ def test_normalize_grade_accepts_validated_flat_local_model_dimensions():
     grade = normalize_grade("dpo", raw)
     assert grade["overall_score"] == 0.82
     assert grade["dimensions"] == {name: 0.8 for name in DATASET_RUBRICS["dpo"]}
+
+
+def test_prompt_version_and_dataset_specific_rubric_anchors():
+    assert DatasetGradingConfig().prompt_version == "dataset-rubric-v3-human-calibration-anchors"
+    expected_phrases = {
+        "sft": ("heartbeat acknowledgments", "explicit BLOCKED"),
+        "persona": ("operator-authored voice", "not agent prose"),
+        "dpo": ("same user task", "weak/debatable direction"),
+    }
+    for dataset, phrases in expected_phrases.items():
+        request = json.loads(_messages(dataset, {"messages": []})[1]["content"])
+        anchors = " ".join(request["rubric_anchors"])
+        assert "runtime or transport contamination" in anchors
+        assert (
+            tuple(request["rubric_anchors"][-len(DATASET_RUBRIC_ANCHORS[dataset]) :])
+            == (DATASET_RUBRIC_ANCHORS[dataset])
+        )
+        assert all(phrase in anchors for phrase in phrases)
+
+
+def test_named_human_calibration_requires_ninety_percent_and_hides_labels(tmp_path: Path):
+    labels = ["pass"] * 10
+    path = tmp_path / "human-calibration.jsonl"
+    _write_calibration(path, labels)
+    predictions = ["pass"] * 9 + ["fail"]
+    calls = 0
+
+    def transport(endpoint, model, messages, timeout):
+        nonlocal calls
+        request_text = messages[1]["content"]
+        assert "human_verdict" not in request_text
+        assert "personally_reviewed" not in request_text
+        assert "Ada Reviewer" not in request_text
+        request = json.loads(request_text)
+        result = _grade_response(request["dataset"], predictions[calls])
+        calls += 1
+        return result
+
+    result = calibrate_grader(
+        path=path,
+        endpoint="http://127.0.0.1:11434/api/chat",
+        model="local-test-model",
+        timeout=1,
+        transport=transport,
+        minimum_agreement=0.5,  # cannot weaken the hard 90% floor
+        minimum_items=10,
+    )
+    assert result["passed"] is True
+    assert result["agreement"] == 0.9
+    assert result["required_agreement"] == 0.9
+    assert result["named_human_provenance"] is True
+    assert result["contains_calibration_text"] is False
+
+
+def test_ai_triage_labels_cannot_authorize_calibration(tmp_path: Path):
+    path = tmp_path / "ai-triage.jsonl"
+    _write_calibration(
+        path,
+        ["pass"] * 10,
+        kind="ai_triage",
+        reviewer="Claude (Opus)",
+        personally_reviewed=False,
+    )
+    calls = 0
+
+    def should_not_run(*args):
+        nonlocal calls
+        calls += 1
+        return {}
+
+    with pytest.raises(ValueError, match="named-human provenance"):
+        calibrate_grader(
+            path=path,
+            endpoint="http://127.0.0.1:11434/api/chat",
+            model="local-test-model",
+            timeout=1,
+            transport=should_not_run,
+        )
+    assert calls == 0
+
+
+def test_ai_reviewer_name_cannot_be_relabelled_as_named_human(tmp_path: Path):
+    path = tmp_path / "mislabelled-ai.jsonl"
+    _write_calibration(
+        path,
+        ["pass"] * 10,
+        kind="named_human",
+        reviewer="Claude (Opus)",
+        personally_reviewed=True,
+    )
+    with pytest.raises(ValueError, match="AI reviewer"):
+        calibrate_grader(
+            path=path,
+            endpoint="http://127.0.0.1:11434/api/chat",
+            model="local-test-model",
+            timeout=1,
+            transport=_transport,
+            minimum_items=10,
+        )
+
+
+def test_calibration_file_must_be_private(tmp_path: Path):
+    path = tmp_path / "world-readable.jsonl"
+    _write_calibration(path, ["pass"] * 10)
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-only"):
+        calibrate_grader(
+            path=path,
+            endpoint="http://127.0.0.1:11434/api/chat",
+            model="local-test-model",
+            timeout=1,
+            transport=_transport,
+        )
+
+
+def test_failed_calibration_blocks_grading_before_candidate_selection(tmp_path: Path):
+    conn = _db(tmp_path)
+    example = _store(conn, "sft", 1)
+    conn.commit()
+    path = tmp_path / "human-calibration.jsonl"
+    _write_calibration(path, ["pass", "pass"])
+    calls = 0
+
+    def disagree(endpoint, model, messages, timeout):
+        nonlocal calls
+        calls += 1
+        request = json.loads(messages[1]["content"])
+        return _grade_response(request["dataset"], "fail")
+
+    result = grade_examples(
+        conn,
+        cfg=_cfg(calibration_path=path, calibration_min_items=2),
+        transport=disagree,
+    )
+    assert result["status"] == "blocked"
+    assert result["skipped"] == "calibration_gate"
+    assert result["calibration_gate"]["passed"] is False
+    assert calls == 2
+    assert conn.execute("SELECT COUNT(*) FROM dataset_grade_runs").fetchone()[0] == 0
+    row = conn.execute(
+        "SELECT grade_score, grade_model FROM dataset_examples WHERE id = ?", (example["id"],)
+    ).fetchone()
+    assert row["grade_score"] is None and row["grade_model"] is None
+
+
+def test_passed_calibration_allows_grading(tmp_path: Path):
+    conn = _db(tmp_path)
+    _store(conn, "sft", 1)
+    conn.commit()
+    path = tmp_path / "human-calibration.jsonl"
+    _write_calibration(path, ["pass", "pass"])
+    calls = 0
+
+    def agree(endpoint, model, messages, timeout):
+        nonlocal calls
+        calls += 1
+        request = json.loads(messages[1]["content"])
+        return _grade_response(request["dataset"], "pass")
+
+    result = grade_examples(
+        conn,
+        cfg=_cfg(calibration_path=path, calibration_min_items=2),
+        transport=agree,
+    )
+    assert result["graded"] == 1
+    assert result["calibration_gate"]["passed"] is True
+    assert calls == 3
 
 
 def test_grade_view_bounds_old_context_but_preserves_target():

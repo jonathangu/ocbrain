@@ -2,10 +2,9 @@
 
 Last updated: 2026-06-25
 
-> **Historical guide.** This describes the pre-autonomy source before the
-> light/heavy autopilot, automatic safeguards, targeted judge, embeddings,
-> stallcheck, local dataset grading, eval-before-train pilot, and current MCP
-> write surfaces. It is preserved as design history. Use
+> **Historical guide.** This describes a retired pre-v1 architecture, including
+> modules and authority paths that were later extracted or removed from core.
+> It is preserved as design history, not current operating doctrine. Use
 > [`ARCHITECTURE.md`](ARCHITECTURE.md), [`AGENT_USE_GUIDE.md`](AGENT_USE_GUIDE.md),
 > [`CONTRACT.md`](CONTRACT.md), and the top-level [`README.md`](../README.md) for
 > current behavior. Statements below about human-gated routine knowledge are

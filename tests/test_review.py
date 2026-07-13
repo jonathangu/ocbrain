@@ -5,12 +5,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import ocbrain.review as review_module
+import ocbrain_ops.review as review_module
 from ocbrain.config import load_config
-from ocbrain.dataset.batching import DatasetWriteBatch
 from ocbrain.db import connect, init_db, upsert_evidence
 from ocbrain.ids import content_hash
-from ocbrain.review import review_session, review_sessions
+from ocbrain.write_batch import DatasetWriteBatch
+from ocbrain_ops.review import review_session, review_sessions
 
 
 @dataclass

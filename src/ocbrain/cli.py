@@ -3,15 +3,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from importlib.metadata import entry_points
 from pathlib import Path
 
 from ocbrain import __version__
-from ocbrain.autolabel import Signal, record_signal
-from ocbrain.autopilot import run_autopilot
-from ocbrain.config import load_config
-from ocbrain.dataset import mine_all
-from ocbrain.dataset.export import export_all
-from ocbrain.dataset.stats import dataset_stats
+from ocbrain.core_ops import (
+    backup_database,
+    database_status,
+    doctor,
+    restore_database,
+    sync_core,
+)
+from ocbrain.core_v1 import (
+    append_core_event,
+    get_core_v1_belief,
+    get_core_v1_evidence,
+    init_core_v1,
+    is_core_v1,
+    record_core_v1_evidence,
+)
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -23,13 +33,11 @@ from ocbrain.db import (
     link_knowledge_evidence,
     list_knowledge,
     mark_knowledge_stale,
-    now_iso,
     search,
     upsert_evidence,
     upsert_knowledge,
     upsert_search_index,
 )
-from ocbrain.dream import dream
 from ocbrain.egress import egress_preview
 from ocbrain.events import (
     decide_compilation,
@@ -44,18 +52,26 @@ from ocbrain.events import (
 )
 from ocbrain.fsutil import file_fingerprint, history_runtime
 from ocbrain.ids import content_hash, stable_id
-from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
-from ocbrain.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
 from ocbrain.mcp import serve
+from ocbrain.mcp_v1 import (
+    build_context_v1,
+    correct_v1,
+    decide_proposal_v1,
+    digest_v1,
+    forget_v1,
+    ingest_v1,
+    proposals_v1,
+    record_context_v1,
+    search_v1,
+)
 from ocbrain.retrieve import retrieve
-from ocbrain.safeguards import release_quarantine
 from ocbrain.scope import ScopeContext, ScopeTag, global_scope, resolve_write_scope
-from ocbrain.teacher import hosted_teacher_request
 from ocbrain.text import compact_whitespace, redact_secrets, title_from_text
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ocbrain", description="OCBrain final-spec brain")
+def _build_legacy_parser() -> argparse.ArgumentParser:
+    """Deprecated parser retained temporarily for direct v0.x function tests."""
+    parser = argparse.ArgumentParser(prog="ocbrain", description="OCBrain legacy commands")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
@@ -63,6 +79,61 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="Initialize the SQLite ledger")
     init_parser.set_defaults(func=cmd_init)
+
+    status_parser = subparsers.add_parser(
+        "status", help="Inspect core and companion state without changing the database"
+    )
+    status_parser.set_defaults(func=cmd_status)
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="Boundedly reconcile the local event projection (no hosted or scheduled work)",
+    )
+    sync_parser.add_argument("--max-events", type=int, default=1_000)
+    sync_parser.add_argument("--time-budget", type=float, default=10.0)
+    sync_parser.set_defaults(func=cmd_sync)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="Check the database and smoke a real stdio MCP subprocess"
+    )
+    doctor_parser.add_argument("--timeout", type=float, default=8.0)
+    doctor_parser.add_argument("--launcher", type=Path)
+    doctor_parser.set_defaults(func=cmd_doctor)
+
+    runtime_parser = subparsers.add_parser(
+        "runtime-check",
+        help="Run doctor plus Codex, Claude Code, and OpenClaw MCP probes",
+    )
+    runtime_parser.add_argument("--timeout", type=float, default=12.0)
+    runtime_parser.add_argument("--launcher", type=Path)
+    runtime_parser.set_defaults(func=cmd_runtime_check)
+
+    backup_parser = subparsers.add_parser(
+        "backup", help="Create a verified online SQLite backup at a fresh path"
+    )
+    backup_parser.add_argument("--output", type=Path, required=True)
+    backup_parser.add_argument("--manifest", type=Path)
+    backup_parser.set_defaults(func=cmd_backup)
+
+    restore_parser = subparsers.add_parser(
+        "restore", help="Restore a verified backup to a fresh path (never overwrite live)"
+    )
+    restore_parser.add_argument("--backup", type=Path, required=True)
+    restore_parser.add_argument("--output-db", type=Path, required=True)
+    restore_parser.add_argument("--manifest", type=Path)
+    restore_parser.set_defaults(func=cmd_restore)
+
+    migrate_parser = subparsers.add_parser(
+        "core-migrate-v1",
+        help="Plan or build an archive-first fresh v1 core database",
+    )
+    migrate_parser.add_argument("--core-db", type=Path, required=True)
+    migrate_parser.add_argument("--archive-db", type=Path, required=True)
+    migrate_parser.add_argument("--manifest", type=Path, required=True)
+    migrate_parser.add_argument(
+        "--plan", action="store_true", help="Read-only preflight; create no files"
+    )
+    migrate_parser.set_defaults(func=cmd_core_migrate_v1)
 
     evidence_parser = subparsers.add_parser("evidence", help="Append immutable evidence")
     evidence_parser.add_argument("--claim")
@@ -237,7 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     teacher_parser = subparsers.add_parser(
         "event-teacher-request",
-        help="Prepare a hosted-teacher request package without dispatch",
+        help="Prepare a hosted-teacher package when explicitly enabled (never dispatches)",
     )
     add_context_args(teacher_parser)
     teacher_parser.add_argument("--query")
@@ -364,15 +435,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     mcp_parser = subparsers.add_parser("mcp", help="Run stdio MCP server")
     mcp_parser.add_argument(
+        "--profile",
+        choices=["runtime", "admin"],
+        default="runtime",
+        help="runtime exposes the shared bridge; admin adds protected maintenance tools",
+    )
+    mcp_parser.add_argument(
         "--allow-writes",
         action="store_true",
-        help="Deprecated no-op flag retained for back-compat (spec §5.1-7)",
+        help="Deprecated alias for the admin MCP profile; enables protected mutation tools",
     )
     mcp_parser.set_defaults(func=cmd_mcp)
 
     # --- v0.2 autonomy + dataset factory (spec §8) --------------------------
     autopilot_parser = subparsers.add_parser(
-        "autopilot", help="Run the autonomy pipeline (harvest→…→dataset-export)"
+        "autopilot", help="Manually run the maintenance pipeline (never scheduled by ocbrain)"
     )
     autopilot_select = autopilot_parser.add_mutually_exclusive_group()
     autopilot_select.add_argument(
@@ -386,7 +463,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="profile",
         help=(
             "Run a named stage profile from cfg.autopilot.profiles "
-            "(e.g. 'light' every 15 min, 'heavy' hourly); embed runs after autolabel"
+            "(legacy 'light'/'heavy' names are manual only); embed runs after autolabel"
         ),
     )
     autopilot_parser.add_argument("--dry-run", action="store_true")
@@ -545,7 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     dataset_stats_parser.set_defaults(func=cmd_dataset_stats)
 
     pilot_prepare_parser = subparsers.add_parser(
-        "dataset-pilot-prepare", help="Build the eval-first local fine-tune pilot pack"
+        "dataset-pilot-prepare",
+        help="Build the eval-first local fine-tune pilot pack when explicitly enabled",
     )
     pilot_prepare_parser.add_argument("--output-dir", type=Path)
     pilot_prepare_parser.add_argument("--min-grade", type=float)
@@ -645,9 +723,235 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Build the core-only v1 CLI parser.
+
+    Training and operations commands are exact-name lazy entry points handled
+    before parsing; they never become imports or apparent core subcommands.
+    """
+    parser = argparse.ArgumentParser(
+        prog="ocbrain",
+        description="Local shared-context bridge for Codex, Claude Code, and OpenClaw",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    parser.add_argument("--pretty", action="store_true")
+    commands = parser.add_subparsers(dest="command")
+
+    commands.add_parser("init", help="Initialize a fresh event-authoritative v1 core").set_defaults(
+        func=cmd_init
+    )
+    commands.add_parser("status", help="Inspect core health without changing it").set_defaults(
+        func=cmd_status
+    )
+    sync = commands.add_parser("sync", help="Boundedly reconcile local core projections")
+    sync.add_argument("--max-events", type=int, default=1_000)
+    sync.add_argument("--time-budget", type=float, default=10.0)
+    sync.set_defaults(func=cmd_sync)
+
+    doctor_parser = commands.add_parser("doctor", help="Check the core and stdio MCP")
+    doctor_parser.add_argument("--timeout", type=float, default=8.0)
+    doctor_parser.add_argument("--launcher", type=Path)
+    doctor_parser.set_defaults(func=cmd_doctor)
+    runtime = commands.add_parser("runtime-check", help="Probe all three client integrations")
+    runtime.add_argument("--timeout", type=float, default=12.0)
+    runtime.add_argument("--launcher", type=Path)
+    runtime.set_defaults(func=cmd_runtime_check)
+
+    backup = commands.add_parser("backup", help="Create a verified online SQLite backup")
+    backup.add_argument("--output", type=Path, required=True)
+    backup.add_argument("--manifest", type=Path)
+    backup.set_defaults(func=cmd_backup)
+    restore = commands.add_parser("restore", help="Restore a backup to a fresh path")
+    restore.add_argument("--backup", type=Path, required=True)
+    restore.add_argument("--output-db", type=Path, required=True)
+    restore.add_argument("--manifest", type=Path)
+    restore.set_defaults(func=cmd_restore)
+    migrate = commands.add_parser("core-migrate-v1", help="Build archive-first v1 outputs")
+    migrate.add_argument("--core-db", type=Path, required=True)
+    migrate.add_argument("--archive-db", type=Path, required=True)
+    migrate.add_argument("--manifest", type=Path, required=True)
+    migrate.add_argument("--training-db", type=Path)
+    migrate.add_argument("--ops-db", type=Path)
+    migrate.add_argument("--plan", action="store_true")
+    migrate.set_defaults(func=cmd_core_migrate_v1)
+
+    evidence = commands.add_parser("evidence", help="Append source-backed evidence")
+    evidence.add_argument("--claim")
+    evidence.add_argument("--input", type=Path)
+    evidence.add_argument("--source-type", default="closeout")
+    evidence.add_argument("--source-runtime")
+    evidence.add_argument("--source-uri")
+    evidence.add_argument("--artifact-uri")
+    evidence.add_argument("--artifact-hash")
+    evidence.add_argument("--verifier-status", default="unknown")
+    evidence.add_argument("--project")
+    evidence.add_argument("--privacy-scope", default="workspace")
+    evidence.set_defaults(func=cmd_evidence)
+
+    knowledge = commands.add_parser("knowledge", help="List compatibility knowledge rows")
+    knowledge.add_argument("--status")
+    knowledge.add_argument("--type")
+    knowledge.add_argument("--include-private", action="store_true")
+    knowledge.add_argument("--limit", type=int, default=20)
+    knowledge.set_defaults(func=cmd_knowledge)
+    value = commands.add_parser("value", help="Upsert one typed compatibility value")
+    value.add_argument("--subject", required=True)
+    value.add_argument("--predicate", required=True)
+    typed = value.add_mutually_exclusive_group(required=True)
+    typed.add_argument("--text")
+    typed.add_argument("--number", type=float)
+    typed.add_argument("--bool", choices=["true", "false"])
+    value.add_argument("--unit")
+    value.add_argument("--target-value", type=float)
+    value.add_argument("--status", default="candidate")
+    value.add_argument("--inject", action="store_true")
+    value.add_argument("--confidence", type=float)
+    value.add_argument("--project")
+    value.add_argument("--privacy-scope", default="workspace")
+    value.set_defaults(func=cmd_value)
+    search_parser = commands.add_parser("search", help="Search scoped brain objects")
+    search_parser.add_argument("query")
+    search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--include-private", action="store_true")
+    search_parser.add_argument("--project")
+    search_parser.add_argument("--type")
+    search_parser.add_argument("--status")
+    search_parser.add_argument("--loop-id")
+    search_parser.add_argument("--family")
+    search_parser.set_defaults(func=cmd_search)
+
+    preview = commands.add_parser("preview", help="Preview a stable shared-context retrieval")
+    preview.add_argument("query")
+    add_context_args(preview)
+    preview.add_argument("--limit", type=int, default=12)
+    preview.add_argument("--cross-scope", action="store_true")
+    preview.add_argument("--at-ts")
+    preview.set_defaults(func=cmd_preview)
+
+    ingest = commands.add_parser("event-ingest", help="Append scoped event evidence")
+    ingest.add_argument("--body", required=True)
+    ingest.add_argument("--kind", default="observation")
+    ingest.add_argument("--writer", default="ocbrain")
+    ingest.add_argument("--artifact-ref")
+    add_context_args(ingest)
+    ingest.add_argument("--global-doctrine", action="store_true")
+    ingest.set_defaults(func=cmd_event_ingest)
+    compile_parser = commands.add_parser("event-compile", help="Propose a compiled belief")
+    compile_parser.add_argument("--belief-id", required=True)
+    compile_parser.add_argument("--body", required=True)
+    compile_parser.add_argument("--evidence-id", action="append", default=[])
+    compile_parser.add_argument("--confidence", type=float)
+    compile_parser.add_argument("--reward-band", choices=["discard", "weak", "moderate", "strong"])
+    compile_parser.add_argument("--approve", action="store_true")
+    add_context_args(compile_parser)
+    compile_parser.add_argument("--global-doctrine", action="store_true")
+    compile_parser.set_defaults(func=cmd_event_compile)
+    correct = commands.add_parser("event-correct", help="Append a durable correction")
+    correct.add_argument(
+        "--target-layer",
+        choices=["evidence", "knowledge", "belief"],
+        required=True,
+    )
+    correct.add_argument("--target-id", required=True)
+    correct.add_argument(
+        "--op",
+        choices=["mark_wrong", "edit", "pin", "demote", "reframe", "retract"],
+        required=True,
+    )
+    correct.add_argument("--body")
+    correct.add_argument("--author", default="human:jonathan")
+    correct.add_argument("--hard", action="store_true")
+    correct.set_defaults(func=cmd_event_correct)
+    forget = commands.add_parser("event-forget", help="Append a tombstone")
+    forget.add_argument("--target", required=True)
+    forget.add_argument("--mode", choices=["soft", "shred"], default="soft")
+    forget.add_argument("--reason")
+    forget.add_argument("--approved-by", default="human:jonathan")
+    forget.set_defaults(func=cmd_event_forget)
+    proposals = commands.add_parser("event-proposals", help="List compilation proposals")
+    add_context_args(proposals)
+    proposals.add_argument("--include-decided", action="store_true")
+    proposals.add_argument("--limit", type=int, default=50)
+    proposals.set_defaults(func=cmd_event_proposals)
+    decide = commands.add_parser("event-decide", help="Gate one compilation proposal")
+    decide.add_argument("--proposal-event-id", required=True)
+    decide.add_argument(
+        "--decision",
+        choices=["approve", "reject", "edit", "shadow"],
+        required=True,
+    )
+    decide.add_argument("--actor", default="human:jonathan")
+    decide.add_argument("--edited-body")
+    decide.add_argument("--reason")
+    decide.set_defaults(func=cmd_event_decide)
+    event_digest = commands.add_parser("event-digest", help="Show scoped current event state")
+    add_context_args(event_digest)
+    event_digest.add_argument("--since-ts")
+    event_digest.add_argument("--limit", type=int, default=20)
+    event_digest.set_defaults(func=cmd_event_digest)
+    egress = commands.add_parser("egress-preview", help="Preview scope-filtered egress")
+    egress.add_argument("--target", default="hosted_teacher")
+    egress.add_argument("--query")
+    egress.add_argument("--record", action="store_true")
+    add_context_args(egress)
+    egress.set_defaults(func=cmd_egress_preview)
+
+    backfill = commands.add_parser("event-backfill", help="Explicitly backfill legacy rows")
+    backfill.add_argument("--limit", type=int, default=100)
+    backfill.add_argument("--sample-limit", type=int, default=100)
+    backfill.add_argument("--all", action="store_true")
+    backfill.add_argument("--project")
+    backfill.add_argument("--type")
+    backfill.add_argument("--dry-run", action="store_true")
+    backfill.set_defaults(func=cmd_event_backfill)
+
+    import_memory = commands.add_parser(
+        "import-memory",
+        help="Import markdown sources into the local core",
+    )
+    import_memory.add_argument("paths", nargs="+", type=Path)
+    import_memory.add_argument("--project", default="workspace")
+    import_memory.add_argument("--privacy-scope", default="workspace")
+    import_memory.add_argument("--limit", type=int)
+    import_memory.add_argument("--max-bytes", type=int, default=50_000)
+    import_memory.set_defaults(func=cmd_import_memory)
+
+    import_history = commands.add_parser(
+        "import-history",
+        help="Import runtime transcript sources into the local core",
+    )
+    import_history.add_argument("paths", nargs="*", type=Path)
+    import_history.add_argument("--manifest", action="append", type=Path, default=[])
+    import_history.add_argument("--project", default="workspace")
+    import_history.add_argument("--privacy-scope", default="workspace")
+    import_history.add_argument("--limit", type=int)
+    import_history.add_argument("--max-bytes", type=int, default=20_000)
+    import_history.add_argument("--batch-size", type=int, default=500)
+    import_history.set_defaults(func=cmd_import_history)
+
+    digest = commands.add_parser("digest", help="Show current scoped knowledge")
+    digest.add_argument("--project")
+    digest.add_argument("--limit", type=int, default=12)
+    digest.add_argument("--include-private", action="store_true")
+    digest.set_defaults(func=cmd_digest)
+    mcp_parser = commands.add_parser("mcp", help="Run the core stdio MCP server")
+    mcp_parser.add_argument("--profile", choices=["runtime", "admin"], default="runtime")
+    mcp_parser.add_argument(
+        "--allow-writes",
+        action="store_true",
+        help="deprecated alias for --profile admin",
+    )
+    mcp_parser.set_defaults(func=cmd_mcp)
+    parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
-    if argv is None and Path(sys.argv[0]).name == "brain-loop-ingest":
-        argv = ["loop-ingest", *sys.argv[1:]]
+    argv = list(sys.argv[1:] if argv is None else argv)
+    extension_result = dispatch_companion_command(argv)
+    if extension_result is not None:
+        return extension_result
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.input and args.command is None:
@@ -657,6 +961,102 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     return args.func(args)
+
+
+COMPANION_COMMANDS: dict[str, str] = {
+    "autopilot": "ocbrain-ops",
+    "quarantine": "ocbrain-ops",
+    "label": "ocbrain-ops",
+    "loop-ingest": "ocbrain-ops",
+    "prune": "ocbrain-ops",
+    "heal": "ocbrain-ops",
+    "liveness-check": "ocbrain-ops",
+    "event-dream": "ocbrain-ops",
+    "event-teacher-request": "ocbrain-ops",
+    "retrieval-feedback-stats": "ocbrain-ops",
+    "public-safety-check": "ocbrain-ops",
+    "install-hooks": "ocbrain-ops",
+    "dataset-mine": "ocbrain-training",
+    "dataset-persona-curate": "ocbrain-training",
+    "dataset-calibration-import": "ocbrain-training",
+    "dataset-grade": "ocbrain-training",
+    "dataset-classify": "ocbrain-training",
+    "dataset-pack-select": "ocbrain-training",
+    "dataset-pack-finalize": "ocbrain-training",
+    "dataset-pack-stats": "ocbrain-training",
+    "dataset-export": "ocbrain-training",
+    "dataset-stats": "ocbrain-training",
+    "dataset-pilot-prepare": "ocbrain-training",
+    "dataset-pilot-blind": "ocbrain-training",
+    "dataset-pilot-score": "ocbrain-training",
+    "dataset-pilot-multiblind": "ocbrain-training",
+    "dataset-pilot-multiscore": "ocbrain-training",
+    "dataset-pilot-record-training": "ocbrain-training",
+    "retrieval-benchmark": "ocbrain-training",
+    "retrieval-benchmark-expand": "ocbrain-training",
+}
+
+
+def _command_position(argv: list[str]) -> int | None:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--db"}:
+            index += 2
+            continue
+        if token in {"--pretty"}:
+            index += 1
+            continue
+        if token.startswith("-"):
+            return None
+        return index
+    return None
+
+
+def dispatch_companion_command(argv: list[str]) -> int | None:
+    """Load only the exact optional command selected by the operator."""
+    position = _command_position(argv)
+    if position is None:
+        return None
+    command = argv[position]
+    package = COMPANION_COMMANDS.get(command)
+    if package is None:
+        return None
+    db: Path | None = None
+    pretty = "--pretty" in argv[:position]
+    if "--db" in argv[:position]:
+        db_index = argv.index("--db")
+        if db_index + 1 < position:
+            db = Path(argv[db_index + 1])
+    matches = [
+        item for item in entry_points(group="ocbrain.commands.v1") if item.name == command
+    ]
+    if len(matches) > 1:
+        print(
+            json.dumps(
+                {
+                    "action": command,
+                    "status": "blocked",
+                    "error": "multiple companion providers registered",
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+    if not matches:
+        print(
+            json.dumps(
+                {
+                    "action": command,
+                    "status": "blocked",
+                    "reason": "optional_companion_not_installed",
+                    "install": f"pip install {package}",
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
+    return int(matches[0].load()(argv=argv[position:], db=db, pretty=pretty))
 
 
 def output(args: argparse.Namespace, payload) -> None:
@@ -683,15 +1083,181 @@ def context_from_args(args: argparse.Namespace) -> ScopeContext:
     )
 
 
+def scope_for_privacy(project: str | None, privacy_scope: str) -> ScopeTag:
+    if privacy_scope == "public":
+        return global_scope()
+    base = resolve_write_scope(ScopeContext(project=project))
+    if privacy_scope == "private":
+        return ScopeTag(
+            base.scope_type,
+            base.scope_id,
+            visibility="confidential",
+            egress_policy="prohibited",
+            provenance="explicit",
+        )
+    return ScopeTag(
+        base.scope_type,
+        base.scope_id,
+        visibility="internal",
+        egress_policy="local_only",
+        provenance="explicit",
+    )
+
+
 def open_db(args: argparse.Namespace):
     conn = connect(args.db)
-    init_db(conn)
+    if is_core_v1(conn):
+        return conn
+    has_tables = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+    if has_tables:
+        init_db(conn)
+    else:
+        init_core_v1(conn)
     return conn
 
 
+def v1_counts(conn) -> dict[str, int]:
+    result = {
+        name: int(conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
+        for name in ("brain_events", "evidence_objects", "current_beliefs", "retrieval_uses")
+    }
+    # Stable output aliases ease automation migration without recreating the
+    # retired relational tables inside the v1 database.
+    result["evidence"] = result["evidence_objects"]
+    result["knowledge"] = result["current_beliefs"]
+    return result
+
+
+def compatibility_refusal(args: argparse.Namespace, command: str, detail: str) -> int:
+    output(
+        args,
+        {
+            "action": command,
+            "status": "blocked",
+            "reason": "legacy_compatibility_command_on_v1_core",
+            "detail": detail,
+        },
+    )
+    return 2
+
+
 def cmd_init(args: argparse.Namespace) -> int:
-    conn = open_db(args)
-    output(args, {"db": str(args.db), "counts": counts(conn)})
+    existed = args.db.expanduser().exists()
+    conn = connect(args.db)
+    has_tables = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
+    if not existed or not has_tables:
+        init_core_v1(conn)
+    elif is_core_v1(conn):
+        pass
+    else:
+        # Existing v0.x ledgers keep their compatibility schema. Migration to
+        # v1 remains an explicit archive-first command and never happens here.
+        init_db(conn)
+    if is_core_v1(conn):
+        conn.commit()
+        payload = {"db": str(args.db), "core": "v1", "database": database_status(args.db)}
+    else:
+        payload = {"db": str(args.db), "core": "legacy", "counts": counts(conn)}
+    output(args, payload)
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    result = database_status(args.db)
+    output(
+        args,
+        {
+            "action": "status",
+            "database": result,
+            "operating_model": {
+                "core": "explicit one-shot commands plus stdio MCP",
+                "training": "optional manual companion (`ocbrain-training`)",
+                "watchdog": "optional manual companion (`ocbrain-watchdog`)",
+                "scheduler_installed_by_core": False,
+            },
+        },
+    )
+    return 0 if result.get("healthy") else 1
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    result = sync_core(
+        args.db,
+        max_events=args.max_events,
+        time_budget_seconds=args.time_budget,
+    )
+    output(args, result)
+    return 0 if result["status"] == "ok" else 3
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    result = doctor(
+        args.db,
+        timeout_seconds=args.timeout,
+        launcher=args.launcher,
+        check_clients=False,
+    )
+    output(args, result)
+    return 0 if result["healthy"] else 1
+
+
+def cmd_runtime_check(args: argparse.Namespace) -> int:
+    result = doctor(
+        args.db,
+        timeout_seconds=args.timeout,
+        launcher=args.launcher,
+        check_clients=True,
+    )
+    output(args, result)
+    return 0 if result["healthy"] else 1
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    result = backup_database(args.db, args.output, manifest=args.manifest)
+    output(args, {"action": "backup", "status": "verified"} | result)
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    result = restore_database(args.backup, args.output_db, manifest=args.manifest)
+    output(args, {"action": "restore", "status": "verified"} | result)
+    return 0
+
+
+def cmd_core_migrate_v1(args: argparse.Namespace) -> int:
+    from ocbrain.v1_migration import migrate_core_v1, migration_plan
+
+    if args.plan:
+        result = migration_plan(
+            args.db,
+            args.core_db,
+            args.archive_db,
+            args.manifest,
+            training=args.training_db,
+            ops=args.ops_db,
+        )
+        output(args, result)
+        return 0 if result["ready"] else 2
+    result = migrate_core_v1(
+        args.db,
+        args.core_db,
+        args.archive_db,
+        args.manifest,
+        training=args.training_db,
+        ops=args.ops_db,
+    )
+    output(args, result)
     return 0
 
 
@@ -699,6 +1265,28 @@ def cmd_evidence(args: argparse.Namespace) -> int:
     conn = open_db(args)
     claim, raw = evidence_claim(args)
     source_uri = args.source_uri or (str(args.input) if args.input else None)
+    if is_core_v1(conn):
+        scope = scope_for_privacy(args.project, args.privacy_scope)
+        body = redact_secrets(raw if args.input else claim)
+        evidence_id, event_id = record_core_v1_evidence(
+            conn,
+            body=body,
+            kind=args.source_type,
+            scope=scope,
+            writer=args.source_runtime or "ocbrain-cli",
+            artifact_ref=args.artifact_uri or source_uri,
+        )
+        conn.commit()
+        output(
+            args,
+            {
+                "event_id": event_id,
+                "evidence_id": evidence_id,
+                "scope": scope.to_dict(),
+                "counts": v1_counts(conn),
+            },
+        )
+        return 0
     evidence_id = upsert_evidence(
         conn,
         source_type=args.source_type,
@@ -728,6 +1316,31 @@ def evidence_claim(args: argparse.Namespace) -> tuple[str, str]:
 
 def cmd_knowledge(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        clauses: list[str] = []
+        params: list[object] = []
+        if args.status:
+            clauses.append("status=?")
+            params.append(args.status)
+        if args.type:
+            clauses.append("belief_type=?")
+            params.append(args.type)
+        if not args.include_private:
+            clauses.append("visibility NOT IN ('confidential','secret')")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = conn.execute(
+            f"SELECT * FROM current_beliefs {where} "  # noqa: S608 - local fixed clauses
+            "ORDER BY pinned DESC, last_compiled_at DESC, belief_id LIMIT ?",
+            (*params, args.limit),
+        )
+        output(
+            args,
+            {
+                "schema_version": "ocbrain.knowledge.v1",
+                "knowledge": [dict(row) for row in rows],
+            },
+        )
+        return 0
     scopes = None if args.include_private else PUBLIC_SCOPES
     rows = [
         dict(row)
@@ -748,6 +1361,64 @@ def cmd_value(args: argparse.Namespace) -> int:
     value_bool = None
     if args.bool is not None:
         value_bool = args.bool == "true"
+    if is_core_v1(conn):
+        value = args.text
+        if args.number is not None:
+            value = str(args.number)
+        elif value_bool is not None:
+            value = str(value_bool).lower()
+        rendered = " ".join(
+            part for part in (args.subject, args.predicate, value, args.unit) if part is not None
+        )
+        scope = scope_for_privacy(args.project, args.privacy_scope)
+        evidence_id, evidence_event_id = record_core_v1_evidence(
+            conn,
+            body=rendered,
+            kind="typed_value",
+            scope=scope,
+            writer="ocbrain-cli",
+        )
+        belief_id = stable_id("belief", "value", args.subject, args.predicate, scope.scope_id)
+        proposal_id = append_core_event(
+            conn,
+            "compilation_proposed",
+            {
+                "schema_version": "ocbrain.compilation.v1",
+                "subject": {"kind": "belief", "id": belief_id},
+                "belief_id": belief_id,
+                "body": rendered,
+                "evidence_ids": [evidence_id],
+                "scope": scope.to_dict(),
+                "confidence": args.confidence,
+                "reward_band": None,
+            },
+            writer="ocbrain-cli",
+        )
+        decision = None
+        if args.status == "current" or args.inject:
+            decision = decide_proposal_v1(
+                conn,
+                proposal_event_id=proposal_id,
+                decision="approve",
+                actor="ocbrain-cli",
+                edited_body=None,
+                reason="explicit current/inject value command",
+            )
+        conn.commit()
+        output(
+            args,
+            {
+                "belief_id": belief_id,
+                "evidence_id": evidence_id,
+                "evidence_event_id": evidence_event_id,
+                "proposal_event_id": proposal_id,
+                "decision_event_id": decision["event_id"] if decision else None,
+                "status": "current" if decision else "candidate",
+                "scope": scope.to_dict(),
+                "counts": v1_counts(conn),
+            },
+        )
+        return 0
     knowledge_id = upsert_knowledge(
         conn,
         knowledge_type="value",
@@ -784,6 +1455,17 @@ def cmd_value(args: argparse.Namespace) -> int:
 
 def cmd_search(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        result = search_v1(
+            conn,
+            args.query,
+            context=ScopeContext(project=args.project, runtime="cli"),
+            limit=args.limit,
+            cross_scope=args.include_private,
+        )
+        conn.commit()
+        output(args, result)
+        return 0
     scopes = None if args.include_private else PUBLIC_SCOPES
     filters = {
         key: value
@@ -805,6 +1487,27 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_preview(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        if args.at_ts:
+            return compatibility_refusal(
+                args,
+                "preview",
+                "historical folding is not exposed by the v1 shared-context packet",
+            )
+        context = context_from_args(args)
+        packet, handles = build_context_v1(
+            conn,
+            args.query,
+            context=context,
+            limit=args.limit,
+            cross_scope=args.cross_scope,
+        )
+        retrieval_id = record_context_v1(conn, packet, handles, context=context)
+        packet["retrieval_use_id"] = retrieval_id
+        packet["retrieval_use_status"] = "recorded"
+        conn.commit()
+        output(args, packet)
+        return 0
     output(
         args,
         retrieve(
@@ -822,6 +1525,31 @@ def cmd_preview(args: argparse.Namespace) -> int:
 def cmd_event_ingest(args: argparse.Namespace) -> int:
     conn = open_db(args)
     scope = global_scope() if args.global_doctrine else resolve_write_scope(context_from_args(args))
+    if is_core_v1(conn):
+        if args.global_doctrine:
+            evidence_id, event_id = record_core_v1_evidence(
+                conn,
+                body=args.body,
+                kind=args.kind,
+                scope=scope,
+                writer=args.writer,
+                session_id=args.session,
+                artifact_ref=args.artifact_ref,
+            )
+            result = {"event_id": event_id, "evidence_id": evidence_id, "kind": args.kind}
+        else:
+            result = ingest_v1(
+                conn,
+                body=args.body,
+                kind=args.kind,
+                context=context_from_args(args),
+                writer=args.writer,
+                session_id=args.session,
+                artifact_ref=args.artifact_ref,
+            )
+        conn.commit()
+        output(args, result | {"scope": scope.to_dict(), "counts": v1_counts(conn)})
+        return 0
     event_id = record_evidence(
         conn,
         body=args.body,
@@ -840,6 +1568,44 @@ def cmd_event_ingest(args: argparse.Namespace) -> int:
 def cmd_event_compile(args: argparse.Namespace) -> int:
     conn = open_db(args)
     scope = global_scope() if args.global_doctrine else resolve_write_scope(context_from_args(args))
+    if is_core_v1(conn):
+        proposal_id = append_core_event(
+            conn,
+            "compilation_proposed",
+            {
+                "schema_version": "ocbrain.compilation.v1",
+                "subject": {"kind": "belief", "id": args.belief_id},
+                "belief_id": args.belief_id,
+                "body": args.body,
+                "evidence_ids": args.evidence_id,
+                "scope": scope.to_dict(),
+                "confidence": args.confidence,
+                "reward_band": args.reward_band,
+            },
+            writer="ocbrain-cli",
+            session_id=args.session,
+        )
+        decision = None
+        if args.approve:
+            decision = decide_proposal_v1(
+                conn,
+                proposal_event_id=proposal_id,
+                decision="approve",
+                actor="ocbrain-cli",
+                edited_body=None,
+                reason="explicit --approve",
+            )
+        conn.commit()
+        output(
+            args,
+            {
+                "proposal_event_id": proposal_id,
+                "decision_event_id": decision["event_id"] if decision else None,
+                "scope": scope.to_dict(),
+                "counts": v1_counts(conn),
+            },
+        )
+        return 0
     proposal_id = propose_compilation(
         conn,
         belief_id=args.belief_id,
@@ -870,6 +1636,19 @@ def cmd_event_compile(args: argparse.Namespace) -> int:
 
 def cmd_event_correct(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        result = correct_v1(
+            conn,
+            layer=args.target_layer,
+            target=args.target_id,
+            op=args.op,
+            body=args.body,
+            actor=args.author,
+            hard=args.hard,
+        )
+        conn.commit()
+        output(args, result | {"counts": v1_counts(conn)})
+        return 0
     event_id = record_correction(
         conn,
         target_layer=args.target_layer,
@@ -886,6 +1665,17 @@ def cmd_event_correct(args: argparse.Namespace) -> int:
 
 def cmd_event_forget(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        result = forget_v1(
+            conn,
+            target=args.target,
+            mode=args.mode,
+            reason=args.reason,
+            actor=args.approved_by,
+        )
+        conn.commit()
+        output(args, result | {"counts": v1_counts(conn)})
+        return 0
     event_id = record_tombstone(
         conn,
         target=args.target,
@@ -899,6 +1689,8 @@ def cmd_event_forget(args: argparse.Namespace) -> int:
 
 
 def cmd_event_dream(args: argparse.Namespace) -> int:
+    from ocbrain_ops.dream import dream
+
     conn = open_db(args)
     result = dream(
         conn,
@@ -915,6 +1707,16 @@ def cmd_event_dream(args: argparse.Namespace) -> int:
 
 def cmd_event_proposals(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        output(
+            args,
+            proposals_v1(
+                conn,
+                limit=args.limit,
+                include_decided=args.include_decided,
+            ),
+        )
+        return 0
     context = context_from_args(args)
     proposals = list_compilation_proposals(
         conn,
@@ -928,6 +1730,18 @@ def cmd_event_proposals(args: argparse.Namespace) -> int:
 
 def cmd_event_decide(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        result = decide_proposal_v1(
+            conn,
+            proposal_event_id=args.proposal_event_id,
+            decision=args.decision,
+            actor=args.actor,
+            edited_body=args.edited_body,
+            reason=args.reason,
+        )
+        conn.commit()
+        output(args, result | {"counts": v1_counts(conn)})
+        return 0
     event_id = decide_compilation(
         conn,
         proposal_event_id=args.proposal_event_id,
@@ -943,6 +1757,21 @@ def cmd_event_decide(args: argparse.Namespace) -> int:
 
 def cmd_event_digest(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        if args.since_ts:
+            return compatibility_refusal(
+                args,
+                "event-digest",
+                "the v1 CLI digest currently exposes current projected state only",
+            )
+        result = digest_v1(conn, context=context_from_args(args), limit=args.limit)
+        result["proposals"] = proposals_v1(
+            conn,
+            limit=args.limit,
+            include_decided=False,
+        )["proposals"]
+        output(args, result)
+        return 0
     output(
         args,
         event_core_digest(
@@ -971,6 +1800,23 @@ def cmd_egress_preview(args: argparse.Namespace) -> int:
 
 
 def cmd_event_teacher_request(args: argparse.Namespace) -> int:
+    from ocbrain.config import load_config
+    from ocbrain_ops.teacher import hosted_teacher_request
+
+    cfg = load_config()
+    if not cfg.teacher.enabled:
+        output(
+            args,
+            {
+                "action": "event-teacher-request",
+                "call_performed": False,
+                "changed": 0,
+                "dispatch_state": "disabled",
+                "reason": "hosted_teacher_disabled_by_default",
+                "status": "blocked",
+            },
+        )
+        return 2
     conn = open_db(args)
     result = hosted_teacher_request(
         conn,
@@ -989,6 +1835,13 @@ def cmd_event_teacher_request(args: argparse.Namespace) -> int:
 
 def cmd_event_backfill(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        return compatibility_refusal(
+            args,
+            "event-backfill",
+            "a v1 core has no in-place legacy relational rows; use core-migrate-v1 "
+            "from the v0.x source",
+        )
     conn.execute("PRAGMA synchronous=OFF")
     conn.execute("PRAGMA temp_store=MEMORY")
     rebuild_projection(conn)
@@ -1013,7 +1866,7 @@ def cmd_event_backfill(args: argparse.Namespace) -> int:
             },
         )
         return 0
-    imported: list[dict[str, str]] = []
+    imported: list[dict[str, object]] = []
     skipped: list[dict[str, str]] = []
     for row, plan_item in zip(rows, planned, strict=True):
         belief_id = f"legacy:{row['id']}"
@@ -1236,13 +2089,22 @@ def cmd_import_memory(args: argparse.Namespace) -> int:
     skipped: list[dict[str, str]] = []
     for path in files:
         try:
-            result = import_memory_file(
-                conn,
-                path,
-                project=args.project,
-                privacy_scope=args.privacy_scope,
-                max_bytes=args.max_bytes,
-            )
+            if is_core_v1(conn):
+                result = import_memory_file_v1(
+                    conn,
+                    path,
+                    project=args.project,
+                    privacy_scope=args.privacy_scope,
+                    max_bytes=args.max_bytes,
+                )
+            else:
+                result = import_memory_file(
+                    conn,
+                    path,
+                    project=args.project,
+                    privacy_scope=args.privacy_scope,
+                    max_bytes=args.max_bytes,
+                )
         except OSError as exc:
             skipped.append({"path": str(path), "reason": str(exc)})
             continue
@@ -1251,15 +2113,14 @@ def cmd_import_memory(args: argparse.Namespace) -> int:
         else:
             imported.append(result)
     conn.commit()
-    output(
-        args,
-        {
-            "imported": len(imported),
-            "skipped": skipped,
-            "files": imported,
-            "counts": counts(conn),
-        },
-    )
+    payload = {
+        "imported": sum(1 for item in imported if item.get("changed", True)),
+        "existing": sum(1 for item in imported if item.get("changed") is False),
+        "skipped": skipped,
+        "files": imported,
+        "counts": v1_counts(conn) if is_core_v1(conn) else counts(conn),
+    }
+    output(args, payload)
     return 0
 
 
@@ -1273,7 +2134,7 @@ def cmd_import_history(args: argparse.Namespace) -> int:
         raise ValueError("pass at least one history path or --manifest")
     if args.limit is not None:
         files = files[: args.limit]
-    existing_sources = imported_history_sources(conn)
+    existing_sources = set() if is_core_v1(conn) else imported_history_sources(conn)
     current_fingerprints = current_history_fingerprints(conn)
     imported = 0
     existing = 0
@@ -1288,20 +2149,32 @@ def cmd_import_history(args: argparse.Namespace) -> int:
             existing += 1
             continue
         try:
-            result = import_history_file(
-                conn,
-                path,
-                project=args.project,
-                privacy_scope=args.privacy_scope,
-                max_bytes=args.max_bytes,
-            )
+            if is_core_v1(conn):
+                result = import_history_file_v1(
+                    conn,
+                    path,
+                    project=args.project,
+                    privacy_scope=args.privacy_scope,
+                    max_bytes=args.max_bytes,
+                )
+            else:
+                result = import_history_file(
+                    conn,
+                    path,
+                    project=args.project,
+                    privacy_scope=args.privacy_scope,
+                    max_bytes=args.max_bytes,
+                )
         except (OSError, UnicodeError, ValueError) as exc:
             skipped.append({"path": str(path), "reason": str(exc)})
             continue
         if result is None:
             skipped.append({"path": str(path), "reason": "empty"})
             continue
-        imported += 1
+        if result.get("changed", True):
+            imported += 1
+        else:
+            existing += 1
         by_runtime[result["runtime"]] = by_runtime.get(result["runtime"], 0) + 1
         if len(samples) < 20:
             samples.append(result)
@@ -1319,7 +2192,7 @@ def cmd_import_history(args: argparse.Namespace) -> int:
             "sample_files": samples,
             "skipped_count": len(skipped),
             "skipped": skipped[:50],
-            "counts": counts(conn),
+            "counts": v1_counts(conn) if is_core_v1(conn) else counts(conn),
         },
     )
     return 0
@@ -1374,6 +2247,137 @@ def history_files(paths: list[Path], *, manifests: list[Path] | None = None) -> 
 def is_history_file(path: Path) -> bool:
     name = path.name.lower()
     return any(name.endswith(suffix) for suffix in HISTORY_SUFFIXES)
+
+
+def import_memory_file_v1(
+    conn,
+    path: Path,
+    *,
+    project: str | None,
+    privacy_scope: str,
+    max_bytes: int,
+) -> dict[str, object] | None:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    if not raw.strip():
+        return None
+    truncated = raw.encode("utf-8", errors="replace")[:max_bytes].decode(
+        "utf-8", errors="replace"
+    )
+    text = redact_secrets(truncated)
+    return import_source_v1(
+        conn,
+        path=path,
+        text=text,
+        title=title_from_text(text, path.stem),
+        source_type="memory_file",
+        runtime="openclaw",
+        project=project,
+        privacy_scope=privacy_scope,
+        confidence=0.7,
+    )
+
+
+def import_history_file_v1(
+    conn,
+    path: Path,
+    *,
+    project: str | None,
+    privacy_scope: str,
+    max_bytes: int,
+) -> dict[str, object] | None:
+    if path.stat().st_size == 0:
+        return None
+    runtime = history_runtime(path)
+    text = redact_secrets(history_text_window(path, max_bytes=max_bytes))
+    return import_source_v1(
+        conn,
+        path=path,
+        text=text,
+        title=history_title(path, runtime),
+        source_type=f"{runtime}_history_file",
+        runtime=runtime,
+        project=project,
+        privacy_scope=privacy_scope,
+        confidence=0.55,
+    )
+
+
+def import_source_v1(
+    conn,
+    *,
+    path: Path,
+    text: str,
+    title: str,
+    source_type: str,
+    runtime: str,
+    project: str | None,
+    privacy_scope: str,
+    confidence: float,
+) -> dict[str, object]:
+    source_uri = str(path.resolve())
+    scope = scope_for_privacy(project, privacy_scope)
+    evidence_id = stable_id("evd", text, source_type, source_uri, scope.scope_id)
+    evidence_event_id = None
+    if get_core_v1_evidence(conn, evidence_id) is None:
+        evidence_id, evidence_event_id = record_core_v1_evidence(
+            conn,
+            body=text,
+            kind=source_type,
+            scope=scope,
+            writer=f"ocbrain-import:{runtime}",
+            artifact_ref=source_uri,
+        )
+
+    belief_id = stable_id("belief", "source", source_type, source_uri)
+    belief_body = f"{title}\n\n{text}".strip()
+    existing = get_core_v1_belief(conn, belief_id)
+    unchanged = bool(
+        existing
+        and existing.get("body") == belief_body
+        and evidence_id in existing.get("evidence_ids", [])
+        and existing.get("scope") == scope.to_dict()
+        and existing.get("status") == "current"
+        and existing.get("serve")
+    )
+    proposal_id = None
+    decision_id = None
+    if not unchanged:
+        proposal_id = append_core_event(
+            conn,
+            "compilation_proposed",
+            {
+                "schema_version": "ocbrain.compilation.v1",
+                "subject": {"kind": "belief", "id": belief_id},
+                "belief_id": belief_id,
+                "body": belief_body,
+                "evidence_ids": [evidence_id],
+                "scope": scope.to_dict(),
+                "confidence": confidence,
+                "reward_band": "moderate",
+            },
+            writer=f"ocbrain-import:{runtime}",
+        )
+        decision = decide_proposal_v1(
+            conn,
+            proposal_event_id=proposal_id,
+            decision="approve",
+            actor="ocbrain-import",
+            edited_body=None,
+            reason="explicit local source import",
+        )
+        decision_id = decision["event_id"]
+    return {
+        "path": source_uri,
+        "runtime": runtime,
+        "source_type": source_type,
+        "evidence_id": evidence_id,
+        "knowledge_id": belief_id,
+        "belief_id": belief_id,
+        "evidence_event_id": evidence_event_id,
+        "proposal_event_id": proposal_id,
+        "decision_event_id": decision_id,
+        "changed": bool(evidence_event_id or not unchanged),
+    }
 
 
 def import_memory_file(
@@ -1522,6 +2526,12 @@ def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:
     historical evidence rows.  The current knowledge row carries the fingerprint
     whose search index is active and is therefore the correct idempotency gate.
     """
+    # The strict v1 import path is already event-idempotent and intentionally
+    # has no legacy ``knowledge`` table. Returning no pre-read fingerprints
+    # lets ``import_source_v1`` make the authoritative changed/unchanged
+    # decision without querying a retired projection.
+    if is_core_v1(conn):
+        return {}
     return {
         (row["body_uri"], f'{row["doc_kind"].removesuffix("_history")}_history_file'):
         row["content_hash"]
@@ -1582,12 +2592,24 @@ def history_slug(path: Path, runtime: str) -> str:
 
 def cmd_digest(args: argparse.Namespace) -> int:
     conn = open_db(args)
+    if is_core_v1(conn):
+        output(
+            args,
+            digest_v1(
+                conn,
+                context=ScopeContext(project=args.project, runtime="cli"),
+                limit=args.limit,
+            ),
+        )
+        return 0
     scopes = None if args.include_private else PUBLIC_SCOPES
     output(args, knowledge_digest(conn, project=args.project, scopes=scopes, limit=args.limit))
     return 0
 
 
 def cmd_loop_ingest(args: argparse.Namespace) -> int:
+    from ocbrain_ops.loops import LoopIngestOptions, dry_run_loop_ingest, write_loop_ingest
+
     options = LoopIngestOptions(
         loop_id=args.loop_id,
         run_id=args.run_id,
@@ -1619,6 +2641,8 @@ def cmd_mark_stale(args: argparse.Namespace) -> int:
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
+    from ocbrain_ops.maintenance import prune_knowledge
+
     conn = open_db(args)
     result = prune_knowledge(
         conn,
@@ -1632,6 +2656,8 @@ def cmd_prune(args: argparse.Namespace) -> int:
 
 
 def cmd_heal(args: argparse.Namespace) -> int:
+    from ocbrain_ops.maintenance import heal_conflicts
+
     conn = open_db(args)
     result = heal_conflicts(conn, numeric_threshold=args.numeric_threshold)
     conn.commit()
@@ -1640,6 +2666,8 @@ def cmd_heal(args: argparse.Namespace) -> int:
 
 
 def cmd_liveness_check(args: argparse.Namespace) -> int:
+    from ocbrain_ops.maintenance import check_loop_liveness
+
     conn = open_db(args)
     result = check_loop_liveness(conn, runner_ledger=args.runner_ledger)
     conn.commit()
@@ -1648,13 +2676,16 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    return serve(args.db, allow_writes=args.allow_writes)
+    return serve(args.db, allow_writes=args.allow_writes, profile=args.profile)
 
 
 # --------------------------------------------------------------------------- #
 # v0.2 autonomy + dataset factory commands (spec §8)
 # --------------------------------------------------------------------------- #
 def cmd_autopilot(args: argparse.Namespace) -> int:
+    from ocbrain.config import load_config
+    from ocbrain_ops.autopilot import run_autopilot
+
     conn = open_db(args)
     cfg = load_config()
     result = run_autopilot(
@@ -1687,6 +2718,8 @@ def cmd_quarantine_list(args: argparse.Namespace) -> int:
 
 
 def cmd_quarantine_release(args: argparse.Namespace) -> int:
+    from ocbrain_ops.safeguards import release_quarantine
+
     conn = open_db(args)
     released = release_quarantine(conn, args.knowledge_id, actor=args.actor, reason=args.reason)
     conn.commit()
@@ -1703,6 +2736,9 @@ def cmd_quarantine_release(args: argparse.Namespace) -> int:
 
 
 def cmd_label(args: argparse.Namespace) -> int:
+    from ocbrain.db import now_iso
+    from ocbrain_ops.autolabel import Signal, record_signal
+
     conn = open_db(args)
     row = get_knowledge(conn, args.knowledge_id)
     if row is None:
@@ -1728,6 +2764,9 @@ def cmd_label(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_mine(args: argparse.Namespace) -> int:
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset import mine_all
+
     conn = open_db(args)
     cfg = load_config()
     roots = list(cfg.review.session_roots)
@@ -1736,15 +2775,15 @@ def cmd_dataset_mine(args: argparse.Namespace) -> int:
     verified_only = getattr(args, "verified_only", False)
     dataset = getattr(args, "dataset", None)
     if dataset == "sft":
-        from ocbrain.dataset.mine_sft import mine_sft
+        from ocbrain_training.dataset.mine_sft import mine_sft
 
         result = mine_sft(conn, cfg=cfg, roots=roots, limit=limit, time_budget_seconds=budget)
     elif dataset == "dpo":
-        from ocbrain.dataset.mine_dpo import mine_dpo
+        from ocbrain_training.dataset.mine_dpo import mine_dpo
 
         result = mine_dpo(conn, cfg=cfg, roots=roots, limit=limit, time_budget_seconds=budget)
     elif dataset == "persona":
-        from ocbrain.dataset.mine_persona import mine_persona
+        from ocbrain_training.dataset.mine_persona import mine_persona
 
         result = mine_persona(
             conn,
@@ -1777,7 +2816,8 @@ def cmd_dataset_mine(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_persona_curate(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.curate import import_persona_curation
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset.curate import import_persona_curation
 
     conn = open_db(args)
     result = import_persona_curation(conn, args.input, cfg=load_config())
@@ -1787,7 +2827,7 @@ def cmd_dataset_persona_curate(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_calibration_import(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.calibration import import_calibrations
+    from ocbrain_training.dataset.calibration import import_calibrations
 
     conn = open_db(args)
     result = import_calibrations(conn, args.input)
@@ -1797,6 +2837,9 @@ def cmd_dataset_calibration_import(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_export(args: argparse.Namespace) -> int:
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset.export import export_all
+
     conn = open_db(args)
     cfg = load_config()
     dataset = getattr(args, "dataset", None)
@@ -1816,7 +2859,8 @@ def cmd_dataset_export(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_grade(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.grade import grade_examples
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset.grade import grade_examples
 
     conn = open_db(args)
     cfg = load_config()
@@ -1839,7 +2883,7 @@ def cmd_dataset_grade(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_classify(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.classify import classify_examples
+    from ocbrain_training.dataset.classify import classify_examples
 
     conn = open_db(args)
     result = classify_examples(
@@ -1853,7 +2897,7 @@ def cmd_dataset_classify(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pack_select(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.selection import select_training_pack
+    from ocbrain_training.dataset.selection import select_training_pack
 
     conn = open_db(args)
     result = select_training_pack(
@@ -1867,7 +2911,7 @@ def cmd_dataset_pack_select(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pack_finalize(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.selection import finalize_training_pack
+    from ocbrain_training.dataset.selection import finalize_training_pack
 
     conn = open_db(args)
     result = finalize_training_pack(
@@ -1881,7 +2925,7 @@ def cmd_dataset_pack_finalize(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pack_stats(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.selection import selected_pack_stats
+    from ocbrain_training.dataset.selection import selected_pack_stats
 
     conn = open_db(args)
     output(args, selected_pack_stats(conn, min_grade=args.min_grade))
@@ -1889,7 +2933,7 @@ def cmd_dataset_pack_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_retrieval_feedback_stats(args: argparse.Namespace) -> int:
-    from ocbrain.feedback import feedback_coverage
+    from ocbrain_ops.feedback import feedback_coverage
 
     conn = open_db(args)
     output(args, feedback_coverage(conn))
@@ -1897,7 +2941,7 @@ def cmd_retrieval_feedback_stats(args: argparse.Namespace) -> int:
 
 
 def cmd_retrieval_benchmark(args: argparse.Namespace) -> int:
-    from ocbrain.retrieval_eval import run_benchmark
+    from ocbrain_training.retrieval_eval import run_benchmark
 
     conn = open_db(args)
     result = run_benchmark(
@@ -1910,7 +2954,7 @@ def cmd_retrieval_benchmark(args: argparse.Namespace) -> int:
 
 
 def cmd_retrieval_benchmark_expand(args: argparse.Namespace) -> int:
-    from ocbrain.retrieval_eval import expand_runtime_matrix
+    from ocbrain_training.retrieval_eval import expand_runtime_matrix
 
     result = expand_runtime_matrix(args.input, args.output)
     output(args, result)
@@ -1918,19 +2962,34 @@ def cmd_retrieval_benchmark_expand(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_stats(args: argparse.Namespace) -> int:
+    from ocbrain_training.dataset.stats import dataset_stats
+
     conn = open_db(args)
     output(args, dataset_stats(conn))
     return 0
 
 
 def cmd_dataset_pilot_prepare(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import prepare_pilot
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset.pilot import prepare_pilot
 
+    cfg = load_config()
+    if not cfg.dataset.training_enabled:
+        output(
+            args,
+            {
+                "action": "dataset-pilot-prepare",
+                "changed": 0,
+                "reason": "dataset_training_disabled_by_default",
+                "status": "blocked",
+            },
+        )
+        return 2
     conn = open_db(args)
     try:
         result = prepare_pilot(
             conn,
-            cfg=load_config(),
+            cfg=cfg,
             output_dir=getattr(args, "output_dir", None),
             min_grade=getattr(args, "min_grade", None),
             eval_prompts=getattr(args, "eval_prompts", 100),
@@ -1959,7 +3018,7 @@ def cmd_dataset_pilot_prepare(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pilot_blind(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import prepare_blind_pairs
+    from ocbrain_training.dataset.pilot import prepare_blind_pairs
 
     result = prepare_blind_pairs(
         args.pilot_dir,
@@ -1971,7 +3030,7 @@ def cmd_dataset_pilot_blind(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pilot_score(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import score_blind_ratings
+    from ocbrain_training.dataset.pilot import score_blind_ratings
 
     result = score_blind_ratings(args.pilot_dir, args.ratings)
     output(args, result)
@@ -1979,7 +3038,7 @@ def cmd_dataset_pilot_score(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pilot_multiblind(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import prepare_multiblind
+    from ocbrain_training.dataset.pilot import prepare_multiblind
 
     response_sets: dict[str, Path] = {}
     for raw in args.response:
@@ -1993,7 +3052,7 @@ def cmd_dataset_pilot_multiblind(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pilot_multiscore(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import score_multiblind
+    from ocbrain_training.dataset.pilot import score_multiblind
 
     result = score_multiblind(args.pilot_dir, args.ratings)
     output(args, result)
@@ -2001,8 +3060,20 @@ def cmd_dataset_pilot_multiscore(args: argparse.Namespace) -> int:
 
 
 def cmd_dataset_pilot_record_training(args: argparse.Namespace) -> int:
-    from ocbrain.dataset.pilot import record_training_result
+    from ocbrain.config import load_config
+    from ocbrain_training.dataset.pilot import record_training_result
 
+    if not load_config().dataset.training_enabled:
+        output(
+            args,
+            {
+                "action": "dataset-pilot-record-training",
+                "changed": 0,
+                "reason": "dataset_training_disabled_by_default",
+                "status": "blocked",
+            },
+        )
+        return 2
     result = record_training_result(
         args.pilot_dir,
         iterations=args.iterations,
@@ -2035,7 +3106,7 @@ def _resolve_repo_root(explicit: Path | None) -> Path:
 
 
 def cmd_public_safety_check(args: argparse.Namespace) -> int:
-    from ocbrain.publicsafety import scan
+    from ocbrain_ops.publicsafety import scan
 
     root = _resolve_repo_root(getattr(args, "root", None))
     result = scan(root, diff_range=getattr(args, "diff_range", None))

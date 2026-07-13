@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from ocbrain.db import connect, init_db
-from ocbrain.retrieval_eval import expand_runtime_matrix, run_benchmark
+from ocbrain_training.retrieval_eval import expand_runtime_matrix, run_benchmark
 
 
 def _belief(conn, belief_id: str, body: str, evidence_id: str):

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from ocbrain.dataset.classify import classify_examples
-from ocbrain.dataset.quality import store_example
 from ocbrain.db import connect, init_db, upsert_evidence
+from ocbrain_training.dataset.classify import DPO_CONTRAST_GATE_VERSION, classify_examples
+from ocbrain_training.dataset.quality import store_example
 
 
 def _db(tmp_path):
@@ -21,6 +21,24 @@ def _db(tmp_path):
 
 def _store(conn, evidence_id, *, dataset, sender_verified=True, label="good"):
     response = "A clear and sufficiently detailed response written for this test fixture."
+    if dataset == "dpo":
+        body = {
+            "input": {"messages": [{"role": "user", "content": "Explain the decision."}]},
+            "preferred_output": [{"role": "assistant", "content": response}],
+            "non_preferred_output": [
+                {
+                    "role": "assistant",
+                    "content": "Take an unrelated action without explaining any tradeoff.",
+                }
+            ],
+        }
+    else:
+        body = {
+            "messages": [
+                {"role": "user", "content": "Explain the decision."},
+                {"role": "assistant", "content": response},
+            ]
+        }
     return store_example(
         conn,
         dataset=dataset,
@@ -28,13 +46,12 @@ def _store(conn, evidence_id, *, dataset, sender_verified=True, label="good"):
         source_uri=f"test://{dataset}/{sender_verified}/{label}",
         evidence_ids=[evidence_id],
         privacy_scope="workspace",
-        body={
-            "messages": [
-                {"role": "user", "content": "Explain the decision."},
-                {"role": "assistant", "content": response},
-            ]
+        body=body,
+        metadata={
+            "sender_verified": sender_verified,
+            "gate": "strict" if dataset == "dpo" else None,
+            "contrast_gate_version": (DPO_CONTRAST_GATE_VERSION if dataset == "dpo" else None),
         },
-        metadata={"sender_verified": sender_verified},
         target_text=response,
         base_label=label,
         base_confidence=0.9,

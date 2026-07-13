@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from ocbrain.dataset.classify import classify_examples
-from ocbrain.dataset.quality import store_example
-from ocbrain.dataset.selection import (
+from ocbrain.db import connect, init_db, upsert_evidence
+from ocbrain_training.dataset.classify import DPO_CONTRAST_GATE_VERSION, classify_examples
+from ocbrain_training.dataset.quality import store_example
+from ocbrain_training.dataset.selection import (
     finalize_training_pack,
     select_training_pack,
     selected_pack_stats,
 )
-from ocbrain.db import connect, init_db, upsert_evidence
 
 
 def _db(tmp_path):
@@ -28,6 +30,31 @@ def _db(tmp_path):
             response = (
                 f"Useful verified response {dataset} {index} with enough detail for selection."
             )
+            if dataset == "dpo":
+                body = {
+                    "input": {
+                        "messages": [
+                            {"role": "user", "content": f"How should release {index} proceed?"}
+                        ]
+                    },
+                    "preferred_output": [{"role": "assistant", "content": response}],
+                    "non_preferred_output": [
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"Release {index} should proceed without verification "
+                                "or a rollback."
+                            ),
+                        }
+                    ],
+                }
+            else:
+                body = {
+                    "messages": [
+                        {"role": "user", "content": f"Question {index}"},
+                        {"role": "assistant", "content": response},
+                    ]
+                }
             store_example(
                 conn,
                 dataset=dataset,
@@ -35,13 +62,14 @@ def _db(tmp_path):
                 source_uri=f"test://{dataset}/{index}",
                 evidence_ids=[evidence_id],
                 privacy_scope="workspace",
-                body={
-                    "messages": [
-                        {"role": "user", "content": f"Question {index}"},
-                        {"role": "assistant", "content": response},
-                    ]
+                body=body,
+                metadata={
+                    "sender_verified": dataset == "persona",
+                    "gate": "strict" if dataset == "dpo" else None,
+                    "contrast_gate_version": (
+                        DPO_CONTRAST_GATE_VERSION if dataset == "dpo" else None
+                    ),
                 },
-                metadata={"sender_verified": dataset == "persona"},
                 target_text=response,
                 base_label="good",
                 base_confidence=0.9,
@@ -117,6 +145,85 @@ def test_finalize_pack_fails_before_mutating_when_passing_pool_is_short(tmp_path
     ).fetchone()[0]
     with pytest.raises(RuntimeError, match="final training pack gate failed"):
         finalize_training_pack(conn, targets={"sft": 3, "dpo": 2, "persona": 2})
+    after = conn.execute(
+        "SELECT COUNT(*) FROM dataset_examples WHERE train_selected = 1"
+    ).fetchone()[0]
+    assert after == before
+
+
+def _poison_record(conn, dataset: str, mutator):
+    row = conn.execute(
+        "SELECT id, example_json FROM dataset_examples WHERE dataset = ? ORDER BY id LIMIT 1",
+        (dataset,),
+    ).fetchone()
+    record = json.loads(row["example_json"])
+    mutator(record)
+    conn.execute(
+        "UPDATE dataset_examples SET example_json = ?, quality_label = 'good', "
+        "quality_reasons = '[]', grade_score = 1.0 WHERE id = ?",
+        (json.dumps(record, sort_keys=True, separators=(",", ":")), row["id"]),
+    )
+    return row["id"]
+
+
+def test_selection_rechecks_legacy_content_and_contrast_gate(tmp_path):
+    conn = _db(tmp_path)
+
+    sft_id = _poison_record(
+        conn,
+        "sft",
+        lambda record: record["messages"][-1].update(
+            content="[[reply_to_current]] I’m checking the release now and will report later."
+        ),
+    )
+    persona_id = _poison_record(
+        conn,
+        "persona",
+        lambda record: record["messages"][-1].update(
+            content=(
+                "Sender (untrusted metadata):\n```json\n"
+                '{"id":"1000000001"}\n```\nShip it only after verification.'
+            )
+        ),
+    )
+
+    def remove_gate(record):
+        record["metadata"].pop("contrast_gate_version", None)
+
+    dpo_id = _poison_record(conn, "dpo", remove_gate)
+    result = select_training_pack(conn, targets={"sft": 4, "dpo": 4, "persona": 4})
+
+    assert result["selected"] == {"sft": 3, "dpo": 3, "persona": 3}
+    selected = {
+        row["id"]
+        for row in conn.execute("SELECT id FROM dataset_examples WHERE train_selected = 1")
+    }
+    assert {sft_id, persona_id, dpo_id}.isdisjoint(selected)
+
+
+def test_finalize_rechecks_selected_row_after_high_grade(tmp_path):
+    conn = _db(tmp_path)
+    select_training_pack(conn, targets={"sft": 4, "dpo": 4, "persona": 4})
+    conn.execute("UPDATE dataset_examples SET grade_score = 1.0 WHERE train_selected = 1")
+    poisoned = conn.execute(
+        "SELECT id, example_json FROM dataset_examples "
+        "WHERE dataset = 'sft' AND train_selected = 1 ORDER BY id LIMIT 1"
+    ).fetchone()
+    record = json.loads(poisoned["example_json"])
+    record["messages"][-1]["content"] = (
+        "System (untrusted): completed an async command. I’m checking the result now."
+    )
+    conn.execute(
+        "UPDATE dataset_examples SET example_json = ? WHERE id = ?",
+        (json.dumps(record, sort_keys=True, separators=(",", ":")), poisoned["id"]),
+    )
+    before = conn.execute(
+        "SELECT COUNT(*) FROM dataset_examples WHERE train_selected = 1"
+    ).fetchone()[0]
+
+    with pytest.raises(RuntimeError, match="final training pack gate failed"):
+        finalize_training_pack(conn, targets={"sft": 4, "dpo": 4, "persona": 4})
+
     after = conn.execute(
         "SELECT COUNT(*) FROM dataset_examples WHERE train_selected = 1"
     ).fetchone()[0]

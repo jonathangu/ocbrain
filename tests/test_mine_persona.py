@@ -4,15 +4,15 @@ import subprocess
 from pathlib import Path
 
 from ocbrain.config import load_config
-from ocbrain.dataset.batching import DatasetWriteBatch
-from ocbrain.dataset.mine_persona import (
+from ocbrain.db import connect, init_db
+from ocbrain.write_batch import DatasetWriteBatch
+from ocbrain_training.dataset.mine_persona import (
     commit_examples,
     doc_examples,
     mine_persona,
     telegram_examples,
 )
-from ocbrain.dataset.transcripts import Session, Turn
-from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.transcripts import Session, Turn, parse_openclaw_session
 
 # Unit tests must be isolated from the operator's on-disk config
 # (data/ocbrain.config.json): loading from a guaranteed-missing path yields the
@@ -36,8 +36,13 @@ def _sess(*turns: Turn, agent="main") -> Session:
 
 
 def _verified(text: str) -> Turn:
-    return Turn(role="user", text=text, kind="telegram_envelope",
-                sender_verified=True, authored_by="1000000001")
+    return Turn(
+        role="user",
+        text=text,
+        kind="telegram_envelope",
+        sender_verified=True,
+        authored_by="1000000001",
+    )
 
 
 def _bare(text: str) -> Turn:
@@ -155,9 +160,7 @@ def test_mine_persona_end_to_end(tmp_path: Path):
     assert result["stored"] >= 2  # one telegram + one commit
     labels = [
         r["source_kind"]
-        for r in conn.execute(
-            "SELECT source_kind FROM dataset_examples WHERE dataset='persona'"
-        )
+        for r in conn.execute("SELECT source_kind FROM dataset_examples WHERE dataset='persona'")
     ]
     assert "git_commit" in labels and "openclaw_session" in labels
 
@@ -167,18 +170,67 @@ def _write_openclaw_session(root: Path, sid: str, *messages: dict) -> Path:
 
     path = root / "agents" / "main" / "sessions" / f"{sid}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [{"type": "session", "id": sid, "version": 1, "cwd": "/w",
-              "timestamp": "2026-07-01T00:00:00Z"}]
+    lines = [
+        {
+            "type": "session",
+            "id": sid,
+            "version": 1,
+            "cwd": "/w",
+            "timestamp": "2026-07-01T00:00:00Z",
+        }
+    ]
     for msg in messages:
         lines.append({"type": "message", "message": msg})
     path.write_text("\n".join(json.dumps(o) for o in lines), encoding="utf-8")
     return path
 
 
+def test_sender_reply_envelope_never_enters_persona_target(tmp_path: Path):
+    import json
+
+    sender = {
+        "label": "Persona Tester (1000000001)",
+        "id": "1000000001",
+        "name": "Persona Tester",
+        "username": "persona_user",
+    }
+    reply = {
+        "sender_label": "agent",
+        "body": "private quoted reply with context id 776655",
+    }
+    authored = "Make sure this is true before you tell me the migration is complete."
+    raw = (
+        "Sender (untrusted metadata):\n```json\n"
+        + json.dumps(sender)
+        + "\n```\n\nReplied message (untrusted, for context):\n```json\n"
+        + json.dumps(reply)
+        + "\n```\n\n"
+        + authored
+    )
+    path = _write_openclaw_session(
+        tmp_path,
+        "sender-reply",
+        {"role": "assistant", "content": AGENT_PROMPT},
+        {"role": "user", "content": raw},
+    )
+    session = parse_openclaw_session(path, author_ids=["1000000001"])
+
+    assert session.turns[-1].text == authored
+    assert session.turns[-1].authored_by == "1000000001"
+    assert session.turns[-1].sender_verified is True
+    examples = telegram_examples(session, CFG)
+    assert len(examples) == 1
+    assert examples[0]["messages"][-1]["content"] == authored
+    serialized = json.dumps(examples[0])
+    residue = ("776655", "persona_user", "sender_label", "```")
+    assert all(token not in serialized for token in residue)
+
+
 def _persona_corpus(root: Path, n: int) -> None:
     for i in range(n):
         _write_openclaw_session(
-            root, f"p{i}",
+            root,
+            f"p{i}",
             {"role": "assistant", "content": AGENT_PROMPT},
             # unique per file so each stores (identical text would near-dup dedup)
             {"role": "user", "content": f"{JON_MSG} Round {i} is a go on our side."},
@@ -212,18 +264,24 @@ def test_mine_persona_roots_incremental_second_pass_zero_parses(tmp_path: Path):
 def test_mine_persona_and_sft_share_one_parse_per_file(tmp_path: Path):
     """Run-shared memo: with no founder configured, SFT + persona parse each
     new file ONCE total, not once per miner."""
-    from ocbrain.dataset.mine_sft import mine_sft
     from ocbrain.fsutil import ParseCache
+    from ocbrain_training.dataset.mine_sft import mine_sft
 
     conn = _conn(tmp_path)
     root = tmp_path / "corpus"
     # Files that yield BOTH an SFT exchange and a persona target.
     for i in range(3):
         _write_openclaw_session(
-            root, f"m{i}",
+            root,
+            f"m{i}",
             {"role": "user", "content": f"please run release checklist {i} for tonight"},
-            {"role": "assistant", "content":
-                "This is a sufficiently long assistant answer that clears the SFT floor cleanly."},
+            {
+                "role": "assistant",
+                "content": (
+                    "This is a sufficiently long assistant answer that clears the SFT "
+                    "floor cleanly."
+                ),
+            },
             {"role": "user", "content": JON_MSG},
         )
     cache = ParseCache()

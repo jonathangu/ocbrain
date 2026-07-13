@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 
-from ocbrain.dataset.calibration import import_calibrations
 from ocbrain.db import connect, init_db
+from ocbrain_training.dataset.calibration import import_calibrations
 
 
 def test_calibration_import_distinguishes_complete_human_ideal(tmp_path):

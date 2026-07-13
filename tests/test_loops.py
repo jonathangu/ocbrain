@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
 
-from ocbrain import cli
 from ocbrain.db import connect, init_db
 from ocbrain.ids import content_hash
-from ocbrain.loops import LoopIngestOptions, dry_run_loop_ingest
+from ocbrain_ops.cli import main as ops_main
+from ocbrain_ops.loops import LoopIngestOptions, dry_run_loop_ingest
 
 
 def write_result(
@@ -225,10 +225,17 @@ def test_precondition_failures_block_family_without_exhausting_it(tmp_path: Path
     assert repair_candidates
 
     db_path = tmp_path / "ocbrain.sqlite"
+    ops_path = tmp_path / "ops.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.commit()
+    conn.close()
     assert (
-        cli.main(
+        ops_main(
             [
-                "--db",
+                "--ops-db",
+                str(ops_path),
+                "--legacy-db",
                 str(db_path),
                 "loop-ingest",
                 "--loop-id",
@@ -354,11 +361,14 @@ def test_loop_ingest_cli_is_dry_run_and_does_not_create_db(tmp_path: Path, capsy
     artifacts = tmp_path / "artifacts"
     write_result(artifacts, "exp_001")
     db_path = tmp_path / "ocbrain.sqlite"
+    ops_path = tmp_path / "ops.sqlite"
 
     assert (
-        cli.main(
+        ops_main(
             [
-                "--db",
+                "--ops-db",
+                str(ops_path),
+                "--legacy-db",
                 str(db_path),
                 "loop-ingest",
                 "--loop-id",
@@ -378,6 +388,7 @@ def test_loop_ingest_cli_is_dry_run_and_does_not_create_db(tmp_path: Path, capsy
     assert payload["dry_run"] is True
     assert payload["summary"]["kept"] == 1
     assert not db_path.exists()
+    assert not ops_path.exists()
 
 
 def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
@@ -385,8 +396,15 @@ def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
     write_result(artifacts, "exp_001")
     write_result(artifacts, "exp_002", decision="reverted", artifact_uri="missing-eval.json")
     db_path = tmp_path / "ocbrain.sqlite"
+    ops_path = tmp_path / "ops.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.commit()
+    conn.close()
     command = [
-        "--db",
+        "--ops-db",
+        str(ops_path),
+        "--legacy-db",
         str(db_path),
         "loop-ingest",
         "--loop-id",
@@ -399,9 +417,9 @@ def test_loop_ingest_apply_is_idempotent(tmp_path: Path, capsys) -> None:
         "--json",
     ]
 
-    assert cli.main(command) == 0
+    assert ops_main(command) == 0
     first_payload = json.loads(capsys.readouterr().out)
-    assert cli.main(command) == 0
+    assert ops_main(command) == 0
     second_payload = json.loads(capsys.readouterr().out)
 
     conn = connect(db_path)
@@ -425,11 +443,18 @@ def test_loop_success_skill_candidate_lands_auto_with_loop_origin(
     write_result(artifacts, "exp_002", decision="kept", delta=-4)
     write_result(artifacts, "exp_003", decision="kept", delta=-2)
     db_path = tmp_path / "ocbrain.sqlite"
+    ops_path = tmp_path / "ops.sqlite"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.commit()
+    conn.close()
 
     assert (
-        cli.main(
+        ops_main(
             [
-                "--db",
+                "--ops-db",
+                str(ops_path),
+                "--legacy-db",
                 str(db_path),
                 "loop-ingest",
                 "--loop-id",
@@ -461,7 +486,7 @@ def test_excerpt_drops_lines_flagged_by_injection_scan(tmp_path: Path) -> None:
     # Belt-and-suspenders: a current, injectable, non-quarantined row whose rendered
     # label carries injection text is dropped by build_excerpt's line scan (spec §5.6-3).
     from ocbrain.db import upsert_knowledge
-    from ocbrain.excerpt import build_excerpt
+    from ocbrain_ops.excerpt import build_excerpt
 
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)

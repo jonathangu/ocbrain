@@ -6,7 +6,6 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ocbrain.autolabel import Signal, record_signal
 from ocbrain.config import load_config
 from ocbrain.db import (
     connect,
@@ -16,7 +15,8 @@ from ocbrain.db import (
     now_iso,
     upsert_knowledge,
 )
-from ocbrain.judge import (
+from ocbrain_ops.autolabel import Signal, record_signal
+from ocbrain_ops.judge import (
     build_judge_batch,
     eligible_rows,
     judge_ambiguous,
@@ -28,9 +28,10 @@ KEY_ENV = {"OPENAI_API_KEY": "sk-test-not-a-real-key-000000000000"}
 
 def _cfg(tmp_path: Path, **judge_overrides):
     base = load_config(tmp_path / "cfg.json")
-    if judge_overrides:
-        return replace(base, judge=replace(base.judge, **judge_overrides))
-    return base
+    # Functional judge tests opt into the hosted lane explicitly; the product
+    # default is fail-closed.
+    settings = {"enabled": True, **judge_overrides}
+    return replace(base, judge=replace(base.judge, **settings))
 
 
 def _db(tmp_path: Path) -> sqlite3.Connection:

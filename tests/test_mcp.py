@@ -22,7 +22,7 @@ def test_mcp_initialize_includes_agent_conduct_guardrails(tmp_path):
     )
 
     instructions = response["result"]["instructions"]
-    assert response["result"]["serverInfo"]["version"] == __version__ == "0.4.0"
+    assert response["result"]["serverInfo"]["version"] == __version__
     assert "Surface assumptions or ambiguity before acting" in instructions
     assert "smallest change that satisfies the verified goal" in instructions
     assert "do not refactor unrelated code" in instructions
@@ -37,11 +37,20 @@ def test_mcp_tools_are_knowledge_first(tmp_path):
     names = {tool["name"] for tool in response["result"]["tools"]}
     by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
 
-    assert {"brain.search", "brain.get", "brain.digest", "brain.feedback"} <= names
+    assert names == {
+        "brain.context",
+        "brain.source",
+        "brain.search",
+        "brain.get",
+        "brain.digest",
+        "brain.feedback",
+        "brain.ingest",
+        "brain.closeout",
+    }
     # brain.propose is deleted in v0.2 (spec §5.1-4).
     assert "brain.propose" not in names
-    # v0.2 §5.1-7: write tools are ungated — always listed, no --allow-writes needed.
-    assert "brain.mark_stale" in names
+    assert "brain.mark_stale" not in names
+    assert "brain.teacher_request" not in names
     assert by_name["brain.search"]["annotations"] == {
         "destructiveHint": False,
         "idempotentHint": True,
@@ -50,7 +59,6 @@ def test_mcp_tools_are_knowledge_first(tmp_path):
     }
     assert by_name["brain.feedback"]["annotations"]["destructiveHint"] is False
     assert by_name["brain.feedback"]["annotations"]["readOnlyHint"] is False
-    assert by_name["brain.forget"]["annotations"]["destructiveHint"] is True
 
     search_schema = by_name["brain.search"]["inputSchema"]
     assert search_schema["additionalProperties"] is False
@@ -81,8 +89,14 @@ def test_mcp_write_tools_are_opt_in(tmp_path):
 
     # brain.propose is deleted in v0.2 (spec §5.1-4) — gone from every tool list.
     assert "brain.propose" not in names
-    assert "brain.mark_stale" in names
-    assert {"brain.ingest", "brain.forget", "brain.proposals"} <= names
+    assert "brain.mark_stale" not in names
+    assert {
+        "brain.ingest",
+        "brain.forget",
+        "brain.proposals",
+        "brain.correct",
+        "brain.proposal_decide",
+    } <= names
 
 
 def test_mcp_get_current_knowledge_by_default_and_candidate_with_flag(tmp_path):
@@ -405,9 +419,9 @@ def test_mcp_propose_tool_removed_and_mark_stale_ungated(tmp_path):
         allow_writes=True,
     )
     assert "error" in removed
-    assert "unknown tool" in removed["error"]["message"]
+    assert "not available in admin profile" in removed["error"]["message"]
 
-    # v0.2 §5.1-7: mark_stale is ungated — it succeeds with no allow_writes argument.
+    # Runtime is read-first; destructive administrative mutation is denied.
     stale = handle_request(
         conn,
         {
@@ -417,14 +431,10 @@ def test_mcp_propose_tool_removed_and_mark_stale_ungated(tmp_path):
             "params": {"name": "brain.mark_stale", "arguments": {"id": knowledge_id}},
         },
     )
-    assert "result" in stale
-    assert json.loads(stale["result"]["content"][0]["text"])["status"] == "stale"
+    assert stale["error"]["code"] == -32001
 
 
-def test_mcp_mark_stale_ungated_without_allow_writes(tmp_path):
-    # v0.2 §5.1-7: the knowledge gate is removed. Write tools are always
-    # available; --allow-writes is a deprecated no-op. mark_stale succeeds with
-    # no allow_writes argument at all.
+def test_mcp_mark_stale_is_not_a_core_mcp_tool(tmp_path):
     conn = connect(tmp_path / "ocbrain.sqlite")
     init_db(conn)
     knowledge_id = upsert_knowledge(
@@ -446,10 +456,10 @@ def test_mcp_mark_stale_ungated_without_allow_writes(tmp_path):
             "method": "tools/call",
             "params": {"name": "brain.mark_stale", "arguments": {"id": knowledge_id}},
         },
+        allow_writes=True,
     )
-    assert "error" not in stale
-    payload = json.loads(stale["result"]["content"][0]["text"])
-    assert payload == {"id": knowledge_id, "status": "stale"}
+    assert stale["error"]["code"] == -32001
+    assert "not available in admin profile" in stale["error"]["message"]
 
 
 def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
@@ -475,7 +485,21 @@ def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
     )
     conn.commit()
 
-    # v0.2 §5.1-7: approval feedback is ungated — succeeds with no allow_writes argument.
+    denied = handle_request(
+        conn,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.feedback",
+                "arguments": {"id": approve_id, "decision": "approve", "actor": "jon"},
+            },
+        },
+    )
+    assert denied["error"]["code"] == -32001
+
+    # Deprecated approval compatibility remains available only to admin clients.
     approved = handle_request(
         conn,
         {
@@ -487,6 +511,7 @@ def test_mcp_feedback_approves_or_rejects_human_gated_knowledge(tmp_path):
                 "arguments": {"id": approve_id, "decision": "approve", "actor": "jon"},
             },
         },
+        allow_writes=True,
     )
     approved_payload = json.loads(approved["result"]["content"][0]["text"])
     approved_row = conn.execute(

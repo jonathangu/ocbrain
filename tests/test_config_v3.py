@@ -59,7 +59,7 @@ def test_archive_defaults(tmp_path: Path) -> None:
 
 def test_embed_defaults(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "missing.json")
-    assert cfg.embed.enabled is True
+    assert cfg.embed.enabled is False
     assert cfg.embed.provider == "openai"
     assert cfg.embed.model == "text-embedding-3-small"
     assert cfg.embed.daily_usd_cap == 0.25
@@ -109,6 +109,31 @@ def test_promote_human_bootstrap_defaults(tmp_path: Path) -> None:
 def test_dataset_dpo_relaxed_gate_default(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "missing.json")
     assert cfg.dataset.dpo_relaxed_gate is True
+
+
+def test_dataset_grading_calibration_defaults_and_overrides(tmp_path: Path) -> None:
+    default = load_config(tmp_path / "missing.json").dataset_grading
+    assert default.calibration_path == ""
+    assert default.calibration_min_agreement == 0.9
+    assert default.calibration_min_items == 150
+
+    path = _write_cfg(
+        tmp_path,
+        {
+            "dataset_grading": {
+                "calibration_path": "/private/human-labels.jsonl",
+                "calibration_min_agreement": 0.95,
+                "calibration_min_items": 25,
+            }
+        },
+    )
+    configured = load_config(
+        path,
+        env={"OCBRAIN_DATASET_GRADING_CALIBRATION_MIN_ITEMS": "30"},
+    ).dataset_grading
+    assert configured.calibration_path == "/private/human-labels.jsonl"
+    assert configured.calibration_min_agreement == 0.95
+    assert configured.calibration_min_items == 30
 
 
 def test_embed_api_key_env_is_a_name_not_a_secret(tmp_path: Path) -> None:

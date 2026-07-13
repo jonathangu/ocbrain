@@ -4,7 +4,11 @@ import json
 from pathlib import Path
 
 from ocbrain.config import OcbrainConfig
-from ocbrain.dataset.pilot import (
+from ocbrain.db import connect, init_db
+from ocbrain.events import canonical_json
+from ocbrain_training.dataset.classify import DPO_CONTRAST_GATE_VERSION
+from ocbrain_training.dataset.pilot import (
+    _eligible_rows,
     prepare_blind_pairs,
     prepare_multiblind,
     prepare_pilot,
@@ -12,9 +16,7 @@ from ocbrain.dataset.pilot import (
     score_blind_ratings,
     score_multiblind,
 )
-from ocbrain.dataset.quality import store_example
-from ocbrain.db import connect, init_db
-from ocbrain.events import canonical_json
+from ocbrain_training.dataset.quality import store_example
 
 
 def _db(tmp_path: Path):
@@ -42,7 +44,10 @@ def _store_chat(conn, dataset: str, index: int):
         evidence_ids=[f"evd_{dataset}_{index}"],
         privacy_scope="workspace",
         body=body,
-        metadata={"session_id": f"session-{index}"},
+        metadata={
+            "session_id": f"session-{index}",
+            "sender_verified": dataset == "persona",
+        },
         target_text=target,
         base_label="good",
         base_confidence=0.9,
@@ -70,7 +75,10 @@ def _store_dpo(conn, index: int):
                 {"role": "assistant", "content": "Rejected response is vague and wrong."}
             ],
         },
-        metadata={},
+        metadata={
+            "gate": "strict",
+            "contrast_gate_version": DPO_CONTRAST_GATE_VERSION,
+        },
         target_text=chosen,
         base_label="good",
         base_confidence=0.9,
@@ -229,6 +237,44 @@ def test_v04_quality_gate_preserves_legacy_sentinel_and_requires_train_classes(t
     manifest = json.loads((root / "pilot-manifest.json").read_text())
     assert manifest["quality_gate"]["passed"] is True
     assert manifest["legacy_sentinel"]["prompt_count"] == 20
+
+
+def test_pilot_eligibility_rechecks_legacy_content_and_dpo_gate(tmp_path: Path):
+    conn = _db(tmp_path)
+    _store_chat(conn, "sft", 1)
+    _store_chat(conn, "persona", 2)
+    _store_dpo(conn, 3)
+    conn.execute(
+        "UPDATE dataset_examples SET train_class = CASE dataset "
+        "WHEN 'sft' THEN 'train_skill' WHEN 'persona' THEN 'train_voice' "
+        "WHEN 'dpo' THEN 'train_judgment' END"
+    )
+
+    sft = conn.execute(
+        "SELECT id, example_json FROM dataset_examples WHERE dataset = 'sft'"
+    ).fetchone()
+    sft_record = json.loads(sft["example_json"])
+    sft_record["messages"][-1]["content"] = (
+        "[[reply_to_current]] I’m checking the release now and will report later."
+    )
+    conn.execute(
+        "UPDATE dataset_examples SET example_json = ?, grade_score = 1.0 WHERE id = ?",
+        (canonical_json(sft_record), sft["id"]),
+    )
+
+    dpo = conn.execute(
+        "SELECT id, example_json FROM dataset_examples WHERE dataset = 'dpo'"
+    ).fetchone()
+    dpo_record = json.loads(dpo["example_json"])
+    dpo_record["metadata"].pop("contrast_gate_version")
+    conn.execute(
+        "UPDATE dataset_examples SET example_json = ?, grade_score = 1.0 WHERE id = ?",
+        (canonical_json(dpo_record), dpo["id"]),
+    )
+
+    assert _eligible_rows(conn, "sft", min_grade=0.8) == []
+    assert _eligible_rows(conn, "dpo", min_grade=0.8) == []
+    assert len(_eligible_rows(conn, "persona", min_grade=0.8)) == 1
 
 
 def test_blind_randomization_and_scoring(tmp_path: Path):

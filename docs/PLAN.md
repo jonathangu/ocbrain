@@ -1,4 +1,9 @@
-# ocbrain Final-Spec Plan
+# Historical ocbrain final-spec plan
+
+> This plan predates Shared Context and the event-authoritative v1 core. Its
+> mark-stale and liveness-watcher work is retired from the core. Use
+> [`SHARED_CONTEXT_V1.md`](SHARED_CONTEXT_V1.md) and
+> [`CORE_ROADMAP_EXECUTION.md`](CORE_ROADMAP_EXECUTION.md) for current status.
 
 ## Goal
 

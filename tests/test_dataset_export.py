@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 
 from ocbrain.config import load_config
-from ocbrain.dataset.export import export_all, export_dataset
 from ocbrain.db import connect, init_db, now_iso
 from ocbrain.events import canonical_json
 from ocbrain.ids import content_hash, stable_id
+from ocbrain_training.dataset.export import export_all, export_dataset
 
 
 def _db(tmp_path: Path):
@@ -181,7 +181,7 @@ def test_manifest_and_audit_rows(tmp_path):
 def test_manifest_reports_injection_flags_advisory(tmp_path):
     # R2: the manifest carries a per-stream injection_flags tally. Flagged
     # examples STAY in the dataset (advisory) — they are still exported.
-    from ocbrain.dataset.quality import store_example
+    from ocbrain_training.dataset.quality import store_example
 
     conn = _db(tmp_path)
     cfg = _cfg(tmp_path)

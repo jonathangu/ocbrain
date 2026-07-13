@@ -18,24 +18,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ocbrain.autolabel import label_from_signals
 from ocbrain.config import founder_ids, founder_weight, load_config
-from ocbrain.dataset.mine_dpo import (
+from ocbrain.db import connect, init_db, upsert_evidence
+from ocbrain.fsutil import file_fingerprint
+from ocbrain_ops.autolabel import label_from_signals
+from ocbrain_ops.review import review_session
+from ocbrain_training.dataset.mine_dpo import (
     find_transcript_pairs,
     mine_dpo,
     remine_founder_sessions,
 )
-from ocbrain.dataset.mine_persona import mine_persona, telegram_examples
-from ocbrain.dataset.transcripts import (
+from ocbrain_training.dataset.mine_persona import mine_persona, telegram_examples
+from ocbrain_training.dataset.transcripts import (
     Session,
     Turn,
     classify_user_text,
     parse_openclaw_session,
     record_source,
 )
-from ocbrain.db import connect, init_db, upsert_evidence
-from ocbrain.fsutil import file_fingerprint
-from ocbrain.review import review_session
 
 # --- synthetic identities (NOT real telegram ids) ---------------------------- #
 FOUNDER = "700000001"  # co-founder: feedback author, weight 2.0, NOT persona

@@ -5,36 +5,18 @@
 <dict>
   <key>Label</key><string>com.jonathangu.ocbrain.stallcheck</string>
   <!--
-    TEMPLATE: replace __OCBRAIN_STALLCHECK_WRAPPER__ and __OCBRAIN_LOG_DIR__
-    with absolute local paths before installing this plist.
+    DEPRECATED / RETIRED — DO NOT INSTALL OR LOAD.
 
-    ocbrain STALL CHECKER — the passive progress watchdog, every 15 minutes
-    (StartInterval 900). One pass scans the agent exhaust (Reader A: workflow
-    passive-wait transcripts + zombie task .output files) and the runner sqlite
-    read-only (Reader B: lost/stale task_runs, Reader C: handler-timeout ingress
-    events), feeds each finding into the brain's deadman engine (loop_liveness +
-    loop_tripwire evidence), writes its own 'stallcheck' heartbeat row, and
-    sends ONE deduplicated Telegram digest of any NEW stalls.
-
-    Runs the SHARED-pattern env wrapper (not uv directly). The wrapper sources
-    the chmod-600 env file and sets OCBRAIN_DB + OCBRAIN_CONFIG. The Telegram bot
-    token is read by the checker from openclaw.json at send time and never
-    appears in this plist, the wrapper env, or any log line. RunAtLoad is false
-    so bootstrap does not fire an unscheduled pass; the 15-minute timer drives it.
+    This label is retained only so operators can identify and remove an old
+    installation. v0.4.1 has no recurring stallcheck or pager job. Diagnostic
+    code remains available only for an explicit manual invocation. There is
+    deliberately no timer and the inert program cannot dispatch work.
   -->
+  <key>Disabled</key><true/>
   <key>ProgramArguments</key>
   <array>
-    <string>/bin/sh</string>
-    <string>__OCBRAIN_STALLCHECK_WRAPPER__</string>
+    <string>/usr/bin/false</string>
   </array>
-  <key>StartInterval</key><integer>900</integer>
   <key>RunAtLoad</key><false/>
-  <key>ProcessType</key><string>Background</string>
-  <key>LowPriorityBackgroundIO</key><true/>
-  <key>Nice</key><integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>__OCBRAIN_LOG_DIR__/stallcheck.log</string>
-  <key>StandardErrorPath</key>
-  <string>__OCBRAIN_LOG_DIR__/stallcheck.err.log</string>
 </dict>
 </plist>
