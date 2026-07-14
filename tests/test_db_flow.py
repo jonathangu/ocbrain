@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,6 +22,18 @@ from ocbrain.db import (
 )
 from ocbrain_ops.excerpt import write_excerpt
 from ocbrain_ops.maintenance import check_loop_liveness, heal_conflicts, prune_knowledge
+
+
+def test_connect_restricts_database_permissions(tmp_path: Path) -> None:
+    db_path = tmp_path / "ocbrain.sqlite"
+    conn = connect(db_path)
+    conn.close()
+    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
+
+    db_path.chmod(0o644)
+    conn = connect(db_path)
+    conn.close()
+    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
 
 
 def test_schema_preserves_unrelated_generic_tables(tmp_path: Path) -> None:
@@ -405,7 +418,7 @@ def test_new_fts_rows_skip_replace_scan_but_existing_rows_replace_exactly(
     assert rows[0]["body"] == "updated searchable claim"
 
 
-def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, capsys) -> None:
+def test_import_memory_keeps_markdown_as_cold_evidence(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     memory_path = tmp_path / "memory" / "2026-06-28.md"
     memory_path.parent.mkdir()
@@ -449,8 +462,7 @@ def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, 
         == 0
     )
     search_payload = json.loads(capsys.readouterr().out)
-    assert search_payload["items"][0]["kind"] == "core_v1"
-    assert "source-backed" in search_payload["items"][0]["excerpt"]
+    assert search_payload["items"] == []
 
     assert (
         cli.main(
@@ -465,7 +477,14 @@ def test_import_memory_makes_markdown_searchable_and_digestible(tmp_path: Path, 
         == 0
     )
     digest_payload = json.loads(capsys.readouterr().out)
-    assert digest_payload["current"][0]["body"].startswith("OCBrain product check")
+    assert digest_payload["current"] == []
+
+    conn = connect(db_path)
+    row = conn.execute("SELECT egress_policy, status FROM current_beliefs").fetchone()
+    assert row is not None
+    assert (row["egress_policy"], row["status"]) == ("prohibited", "current")
+    assert conn.execute("SELECT count(*) FROM evidence_objects").fetchone()[0] == 1
+    conn.close()
 
 
 def test_event_backfill_batches_past_already_projected_rows(tmp_path: Path, capsys) -> None:
@@ -593,7 +612,9 @@ def test_event_backfill_all_classifies_and_rebuilds_once(tmp_path: Path, capsys)
     assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 3
 
 
-def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> None:
+def test_import_history_archives_runtime_transcripts_without_serving_them(
+    tmp_path: Path, capsys
+) -> None:
     db_path = tmp_path / "ocbrain.sqlite"
     codex_path = tmp_path / ".codex" / "sessions" / "2026" / "06" / "rollout.jsonl"
     openclaw_path = tmp_path / ".openclaw" / "agents" / "main" / "sessions" / "turn.jsonl"
@@ -652,12 +673,10 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
         == 0
     )
     search_payload = json.loads(capsys.readouterr().out)
-    assert {item["kind"] for item in search_payload["items"]} == {"core_v1"}
-    assert {item["scope"]["scope_id"] for item in search_payload["items"]} == {"project:workspace"}
-    assert len(search_payload["items"]) == 3
+    assert search_payload["items"] == []
 
-    # A live append-only transcript path must refresh when its fingerprint
-    # changes, while keeping one current searchable knowledge document.
+    # A live append-only transcript path refreshes its cold evidence when its
+    # fingerprint changes without becoming a retrievable knowledge document.
     openclaw_path.write_text(
         json.dumps(
             {
@@ -700,11 +719,14 @@ def test_import_history_catalogs_runtime_transcripts(tmp_path: Path, capsys) -> 
         == 0
     )
     refreshed_items = json.loads(capsys.readouterr().out)["items"]
-    refreshed_matches = [
-        item for item in refreshed_items if "refreshed sentinel" in item["excerpt"]
-    ]
-    assert len(refreshed_matches) == 1
-    assert refreshed_matches[0]["kind"] == "core_v1"
+    assert refreshed_items == []
+
+    conn = connect(db_path)
+    assert conn.execute("SELECT count(*) FROM evidence_objects").fetchone()[0] == 4
+    assert {
+        row[0] for row in conn.execute("SELECT DISTINCT egress_policy FROM current_beliefs")
+    } == {"prohibited"}
+    conn.close()
 
 
 def test_capability_no_longer_force_gated(tmp_path: Path) -> None:

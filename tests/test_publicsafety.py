@@ -278,6 +278,42 @@ def test_unlabeled_full_hex_value_remains_an_entropy_finding(repo: Path) -> None
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
+def test_labeled_sha256_is_not_an_entropy_finding(repo: Path) -> None:
+    digest = "28d8cd1b4287d12eb9bc21c67a7d916877c79dd330dffdff52b1ae8423e74d82"
+    rng = _commit_added_line(repo, "manifest.json", f'  "sha256": "{digest}"')
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_unlabeled_sha256_remains_an_entropy_finding(repo: Path) -> None:
+    digest = "28d8cd1b4287d12eb9bc21c67a7d916877c79dd330dffdff52b1ae8423e74d82"
+    rng = _commit_added_line(repo, "manifest.json", f'  "value": "{digest}"')
+    result = ps.scan(repo, diff_range=rng)
+    assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_public_repo_url_is_not_an_entropy_finding(repo: Path) -> None:
+    rng = _commit_added_line(
+        repo,
+        "SECURITY.md",
+        "Report at https://github.com/jonathangu/ocbrain/security/advisories/new",
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_public_repo_url_query_token_remains_an_entropy_finding(repo: Path) -> None:
+    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    rng = _commit_added_line(
+        repo,
+        "SECURITY.md",
+        "Report at https://github.com/jonathangu/ocbrain/security/advisories/new"
+        f"?token={suspicious}",
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
 def test_python_identifier_is_not_an_entropy_finding(repo: Path) -> None:
     rng = _commit_added_line(
         repo,

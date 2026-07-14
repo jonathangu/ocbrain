@@ -24,6 +24,7 @@ from ocbrain.core_v1 import (
     is_core_v1,
     record_core_v1_evidence,
 )
+from ocbrain.curation import apply_curated_manifest
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -53,6 +54,7 @@ from ocbrain.events import (
     record_tombstone,
 )
 from ocbrain.fsutil import file_fingerprint, history_runtime
+from ocbrain.hybrid import build_vector_index, vector_status
 from ocbrain.ids import content_hash, stable_id
 from ocbrain.mcp import serve
 from ocbrain.mcp_v1 import (
@@ -768,6 +770,28 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--time-budget", type=float, default=10.0)
     sync.set_defaults(func=cmd_sync)
 
+    vector_build = commands.add_parser(
+        "vector-build",
+        help="Explicitly rebuild the disposable loopback-only dense index",
+    )
+    vector_build.add_argument("--output", type=Path)
+    vector_build.add_argument("--model")
+    vector_build.add_argument("--endpoint")
+    vector_build.add_argument("--batch-size", type=int, default=8)
+    vector_build.set_defaults(func=cmd_vector_build)
+    vector_status_parser = commands.add_parser(
+        "vector-status", help="Inspect the local derived dense index"
+    )
+    vector_status_parser.add_argument("--sidecar", type=Path)
+    vector_status_parser.set_defaults(func=cmd_vector_status)
+    curated_apply = commands.add_parser(
+        "curated-apply",
+        help="Apply a source-hash-verified curated-memory manifest",
+    )
+    curated_apply.add_argument("manifest", type=Path)
+    curated_apply.add_argument("--actor", default="human-curated:operator")
+    curated_apply.set_defaults(func=cmd_curated_apply)
+
     doctor_parser = commands.add_parser("doctor", help="Check the core and stdio MCP")
     doctor_parser.add_argument("--timeout", type=float, default=8.0)
     doctor_parser.add_argument("--launcher", type=Path)
@@ -1281,6 +1305,36 @@ def cmd_sync(args: argparse.Namespace) -> int:
     )
     output(args, result)
     return 0 if result["status"] == "ok" else 3
+
+
+def cmd_vector_build(args: argparse.Namespace) -> int:
+    if not args.db.expanduser().is_file():
+        raise ValueError(f"strict-v1 core database does not exist: {args.db.expanduser()}")
+    result = build_vector_index(
+        args.db,
+        output_path=args.output,
+        model=args.model,
+        endpoint=args.endpoint,
+        batch_size=args.batch_size,
+    )
+    output(args, {"action": "vector-build", **result})
+    return 0
+
+
+def cmd_vector_status(args: argparse.Namespace) -> int:
+    result = vector_status(args.db, sidecar_path=args.sidecar)
+    output(args, {"action": "vector-status", **result})
+    return 0 if result.get("healthy") else 1
+
+
+def cmd_curated_apply(args: argparse.Namespace) -> int:
+    conn = open_existing_core_v1(args.db)
+    try:
+        result = apply_curated_manifest(conn, args.manifest, actor=args.actor)
+    finally:
+        conn.close()
+    output(args, {"action": "curated-apply", **result})
+    return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

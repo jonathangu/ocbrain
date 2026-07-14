@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- Add optional hybrid lexical/dense retrieval with an explicit local vector
+  sidecar and deterministic lexical fallback when the sidecar is absent,
+  stale, or incompatible.
+- Add source-hash-verified curated-memory manifests for explicitly reviewed
+  starter beliefs; relative source paths are portable and the public example
+  contains synthetic data only.
+- Restrict core database files to owner read/write permissions and document
+  that SQLite remains plaintext at rest.
+- Add a clone-to-first-smoke quick start, explicit empty-brain behavior,
+  contribution and security policies, issue/PR templates, code ownership, and
+  a public CI gate.
+- Clarify that OpenClaw is optional and that each compatible MCP client must be
+  configured and instructed before a fresh chat can use OCBrain.
+
 ## 1.0.1 — 2026-07-13
 
 - Add explicit, owner-only evidence bundles for manual cross-machine exchange;

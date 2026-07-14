@@ -5,12 +5,29 @@ build-backend = "hatchling.build"
 [project]
 name = "ocbrain"
 version = "1.0.1"
-description = "Lightweight shared memory for ChatGPT/Codex, Claude Code, and OpenClaw"
+description = "Local, source-backed Shared Context for Codex, Claude Code, and MCP clients"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Jonathan Gu" }]
 dependencies = []
+keywords = ["agents", "memory", "mcp", "sqlite"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://openclawbrain.ai/"
+Documentation = "https://openclawbrain.ai/install/"
+Repository = "https://github.com/jonathangu/ocbrain"
+Issues = "https://github.com/jonathangu/ocbrain/issues"
+Changelog = "https://github.com/jonathangu/ocbrain/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [

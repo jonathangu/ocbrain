@@ -476,6 +476,14 @@ def now_iso() -> str:
 def connect(path: Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
+    try:
+        # OCBrain stores private transcripts, evidence, and outcomes. Do not
+        # leave a newly created or previously permissive ledger group/world
+        # readable under the caller's ambient umask.
+        path.chmod(0o600)
+    except OSError:
+        conn.close()
+        raise
     conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     conn.row_factory = sqlite3.Row
     return conn

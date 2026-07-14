@@ -8,6 +8,76 @@ agent saw.
 
 Current core version: **v1.0.1**. License: Apache-2.0.
 
+[Install](#quick-start) · [Connect a client](#connect-the-clients-you-use) ·
+[Agent instructions](docs/RUNTIME_INTEGRATION.md#client-instruction-block) ·
+[Contribute](CONTRIBUTING.md) · [Public guide](https://openclawbrain.ai/install/)
+
+## What you need
+
+**OpenClaw is optional.** OCBrain is a local stdio
+[Model Context Protocol](https://modelcontextprotocol.io/) server. You can use
+it with Codex, Claude Code, OpenClaw, or another compatible MCP client; install
+and configure only the clients you actually use.
+
+| Requirement | Current support |
+|---|---|
+| Python | 3.11 or newer |
+| Operating system | macOS or Linux; WSL is expected to work but is not release-accepted |
+| Source install | Git plus Python's built-in `venv` and `pip` |
+| Agent client | At least one local stdio MCP client |
+| Not required | OpenClaw, an API key, a hosted service, or a vector database |
+
+The core declares no third-party runtime dependencies and stores its ledger in
+local SQLite. The repository launcher is a Bash script, and parts of the
+current file-locking implementation are POSIX-specific, so native Windows is
+not currently supported. WSL has not yet been included in the dated acceptance
+proof.
+
+## Quick start
+
+Clone the canonical repository and create a repository-local environment:
+
+```bash
+git clone https://github.com/jonathangu/ocbrain.git
+cd ocbrain
+
+python3 --version  # must be 3.11+
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+
+.venv/bin/ocbrain --version
+.venv/bin/ocbrain --db data/ocbrain.sqlite init
+.venv/bin/ocbrain --db data/ocbrain.sqlite status
+.venv/bin/ocbrain --db data/ocbrain.sqlite doctor \
+  --launcher scripts/ocbrain-mcp
+```
+
+This creates a new local brain. It does not import another person's history,
+start a background process, or send anything to a hosted service. Runtime data
+under `data/` is ignored by Git, and the database file is restricted to its
+owner. The SQLite database is plaintext rather than encrypted at rest; use
+full-disk encryption when the host or backup threat model requires it.
+
+### A fresh brain starts empty
+
+An empty `brain.context` result immediately after installation is honest and
+expected. `brain.ingest` appends scoped evidence; it does not promote that
+evidence directly into a durable serving belief.
+
+To add a small set of reviewed starter facts, copy the synthetic
+`examples/curated-memory` example, replace its source and facts, update the
+source SHA-256, review the manifest, and apply it explicitly:
+
+```bash
+.venv/bin/ocbrain --db data/ocbrain.sqlite curated-apply \
+  examples/curated-memory/manifest.json \
+  --actor "human-curated:YOUR-NAME"
+```
+
+The command verifies every named source hash and appends evidence, proposal,
+and approval events; it never writes a belief projection directly. Existing
+v0.x users should follow the archive-first migration path instead.
+
 The product is the evidence and outcome ledger, not a particular embedding
 model, vector database, prompt, or training pipeline. Search indexes,
 embeddings, rankings, summaries, and model-specific features are derived and
@@ -66,25 +136,19 @@ The companion databases are not additional brains. The default MCP never
 queries them. Legacy companion mutators require an explicit `--legacy-db`; they
 never silently write the v1 core.
 
-Install the core from this checkout:
-
-```bash
-uv pip install .
-```
-
 Install companions only when deliberately needed:
 
 ```bash
-uv pip install ./packages/training
-uv pip install ./packages/ops
+.venv/bin/python -m pip install -e ./packages/training
+.venv/bin/python -m pip install -e ./packages/ops
 ```
 
 For development:
 
 ```bash
-uv sync --extra dev
-uv run pytest -q
-uv run ruff check .
+.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check .
 ```
 
 ## MCP profiles
@@ -112,36 +176,58 @@ ocbrain mcp --profile runtime
 ocbrain mcp --profile admin
 ```
 
-## Connect all three clients
+## Connect the clients you use
 
-All clients should register the same launcher:
+Resolve the launcher once from the repository root:
 
 ```bash
 LAUNCHER="$PWD/scripts/ocbrain-mcp"
-codex mcp add ocbrain -- "$LAUNCHER"
-claude mcp add --scope user ocbrain -- "$LAUNCHER"
-openclaw mcp add ocbrain --command "$LAUNCHER"
 ```
 
-Registration is configuration, not acceptance. A real acceptance turn in each
-fresh client must complete:
+Register it with any installed clients.
+
+### Codex
+
+```bash
+codex mcp add ocbrain -- "$LAUNCHER"
+codex mcp get ocbrain
+```
+
+The ChatGPT desktop app, Codex CLI, and Codex IDE extension share the same
+local Codex MCP configuration.
+
+### Claude Code
+
+```bash
+claude mcp add --scope user ocbrain -- "$LAUNCHER"
+claude mcp get ocbrain
+```
+
+### OpenClaw (optional)
+
+If you also use OpenClaw:
+
+```bash
+openclaw mcp add ocbrain --command "$LAUNCHER"
+openclaw mcp doctor ocbrain
+openclaw mcp probe ocbrain
+```
+
+Registration is configuration, not acceptance. A fresh chat alone does not
+activate OCBrain unless the client has the MCP server configured and the agent
+is instructed to use it. A real acceptance turn in every configured client
+should complete:
 
 ```text
 brain.context → brain.source → brain.feedback → brain.closeout
 ```
 
 Already-open chats may retain the MCP process they started before an upgrade.
-Start a fresh Codex/ChatGPT task and reconnect Claude Code/OpenClaw when testing
-a new core.
-
-Read-only registration probes:
-
-```bash
-codex mcp get ocbrain
-claude mcp list
-openclaw mcp doctor ocbrain
-openclaw mcp probe ocbrain
-```
+Start a fresh task or restart/reconnect the client when testing a new core.
+Copy the short policy from the
+[runtime integration guide](docs/RUNTIME_INTEGRATION.md#client-instruction-block)
+into `AGENTS.md`, `CLAUDE.md`, or the equivalent durable
+instruction surface.
 
 The July 13 v1 cutover passed this real gate against one activated core. Fresh
 Codex, Claude Code, and OpenClaw processes each returned an
@@ -249,3 +335,11 @@ stratified audit, and explicit operator closeout remain separate gates.
 
 Files labeled historical preserve old decisions and evidence; they are not
 current operating doctrine.
+
+## Contributing
+
+Bug reports, focused fixes, documentation improvements, new client setup
+proofs, and scope/privacy tests are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md), run the local test and lint gate, and open a
+pull request against `main`. Never attach a live brain database, transcript
+corpus, secret, or owner-specific runtime artifact to an issue or commit.

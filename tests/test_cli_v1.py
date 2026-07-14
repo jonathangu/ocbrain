@@ -8,8 +8,6 @@ import ocbrain.cli as cli_module
 from ocbrain.cli import build_parser, main
 from ocbrain.core_v1 import get_core_v1_evidence, is_core_v1
 from ocbrain.db import connect
-from ocbrain.mcp_v1 import expand_source_v1
-from ocbrain.scope import ScopeContext
 
 
 def _run(capsys, db: Path, argv: list[str], *, expected: int = 0) -> dict:
@@ -65,7 +63,14 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
         "core-migrate-v1",
         "mcp",
     }
-    assert commands == exercised_here | subprocess_or_migration_acceptance
+    curated_and_vector_acceptance = {
+        "curated-apply",
+        "vector-build",
+        "vector-status",
+    }
+    assert commands == (
+        exercised_here | subprocess_or_migration_acceptance | curated_and_vector_acceptance
+    )
 
 
 def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
@@ -287,7 +292,7 @@ def test_fresh_v1_cli_read_surfaces_and_event_lifecycle(tmp_path, capsys) -> Non
     _strict_v1(db).close()
 
 
-def test_v1_source_imports_are_searchable_expandable_and_idempotent(tmp_path, capsys) -> None:
+def test_v1_private_source_imports_are_cold_evidence_and_idempotent(tmp_path, capsys) -> None:
     db = tmp_path / "core.sqlite"
     _run(capsys, db, ["init"])
     memory = tmp_path / "memory.md"
@@ -316,26 +321,22 @@ def test_v1_source_imports_are_searchable_expandable_and_idempotent(tmp_path, ca
         db,
         ["search", "durable general representations", "--project", "ocbrain"],
     )
-    assert len(search["items"]) == 1
+    assert search["items"] == []
     preview = _run(
         capsys,
         db,
         ["preview", "durable general representations", "--project", "ocbrain"],
     )
-    source = preview["items"][0]["sources"][0]
-    assert source["uri"] == str(memory.resolve())
+    assert preview["items"] == []
     conn = _strict_v1(db)
-    evidence = get_core_v1_evidence(conn, preview["items"][0]["evidence_ids"][0])
+    evidence = get_core_v1_evidence(conn, first["files"][0]["evidence_id"])
     assert evidence is not None
     assert "Actions and outcomes" in evidence["body"]
-    expanded = expand_source_v1(
-        conn,
-        source["id"],
-        context=ScopeContext(project="ocbrain"),
-        max_chars=4_000,
-    )
-    assert expanded["hash_verified"] is True
-    assert "Actions and outcomes" in expanded["content"]
+    belief = conn.execute(
+        "SELECT egress_policy FROM current_beliefs WHERE belief_id=?",
+        (first["files"][0]["belief_id"],),
+    ).fetchone()
+    assert belief is not None and belief["egress_policy"] == "prohibited"
     conn.close()
 
     memory.write_text(
@@ -349,7 +350,7 @@ def test_v1_source_imports_are_searchable_expandable_and_idempotent(tmp_path, ca
     )
     assert changed["imported"] == 1
     assert changed["counts"]["brain_events"] == event_count + 3
-    assert _run(
+    assert not _run(
         capsys,
         db,
         ["search", "measured outcomes future transfer", "--project", "ocbrain"],
@@ -373,7 +374,7 @@ def test_v1_source_imports_are_searchable_expandable_and_idempotent(tmp_path, ca
         ["import-history", str(history), "--project", "ocbrain"],
     )
     assert (repeated["imported"], repeated["existing"]) == (0, 1)
-    assert _run(
+    assert not _run(
         capsys,
         db,
         ["search", "runtime bridge acceptance sentinel", "--project", "ocbrain"],
