@@ -85,6 +85,7 @@ def build_context_v1(
             str(raw_item["belief_id"]),
             context=context,
             delivery_target=delivery_target,
+            cross_scope=cross_scope,
         )
         item_handles = item_handles[:MAX_ITEM_SOURCE_HANDLES]
         handles.extend(item_handles)
@@ -132,7 +133,13 @@ def build_context_v1(
         "coverage": {
             "requested_limit": limit,
             "returned": len(items),
-            "excluded_scope_count": int(raw.get("excluded_count") or 0) + delivery_excluded,
+            "excluded_scope_count": int(raw.get("excluded_count") or 0),
+            "excluded_delivery_count": (
+                int(raw.get("delivery_excluded_count") or 0) + delivery_excluded
+            ),
+            "exclusion_count_basis": str(
+                raw.get("exclusion_count_basis") or "current_serving_inventory"
+            ),
             "excluded_sample": (
                 [] if delivery_target != LOCAL_MODEL_TARGET else list(raw.get("excluded") or [])
             ),
@@ -835,6 +842,7 @@ def _source_handles_for_belief(
     *,
     context: ScopeContext,
     delivery_target: str,
+    cross_scope: bool = False,
 ) -> list[dict[str, Any]]:
     canonical_id = resolve_object_id(conn, belief_id)
     handles: list[dict[str, Any]] = []
@@ -856,6 +864,7 @@ def _source_handles_for_belief(
             ScopeTag.from_dict(scope),
             context,
             delivery_target,
+            cross_scope=cross_scope,
         )
         if not allowed:
             continue
@@ -886,6 +895,7 @@ def _source_handles_for_belief(
         ScopeTag.from_dict(scope),
         context,
         delivery_target,
+        cross_scope=cross_scope,
     )
     if not allowed:
         return []

@@ -57,11 +57,18 @@ git switch -c fix/short-description
 ## Run the local gate
 
 ```bash
+PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_golden_context_v1.py
 PYTHONPATH=src .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
 .venv/bin/python -m compileall -q src tests
 git diff --check
 ```
+
+The focused golden gate drives the real MCP `brain.context` and `brain.source`
+path through deterministic synthetic relevance, scope, hosted-delivery,
+contradiction, hash-verification, and denial cases. Golden fixtures must remain
+public synthetic test data and must never be populated from a live brain or
+used as training data.
 
 The optional repository hook runs the public-safety scanner before a push:
 

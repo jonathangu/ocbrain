@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain-training"
-version = "1.0.1"
+version = "1.1.0"
 description = "Optional local dataset curation and training tools for OCBrain"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Jonathan Gu" }]
-dependencies = ["ocbrain>=1,<2"]
+dependencies = ["ocbrain>=1.1,<2"]
 
 [project.scripts]
 ocbrain-training = "ocbrain_training.cli:main"

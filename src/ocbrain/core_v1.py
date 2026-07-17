@@ -1495,14 +1495,20 @@ def search_core_v1(
     fts = _normalize_fts_query(query)
     compatible = sorted(context.compatible_scope_ids())
     placeholders = ",".join("?" for _ in compatible)
-    scope_sql = f"cb.scope_id IN ({placeholders})"
+    scope_sql = f"(cb.scope_type='global' OR cb.scope_id IN ({placeholders}))"
     scope_params: list[Any] = list(compatible)
     if cross_scope:
         scope_sql = (
-            f"({scope_sql} OR (cb.scope_type != 'legacy_unscoped' "
+            f"({scope_sql} OR (cb.scope_type NOT IN ('legacy_unscoped','client') "
             "AND cb.visibility NOT IN ('confidential','secret')))"
         )
     delivery_sql = _delivery_sql(delivery_target)
+    visibility_counts = _serving_visibility_counts(
+        conn,
+        scope_sql=scope_sql,
+        scope_params=scope_params,
+        delivery_sql=delivery_sql,
+    )
     eligible_rows = list(
         conn.execute(
             f"""
@@ -1549,11 +1555,13 @@ def search_core_v1(
         return {
             "items": [],
             "excluded": [],
-            "excluded_count": 0,
+            "excluded_count": visibility_counts["excluded_scope_count"],
+            "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
+            "exclusion_count_basis": "current_serving_inventory",
             "ranking": {
                 "mode": "lexical" if dense_fallback else "hybrid",
                 "dense_fallback": dense_fallback,
-                "eligible_count": len(eligible),
+                "eligible_count": visibility_counts["eligible_count"],
                 "lexical_candidates": 0,
                 "dense_candidates": 0,
             },
@@ -1644,11 +1652,13 @@ def search_core_v1(
     return {
         "items": items,
         "excluded": [],
-        "excluded_count": 0,
+        "excluded_count": visibility_counts["excluded_scope_count"],
+        "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
+        "exclusion_count_basis": "current_serving_inventory",
         "ranking": {
             "mode": "lexical" if dense_fallback else "hybrid_rrf",
             "dense_fallback": dense_fallback,
-            "eligible_count": len(eligible),
+            "eligible_count": visibility_counts["eligible_count"],
             "lexical_candidates": len(lexical_rank),
             "dense_candidates": len(dense_rank),
             "deduplicated_candidates": len(ranked) - len(items),
@@ -1787,10 +1797,53 @@ def _normalize_fts_query(query: str) -> str:
 
 def _delivery_sql(target: str) -> str:
     if target == "hosted_model":
-        return "cb.egress_policy='hosted_ok' AND cb.visibility NOT IN ('confidential','secret')"
+        return (
+            "cb.egress_policy='hosted_ok' AND cb.scope_type!='client' "
+            "AND cb.visibility NOT IN ('confidential','secret')"
+        )
     if target == "local_model":
         return "cb.egress_policy!='prohibited'"
     raise ValueError(f"unsupported delivery target: {target}")
+
+
+def _serving_visibility_counts(
+    conn: sqlite3.Connection,
+    *,
+    scope_sql: str,
+    scope_params: list[Any],
+    delivery_sql: str,
+) -> dict[str, int]:
+    """Partition current serving inventory without exposing excluded objects.
+
+    These counts describe the scope and delivery gates before query ranking.
+    They are intentionally query-independent so an empty or unmatched query
+    still reports whether the supplied context can see any serving inventory.
+    """
+    row = conn.execute(
+        f"""
+        WITH classified AS (
+          SELECT
+            CASE WHEN {scope_sql} THEN 1 ELSE 0 END AS scope_allowed,
+            CASE WHEN {delivery_sql} THEN 1 ELSE 0 END AS delivery_allowed
+          FROM current_beliefs cb
+          WHERE cb.serve=1 AND cb.status='current'
+        )
+        SELECT
+          COALESCE(SUM(CASE WHEN scope_allowed=0 THEN 1 ELSE 0 END), 0)
+            AS excluded_scope_count,
+          COALESCE(SUM(CASE WHEN scope_allowed=1 AND delivery_allowed=0 THEN 1 ELSE 0 END), 0)
+            AS excluded_delivery_count,
+          COALESCE(SUM(CASE WHEN scope_allowed=1 AND delivery_allowed=1 THEN 1 ELSE 0 END), 0)
+            AS eligible_count
+        FROM classified
+        """,  # noqa: S608 - clauses are selected from fixed local expressions
+        scope_params,
+    ).fetchone()
+    return {
+        "excluded_scope_count": int(row["excluded_scope_count"]),
+        "excluded_delivery_count": int(row["excluded_delivery_count"]),
+        "eligible_count": int(row["eligible_count"]),
+    }
 
 
 def _source_quality(attributes: dict[str, Any]) -> float:

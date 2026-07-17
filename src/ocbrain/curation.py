@@ -32,6 +32,7 @@ def apply_curated_manifest(
     manifest_path: Path,
     *,
     actor: str = "human-curated:operator",
+    allow_hosted_egress: bool = False,
 ) -> dict[str, Any]:
     if not is_core_v1(conn):
         raise ValueError("curated manifests require an OCBrain v1 core")
@@ -46,6 +47,7 @@ def apply_curated_manifest(
     if not isinstance(facts, list) or not facts:
         raise ValueError("manifest facts must be a non-empty list")
     seen_fact_ids: set[str] = set()
+    hosted_fact_ids: list[str] = []
     for raw in facts:
         if not isinstance(raw, dict):
             raise ValueError("each curated fact must be an object")
@@ -53,43 +55,140 @@ def apply_curated_manifest(
         if fact_id in seen_fact_ids:
             raise ValueError(f"duplicate curated fact id: {fact_id}")
         seen_fact_ids.add(fact_id)
+        visibility = str(raw.get("visibility") or "internal")
+        egress_policy = str(raw.get("egress_policy") or "local_only")
+        if egress_policy == "hosted_ok":
+            if visibility in {"confidential", "secret"}:
+                raise ValueError(
+                    f"fact {fact_id} cannot combine hosted_ok with {visibility} visibility"
+                )
+            hosted_fact_ids.append(fact_id)
+    if hosted_fact_ids and not allow_hosted_egress:
+        joined = ", ".join(hosted_fact_ids)
+        raise ValueError(
+            "manifest authorizes hosted-model delivery for facts "
+            f"{joined}; review their exact bodies and pass --allow-hosted-egress"
+        )
 
+    prepared_facts = _prepare_facts(facts, project=project, sources=sources)
     applied: list[str] = []
     unchanged: list[str] = []
+    conn.execute("SAVEPOINT curated_manifest_apply")
+    try:
+        for fact in prepared_facts:
+            body = fact["body"]
+            referenced = fact["referenced"]
+            scope = fact["scope"]
+            belief_id = fact["belief_id"]
+            confidence = fact["confidence"]
+            attributes = fact["attributes"]
+            current = get_core_v1_belief(conn, belief_id)
+            if (
+                current is not None
+                and current.get("status") == "current"
+                and bool(current.get("serve"))
+                and str(current.get("body")) == body
+                and current.get("belief_type") == "curated_fact"
+                and float(current.get("confidence") or 0.0) == confidence
+                and current.get("attributes") == attributes
+                and current.get("scope") == scope.to_dict()
+            ):
+                unchanged.append(belief_id)
+                continue
+
+            evidence_ids: list[str] = []
+            for source in referenced:
+                evidence_id, _event_id = record_core_v1_evidence(
+                    conn,
+                    body=body,
+                    kind="curated_source_attestation",
+                    scope=scope,
+                    writer=actor,
+                    artifact_ref=str(source["path"]),
+                )
+                evidence_ids.append(evidence_id)
+            proposal_id = append_core_event(
+                conn,
+                "compilation_proposed",
+                {
+                    "schema_version": "ocbrain.compilation.v1",
+                    "subject": {"kind": "belief", "id": belief_id},
+                    "belief_id": belief_id,
+                    "belief_type": "curated_fact",
+                    "body": body,
+                    "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                    "scope": scope.to_dict(),
+                    "confidence": confidence,
+                    "reward_band": "strong",
+                    "attributes": attributes,
+                },
+                writer=actor,
+            )
+            decide_proposal_v1(
+                conn,
+                proposal_event_id=proposal_id,
+                decision="approve",
+                actor=actor,
+                edited_body=None,
+                reason="source-hash-verified curated manifest",
+            )
+            applied.append(belief_id)
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT curated_manifest_apply")
+        conn.execute("RELEASE SAVEPOINT curated_manifest_apply")
+        raise
+    else:
+        conn.execute("RELEASE SAVEPOINT curated_manifest_apply")
+    conn.commit()
+    return {
+        "status": "ok",
+        "schema_version": CURATED_MANIFEST_SCHEMA,
+        "manifest": str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+        "sources_verified": len(sources),
+        "facts_total": len(facts),
+        "hosted_egress_acknowledged": bool(hosted_fact_ids and allow_hosted_egress),
+        "applied": applied,
+        "unchanged": unchanged,
+    }
+
+
+def _prepare_facts(
+    facts: list[Any],
+    *,
+    project: str,
+    sources: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    """Validate and normalize every fact before the first ledger write."""
+    result: list[dict[str, Any]] = []
     for raw in facts:
         fact_id = _required_text(raw, "id")
         body = _required_text(raw, "body")
         source_refs = raw.get("source_refs")
         if not isinstance(source_refs, list) or not source_refs:
             raise ValueError(f"fact {fact_id} must name at least one source_ref")
-        referenced = []
+        referenced: list[dict[str, str]] = []
         for ref in source_refs:
             if str(ref) not in sources:
                 raise ValueError(f"fact {fact_id} references unknown source {ref}")
             referenced.append(sources[str(ref)])
-        visibility = str(raw.get("visibility") or "internal")
-        egress_policy = str(raw.get("egress_policy") or "local_only")
         scope = ScopeTag(
             "project",
             f"project:{project}",
-            visibility=visibility,
-            egress_policy=egress_policy,
+            visibility=str(raw.get("visibility") or "internal"),
+            egress_policy=str(raw.get("egress_policy") or "local_only"),
             provenance="explicit_curated_manifest",
         )
         belief_id = f"curated:{project}:{fact_id}"
-        source_attestations = [
-            {
-                "ref": source["ref"],
-                "sha256": source["sha256"],
-            }
-            for source in referenced
-        ]
         confidence = float(raw.get("confidence", 0.9))
         attributes = {
             "title": str(raw.get("title") or fact_id),
             "curated": True,
             "manifest_schema": CURATED_MANIFEST_SCHEMA,
-            "source_attestations": source_attestations,
+            "source_attestations": [
+                {"ref": source["ref"], "sha256": source["sha256"]}
+                for source in referenced
+            ],
             "source_quality": float(raw.get("source_quality", 0.95)),
             "lifecycle": str(raw.get("lifecycle") or "durable"),
             "content_sha256": sha256_text(body),
@@ -106,68 +205,18 @@ def apply_curated_manifest(
                 }
             )
         )
-        current = get_core_v1_belief(conn, belief_id)
-        if (
-            current is not None
-            and current.get("status") == "current"
-            and bool(current.get("serve"))
-            and str(current.get("body")) == body
-            and current.get("belief_type") == "curated_fact"
-            and float(current.get("confidence") or 0.0) == confidence
-            and current.get("attributes") == attributes
-            and current.get("scope") == scope.to_dict()
-        ):
-            unchanged.append(belief_id)
-            continue
-
-        evidence_ids: list[str] = []
-        for source in referenced:
-            evidence_id, _event_id = record_core_v1_evidence(
-                conn,
-                body=body,
-                kind="curated_source_attestation",
-                scope=scope,
-                writer=actor,
-                artifact_ref=str(source["path"]),
-            )
-            evidence_ids.append(evidence_id)
-        proposal_id = append_core_event(
-            conn,
-            "compilation_proposed",
+        result.append(
             {
-                "schema_version": "ocbrain.compilation.v1",
-                "subject": {"kind": "belief", "id": belief_id},
-                "belief_id": belief_id,
-                "belief_type": "curated_fact",
+                "fact_id": fact_id,
                 "body": body,
-                "evidence_ids": list(dict.fromkeys(evidence_ids)),
-                "scope": scope.to_dict(),
+                "referenced": referenced,
+                "scope": scope,
+                "belief_id": belief_id,
                 "confidence": confidence,
-                "reward_band": "strong",
                 "attributes": attributes,
-            },
-            writer=actor,
+            }
         )
-        decide_proposal_v1(
-            conn,
-            proposal_event_id=proposal_id,
-            decision="approve",
-            actor=actor,
-            edited_body=None,
-            reason="source-hash-verified curated manifest",
-        )
-        applied.append(belief_id)
-    conn.commit()
-    return {
-        "status": "ok",
-        "schema_version": CURATED_MANIFEST_SCHEMA,
-        "manifest": str(manifest_path),
-        "manifest_sha256": manifest_sha256,
-        "sources_verified": len(sources),
-        "facts_total": len(facts),
-        "applied": applied,
-        "unchanged": unchanged,
-    }
+    return result
 
 
 def _verify_sources(value: Any, *, base_dir: Path) -> dict[str, dict[str, str]]:

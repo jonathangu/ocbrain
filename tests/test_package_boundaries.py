@@ -50,7 +50,7 @@ def test_distribution_metadata_and_console_ownership() -> None:
         "ocbrain-training",
         "ocbrain-ops",
     )
-    assert core["version"] == training["version"] == ops["version"] == "1.0.1"
+    assert core["version"] == training["version"] == ops["version"] == "1.1.0"
     assert core["scripts"] == {
         "ocbrain": "ocbrain.cli:main",
         "ocbrain-closeout": "ocbrain.cli:main",
@@ -61,8 +61,9 @@ def test_distribution_metadata_and_console_ownership() -> None:
         "ocbrain-watchdog": "ocbrain_ops.stallcheck:main",
         "brain-loop-ingest": "ocbrain_ops.cli:loop_ingest_main",
     }
-    assert training["dependencies"] == ["ocbrain>=1,<2"]
-    assert ops["dependencies"] == ["ocbrain>=1,<2"]
+    assert training["dependencies"] == ["ocbrain>=1.1,<2"]
+    assert ops["dependencies"] == ["ocbrain>=1.1,<2"]
+    assert ops["optional-dependencies"] == {"training": ["ocbrain-training>=1.1,<2"]}
 
 
 def test_core_source_and_parser_exclude_companion_implementations() -> None:

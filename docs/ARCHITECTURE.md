@@ -115,7 +115,9 @@ project claim.
 - ranked current serving beliefs with confidence and evidence IDs;
 - visible contradictions;
 - bounded OCBrain-issued source handles;
-- returned/excluded counts and an excluded sample;
+- returned counts plus separate scope- and delivery-excluded serving-inventory
+  counts; these exact query-independent counts disclose category cardinalities,
+  but hosted packets never include excluded IDs, content, or an object sample;
 - estimated token cost and unavailable-source reasons;
 - a retrieval-use ID for feedback and closeout linkage.
 

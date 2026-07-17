@@ -1,0 +1,295 @@
+{
+  "schema_version": "ocbrain.golden-context.v1",
+  "dataset_class": "public_synthetic_test_fixture_not_training_data",
+  "description": "Deterministic Shared Context, hosted-egress, source, and negative-query contract cases.",
+  "records": [
+    {
+      "id": "golden:alpha:client-contract",
+      "body": "Violet compass client contract: one compatible stdio MCP client is sufficient.",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "Violet compass client contract: one compatible stdio MCP client is sufficient.",
+        "sha256": "2bfce61a8e5a32855ea8ca597273c435721e616b5a42b88514fe1fe08881b000"
+      }
+    },
+    {
+      "id": "golden:alpha:platform-contract",
+      "body": "Cobalt runway platform contract: Python 3.11 or newer is required.",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "Cobalt runway platform contract: Python 3.11 or newer is required.",
+        "sha256": "816d1d9e353d053dcc039da86b083d27973dd994056fd3c2b062a88c92794c49"
+      }
+    },
+    {
+      "id": "golden:alpha:local-note",
+      "body": "GOLDEN_LOCAL_ONLY_MARKER amber vault",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "local_only",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "GOLDEN_LOCAL_ONLY_MARKER amber vault",
+        "sha256": "2d1ea5519fd220f5c53582ff35ae0700c3c3570ac5bba506c27a4f9bb57cbcfe"
+      }
+    },
+    {
+      "id": "golden:alpha:confidential-note",
+      "body": "GOLDEN_CONFIDENTIAL_MARKER indigo ledger",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "confidential",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "GOLDEN_CONFIDENTIAL_MARKER indigo ledger",
+        "sha256": "f5b84894481c2cc931f226f507f5d62e0200acddcf3ce8ccab39bc4d3ce52508"
+      }
+    },
+    {
+      "id": "golden:alpha:prohibited-note",
+      "body": "GOLDEN_PROHIBITED_MARKER scarlet quarantine",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "prohibited",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "GOLDEN_PROHIBITED_MARKER scarlet quarantine",
+        "sha256": "f0b5d688218c4084ab56bbdf4971f8fc1afb2bec5f4ef9d9b586e72160c25f45"
+      }
+    },
+    {
+      "id": "golden:beta:foreign-note",
+      "body": "GOLDEN_FOREIGN_MARKER silver orchard",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:beta",
+        "visibility": "internal",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "GOLDEN_FOREIGN_MARKER silver orchard",
+        "sha256": "a9a72862411ea63b670bb4f0401b1e37a0c4c16d6f6285232a6a22c9d632bac2"
+      }
+    },
+    {
+      "id": "golden:alpha:legacy-route",
+      "body": "Magenta bridge rule uses the legacy route.",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "attributes": {
+        "contradicts": ["golden:alpha:current-route"]
+      },
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "Magenta bridge rule uses the legacy route.",
+        "sha256": "43ca15c3da61c3c285b7a7acd0eab2e0514fac30e99a2ba9ea32ef67848a07f9"
+      }
+    },
+    {
+      "id": "golden:alpha:current-route",
+      "body": "Magenta bridge rule uses the current route.",
+      "scope": {
+        "scope_type": "project",
+        "scope_id": "project:alpha",
+        "visibility": "internal",
+        "egress_policy": "hosted_ok",
+        "provenance": "golden_fixture"
+      },
+      "confidence": 0.95,
+      "evidence": {
+        "kind": "golden_fixture",
+        "body": "Magenta bridge rule uses the current route.",
+        "sha256": "438a7251e149997c99dc4621105f6a40e47a9356affe14fb0dfe53e53ac164e0"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "id": "hosted-client-positive",
+      "query": "violet compass client",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": ["golden:alpha:client-contract"],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3,
+        "source_item_id": "golden:alpha:client-contract",
+        "source_sha256": "2bfce61a8e5a32855ea8ca597273c435721e616b5a42b88514fe1fe08881b000",
+        "wrong_scope_denied": true
+      }
+    },
+    {
+      "id": "hosted-platform-positive",
+      "query": "cobalt runway platform",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": ["golden:alpha:platform-contract"],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3,
+        "source_item_id": "golden:alpha:platform-contract",
+        "source_sha256": "816d1d9e353d053dcc039da86b083d27973dd994056fd3c2b062a88c92794c49"
+      }
+    },
+    {
+      "id": "hosted-private-exclusion",
+      "query": "amber vault indigo ledger",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": [],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3,
+        "forbidden_ids": ["golden:alpha:local-note", "golden:alpha:confidential-note"],
+        "forbidden_markers": ["GOLDEN_LOCAL_ONLY_MARKER", "GOLDEN_CONFIDENTIAL_MARKER"]
+      }
+    },
+    {
+      "id": "hosted-scope-isolation",
+      "query": "silver orchard",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": [],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3,
+        "forbidden_ids": ["golden:beta:foreign-note"],
+        "forbidden_markers": ["GOLDEN_FOREIGN_MARKER"]
+      }
+    },
+    {
+      "id": "hosted-cross-scope-opt-in",
+      "query": "silver orchard",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": true,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": ["golden:beta:foreign-note"],
+        "eligible_count": 5,
+        "excluded_scope_count": 0,
+        "excluded_delivery_count": 3,
+        "source_item_id": "golden:beta:foreign-note",
+        "source_sha256": "a9a72862411ea63b670bb4f0401b1e37a0c4c16d6f6285232a6a22c9d632bac2"
+      }
+    },
+    {
+      "id": "local-only-visible-locally",
+      "query": "amber vault",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "local_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": ["golden:alpha:local-note"],
+        "eligible_count": 6,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 1,
+        "source_item_id": "golden:alpha:local-note",
+        "source_sha256": "2d1ea5519fd220f5c53582ff35ae0700c3c3570ac5bba506c27a4f9bb57cbcfe"
+      }
+    },
+    {
+      "id": "local-prohibited-exclusion",
+      "query": "scarlet quarantine",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "local_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": [],
+        "eligible_count": 6,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 1,
+        "forbidden_ids": ["golden:alpha:prohibited-note"],
+        "forbidden_markers": ["GOLDEN_PROHIBITED_MARKER"]
+      }
+    },
+    {
+      "id": "negative-no-match",
+      "query": "quartz zeppelin nonsense",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_ordered": [],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3
+      }
+    },
+    {
+      "id": "explicit-contradiction",
+      "query": "magenta bridge rule route",
+      "context": {"project": "alpha", "runtime": "golden"},
+      "delivery_target": "hosted_model",
+      "cross_scope": false,
+      "limit": 5,
+      "expected": {
+        "ids_unordered": ["golden:alpha:legacy-route", "golden:alpha:current-route"],
+        "eligible_count": 4,
+        "excluded_scope_count": 1,
+        "excluded_delivery_count": 3,
+        "contradictions": [
+          {
+            "belief_id": "golden:alpha:legacy-route",
+            "other_belief_id": "golden:alpha:current-route"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -23,6 +23,12 @@ Relative source paths resolve from the manifest directory. Applying a manifest
 verifies the source hashes and appends evidence, proposal, and approval events.
 Reapplying unchanged facts is idempotent.
 
+This example is intentionally `local_only`. If a reviewed manifest contains
+`hosted_ok` facts, `curated-apply` refuses to write anything unless the operator
+also passes `--allow-hosted-egress`. That flag acknowledges delivery of the
+exact fact bodies, not the complete source file or database. See
+`../hosted-context-demo/` for the public end-to-end acceptance example.
+
 Do not commit a real personal source, absolute owner path, private project fact,
 database, transcript, token, or generated runtime artifact to the public
 repository.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain"
-version = "1.0.1"
+version = "1.1.0"
 description = "Local, source-backed Shared Context for Codex, Claude Code, and MCP clients"
 readme = "README.md"
 requires-python = ">=3.11"

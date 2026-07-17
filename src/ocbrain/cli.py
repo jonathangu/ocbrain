@@ -790,6 +790,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     curated_apply.add_argument("manifest", type=Path)
     curated_apply.add_argument("--actor", default="human-curated:operator")
+    curated_apply.add_argument(
+        "--allow-hosted-egress",
+        action="store_true",
+        help="Acknowledge that hosted_ok fact bodies may be delivered to a hosted model",
+    )
     curated_apply.set_defaults(func=cmd_curated_apply)
 
     doctor_parser = commands.add_parser("doctor", help="Check the core and stdio MCP")
@@ -1330,7 +1335,12 @@ def cmd_vector_status(args: argparse.Namespace) -> int:
 def cmd_curated_apply(args: argparse.Namespace) -> int:
     conn = open_existing_core_v1(args.db)
     try:
-        result = apply_curated_manifest(conn, args.manifest, actor=args.actor)
+        result = apply_curated_manifest(
+            conn,
+            args.manifest,
+            actor=args.actor,
+            allow_hosted_egress=args.allow_hosted_egress,
+        )
     finally:
         conn.close()
     output(args, {"action": "curated-apply", **result})

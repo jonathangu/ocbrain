@@ -6,7 +6,7 @@ effectively unbounded private history, expands exact sources on demand, records
 whether the context mattered, and links the eventual outcome back to what the
 agent saw.
 
-Current core version: **v1.0.1**. License: Apache-2.0.
+Current core version: **v1.1.0**. License: Apache-2.0.
 
 [Install](#quick-start) · [Connect a client](#connect-the-clients-you-use) ·
 [Agent instructions](docs/RUNTIME_INTEGRATION.md#client-instruction-block) ·
@@ -64,7 +64,23 @@ An empty `brain.context` result immediately after installation is honest and
 expected. `brain.ingest` appends scoped evidence; it does not promote that
 evidence directly into a durable serving belief.
 
-To add a small set of reviewed starter facts, copy the synthetic
+To prove a non-empty hosted `context -> source` round trip, first review the
+four public facts in `examples/hosted-context-demo`, then apply them explicitly:
+
+```bash
+.venv/bin/ocbrain --db data/ocbrain.sqlite curated-apply \
+  examples/hosted-context-demo/manifest.json \
+  --allow-hosted-egress \
+  --actor "human-curated:YOUR-NAME"
+```
+
+The acknowledgement is required because those exact fact bodies may be sent
+to a hosted model. It does not authorize the database, full source file, or a
+local path to leave the machine. Start a fresh client and query for `OCBrain
+installation requirements and client constraints` with `project=ocbrain`; an
+issued source should expand with `hash_verified=true`.
+
+To add your own reviewed starter facts, copy the local-only synthetic
 `examples/curated-memory` example, replace its source and facts, update the
 source SHA-256, review the manifest, and apply it explicitly:
 
@@ -75,8 +91,11 @@ source SHA-256, review the manifest, and apply it explicitly:
 ```
 
 The command verifies every named source hash and appends evidence, proposal,
-and approval events; it never writes a belief projection directly. Existing
-v0.x users should follow the archive-first migration path instead.
+and approval events atomically after validating the entire manifest; it never
+writes a belief projection directly. Existing
+v0.x users should follow the archive-first migration path instead. A manifest
+containing `hosted_ok` facts always requires `--allow-hosted-egress` and cannot
+combine that policy with confidential or secret visibility.
 
 The product is the evidence and outcome ledger, not a particular embedding
 model, vector database, prompt, or training pipeline. Search indexes,
@@ -147,9 +166,15 @@ For development:
 
 ```bash
 .venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pytest -q tests/test_golden_context_v1.py
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
 ```
+
+The focused [golden Shared Context dataset](tests/fixtures/README.md) uses only
+public synthetic facts. It tests the real MCP context/source contract,
+including hosted filtering, scope isolation, contradictions, and source hash
+verification; it is not training data.
 
 ## MCP profiles
 
