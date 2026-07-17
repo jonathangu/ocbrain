@@ -4,16 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ocbrain-ops"
-version = "1.0.1"
+version = "1.1.0"
 description = "Optional manual operations and watchdog tools for OCBrain"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 authors = [{ name = "Jonathan Gu" }]
-dependencies = ["ocbrain>=1,<2"]
+dependencies = ["ocbrain>=1.1,<2"]
 
 [project.optional-dependencies]
-training = ["ocbrain-training>=1,<2"]
+training = ["ocbrain-training>=1.1,<2"]
 
 [project.scripts]
 ocbrain-ops = "ocbrain_ops.cli:main"

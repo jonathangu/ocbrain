@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+## 1.1.0 — 2026-07-17
+
+- Add optional hybrid lexical/dense retrieval with an explicit local vector
+  sidecar and deterministic lexical fallback when the sidecar is absent,
+  stale, or incompatible.
+- Add source-hash-verified curated-memory manifests for explicitly reviewed
+  starter beliefs; relative source paths are portable and the public example
+  contains synthetic data only.
+- Restrict core database files to owner read/write permissions and document
+  that SQLite remains plaintext at rest.
+- Add a clone-to-first-smoke quick start, explicit empty-brain behavior,
+  contribution and security policies, issue/PR templates, code ownership, and
+  a public CI gate.
+- Clarify that OpenClaw is optional and that each compatible MCP client must be
+  configured and instructed before a fresh chat can use OCBrain.
+- Enforce server-controlled hosted-model delivery, bounded 32 KB context
+  packets, bounded excerpts and source handles, and local-path redaction.
+- Partition current serving inventory into eligible, scope-excluded, and
+  delivery-excluded counts without listing excluded hosted IDs or content;
+  these exact, query-independent counts disclose category cardinalities.
+- Require an explicit hosted-egress acknowledgement for curated manifests and
+  apply fully prevalidated manifests atomically; add a public, source-backed
+  hosted-context demonstration.
+- Add a deterministic public golden retrieval dataset covering relevance,
+  scope, delivery policy, source hashes, contradictions, and negative queries.
+
 ## 1.0.1 — 2026-07-13
 
 - Add explicit, owner-only evidence bundles for manual cross-machine exchange;

@@ -1,8 +1,9 @@
 # Runtime integration
 
-Codex, Claude Code, and OpenClaw use the same on-demand stdio MCP launcher and
-the same activated v1 core. A config entry is necessary but not sufficient;
-acceptance requires a real tool round trip from a fresh process.
+Codex, Claude Code, OpenClaw, and compatible clients can use the same on-demand
+stdio MCP launcher and local v1 core. OpenClaw is optional. A config entry is
+necessary but not sufficient; acceptance requires a real tool round trip from
+a fresh process.
 
 Current local status: **accepted on 2026-07-13**. Codex, Claude Code, and
 OpenClaw completed the full round trip against the same v1 core, SQLite and
@@ -31,11 +32,18 @@ between producing a candidate and choosing to activate it.
 
 ## Register the same launcher
 
+Register only the clients you use:
+
 ```bash
 LAUNCHER="$PWD/scripts/ocbrain-mcp"
 
 codex mcp add ocbrain -- "$LAUNCHER"
 claude mcp add --scope user ocbrain -- "$LAUNCHER"
+```
+
+If you use OpenClaw, register the same launcher:
+
+```bash
 openclaw mcp add ocbrain --command "$LAUNCHER"
 ```
 
@@ -45,7 +53,7 @@ Check saved configuration and stdio negotiation:
 
 ```bash
 codex mcp get ocbrain
-claude mcp list
+claude mcp get ocbrain
 openclaw mcp doctor ocbrain
 openclaw mcp probe ocbrain
 ```
@@ -63,8 +71,8 @@ OpenClaw normalizes dotted MCP names to provider-safe names such as
 ## Fresh-process acceptance
 
 Already-open tasks can retain the MCP child process they created before an
-upgrade. Start a fresh Codex/ChatGPT task and reconnect or restart Claude Code
-and OpenClaw for release acceptance.
+upgrade. Start a fresh task or reconnect/restart each configured client for
+release acceptance.
 
 Use the same semantic prompt in each runtime:
 
@@ -85,7 +93,7 @@ Acceptance requires evidence from the core database:
 - a hash-verified source expansion when a handle was issued;
 - a feedback update on the issued retrieval;
 - an `ocbrain.closeout.v1` receipt linked to that retrieval;
-- runtime/session attribution for Codex, Claude Code, and OpenClaw;
+- runtime/session attribution for each client being accepted;
 - all receipts in the same activated core.
 
 An honestly empty context packet is not a full source-expansion acceptance. Seed
@@ -93,8 +101,8 @@ or migrate at least one scoped, serving belief with source evidence first.
 
 ## Client instruction block
 
-Use this compact policy in Codex `AGENTS.md`, Claude `CLAUDE.md`, and the
-OpenClaw workspace instructions:
+Use this compact policy in Codex `AGENTS.md`, Claude `CLAUDE.md`, and OpenClaw
+workspace instructions:
 
 ```markdown
 ## OCBrain
@@ -159,7 +167,7 @@ ocbrain --db /absolute/core.sqlite status
 ocbrain --db /absolute/core.sqlite sync --max-events 1000 --time-budget 10
 ocbrain --db /absolute/core.sqlite doctor
 codex mcp get ocbrain
-claude mcp list
+claude mcp get ocbrain
 openclaw mcp doctor ocbrain
 openclaw mcp probe ocbrain
 ```

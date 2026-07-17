@@ -1,0 +1,57 @@
+{
+  "schema_version": "ocbrain.curated-memory.v1",
+  "project": "ocbrain",
+  "sources": [
+    {
+      "ref": "INSTALL",
+      "path": "source.md",
+      "sha256": "731dbd29033ada8023091f4b083e4ec909b10eb465669f9ed4dabe3d7dac2c10"
+    }
+  ],
+  "facts": [
+    {
+      "id": "installation-requirements",
+      "title": "Installation requirements",
+      "body": "OCBrain requires Python 3.11 or newer and a Git source installation.",
+      "source_refs": ["INSTALL"],
+      "visibility": "internal",
+      "egress_policy": "hosted_ok",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 1.0
+    },
+    {
+      "id": "client-constraints",
+      "title": "Client constraints",
+      "body": "One compatible stdio MCP client is enough. OpenClaw is optional.",
+      "source_refs": ["INSTALL"],
+      "visibility": "internal",
+      "egress_policy": "hosted_ok",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 1.0
+    },
+    {
+      "id": "platform-support",
+      "title": "Platform support",
+      "body": "The source launcher targets macOS and Linux. Native Windows is unsupported; WSL has not passed release acceptance.",
+      "source_refs": ["INSTALL"],
+      "visibility": "internal",
+      "egress_policy": "hosted_ok",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 1.0
+    },
+    {
+      "id": "storage-security",
+      "title": "Storage security",
+      "body": "The local SQLite database is plaintext and should remain owner-only.",
+      "source_refs": ["INSTALL"],
+      "visibility": "internal",
+      "egress_policy": "hosted_ok",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 1.0
+    }
+  ]
+}

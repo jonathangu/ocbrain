@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from collections.abc import Iterable
@@ -20,6 +21,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ocbrain.hybrid import semantic_neighbors
 from ocbrain.ids import stable_id
 from ocbrain.scope import ScopeContext, ScopeTag, scope_match
 
@@ -27,6 +29,8 @@ CORE_V1_APPLICATION_ID = 0x4F434231  # ASCII-ish "OCB1"
 CORE_V1_USER_VERSION = 10_000
 CORE_V1_SCHEMA_VERSION = "ocbrain.core.v1"
 CORE_V1_EVENT_SCHEMA = "ocbrain.event.v1"
+HYBRID_RRF_K = 60
+MIN_DENSE_COSINE = 0.15
 
 LEGACY_IMPORT_KINDS = {
     "legacy_evidence_imported",
@@ -755,8 +759,8 @@ def _project_compilation_decision(
         conn,
         belief_id=belief_id,
         body=belief_body,
-        belief_type=None,
-        attributes={},
+        belief_type=proposed.get("belief_type"),
+        attributes=dict(proposed.get("attributes") or {}),
         scope=scope,
         confidence=proposed.get("confidence"),
         evidence_ids=evidence_ids,
@@ -767,6 +771,10 @@ def _project_compilation_decision(
         last_event_id=event["id"],
         compiled_at=event["ts"],
     )
+    # An approved proposal replaces the current support set. The evidence
+    # objects and events remain immutable, but obsolete relations must not be
+    # served as sources for the new belief revision.
+    conn.execute("DELETE FROM belief_evidence WHERE belief_id=?", (belief_id,))
     for evidence_id in evidence_ids:
         _link_belief_evidence(
             conn,
@@ -1200,7 +1208,14 @@ def _upsert_evidence_object(
           source_content_hash=COALESCE(
             excluded.source_content_hash, evidence_objects.source_content_hash
           ),
-          metadata_json=excluded.metadata_json
+          recorded_at=excluded.recorded_at,
+          scope_type=excluded.scope_type,
+          scope_id=excluded.scope_id,
+          visibility=excluded.visibility,
+          egress_policy=excluded.egress_policy,
+          scope_provenance=excluded.scope_provenance,
+          metadata_json=excluded.metadata_json,
+          recorded_event_id=excluded.recorded_event_id
         """,
         (
             evidence_id,
@@ -1467,38 +1482,97 @@ def search_core_v1(
     context: ScopeContext | None = None,
     limit: int = 12,
     cross_scope: bool = False,
+    delivery_target: str = "local_model",
 ) -> dict[str, Any]:
-    """Return the stable retrieval subset needed by ``ocbrain.context.v1``."""
+    """Return scope-safe hybrid lexical/dense retrieval for ``ocbrain.context.v1``.
+
+    Dense vectors are a disposable loopback-only sidecar.  If it is absent or
+    local inference is unavailable, retrieval remains deterministic and
+    lexical.  Lifecycle, scope, visibility, and delivery policy are applied
+    before either candidate list is ranked.
+    """
     context = context or ScopeContext()
     fts = _normalize_fts_query(query)
-    if not fts:
-        return {"items": [], "excluded": [], "excluded_count": 0}
     compatible = sorted(context.compatible_scope_ids())
     placeholders = ",".join("?" for _ in compatible)
-    scope_sql = f"cb.scope_id IN ({placeholders})"
+    scope_sql = f"(cb.scope_type='global' OR cb.scope_id IN ({placeholders}))"
     scope_params: list[Any] = list(compatible)
     if cross_scope:
         scope_sql = (
-            f"({scope_sql} OR (cb.scope_type != 'legacy_unscoped' "
+            f"({scope_sql} OR (cb.scope_type NOT IN ('legacy_unscoped','client') "
             "AND cb.visibility NOT IN ('confidential','secret')))"
         )
-    rows = conn.execute(
-        f"""
-        SELECT cb.*, bm25(search_index) AS lexical_rank
-        FROM search_index
-        JOIN search_documents sd ON sd.rowid=search_index.rowid
-        JOIN current_beliefs cb ON cb.belief_id=sd.doc_id
-        WHERE search_index MATCH ? AND cb.serve=1 AND cb.status='current'
-          AND {scope_sql}
-        ORDER BY lexical_rank, cb.pinned DESC, cb.last_compiled_at DESC, cb.belief_id
-        LIMIT ?
-        """,  # noqa: S608 - placeholder count is derived from local ScopeContext fields
-        (fts, *scope_params, max(limit * 8, 40)),
+    delivery_sql = _delivery_sql(delivery_target)
+    visibility_counts = _serving_visibility_counts(
+        conn,
+        scope_sql=scope_sql,
+        scope_params=scope_params,
+        delivery_sql=delivery_sql,
     )
-    items: list[dict[str, Any]] = []
-    excluded: list[dict[str, Any]] = []
-    excluded_count = 0
-    for rank, row in enumerate(rows):
+    eligible_rows = list(
+        conn.execute(
+            f"""
+            SELECT cb.* FROM current_beliefs cb
+            WHERE cb.serve=1 AND cb.status='current' AND {scope_sql} AND {delivery_sql}
+            ORDER BY cb.belief_id
+            """,  # noqa: S608 - clauses are selected from fixed local constants
+            scope_params,
+        )
+    )
+    eligible = {str(row["belief_id"]): row for row in eligible_rows}
+    candidate_limit = max(limit * 10, 120)
+    lexical_rows: list[sqlite3.Row] = []
+    if fts:
+        lexical_rows = list(
+            conn.execute(
+                f"""
+                SELECT cb.*, bm25(search_index, 0.25, 5.0, 1.0) AS lexical_score
+                FROM search_index
+                JOIN search_documents sd ON sd.rowid=search_index.rowid
+                JOIN current_beliefs cb ON cb.belief_id=sd.doc_id
+                WHERE search_index MATCH ? AND cb.serve=1 AND cb.status='current'
+                  AND {scope_sql} AND {delivery_sql}
+                ORDER BY lexical_score, cb.pinned DESC, cb.last_compiled_at DESC, cb.belief_id
+                LIMIT ?
+                """,  # noqa: S608 - clauses are selected from fixed local constants
+                (fts, *scope_params, candidate_limit),
+            )
+        )
+    dense_rows, dense_fallback = semantic_neighbors(
+        conn,
+        query,
+        candidate_ids=eligible,
+        limit=candidate_limit,
+    )
+    dense_rows = [
+        row for row in dense_rows if float(row.get("similarity") or 0.0) >= MIN_DENSE_COSINE
+    ]
+    lexical_rank = {str(row["belief_id"]): rank for rank, row in enumerate(lexical_rows, 1)}
+    dense_rank = {str(row["belief_id"]): rank for rank, row in enumerate(dense_rows, 1)}
+    dense_similarity = {str(row["belief_id"]): float(row["similarity"]) for row in dense_rows}
+    candidate_ids = set(lexical_rank) | set(dense_rank)
+    if not candidate_ids:
+        return {
+            "items": [],
+            "excluded": [],
+            "excluded_count": visibility_counts["excluded_scope_count"],
+            "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
+            "exclusion_count_basis": "current_serving_inventory",
+            "ranking": {
+                "mode": "lexical" if dense_fallback else "hybrid",
+                "dense_fallback": dense_fallback,
+                "eligible_count": visibility_counts["eligible_count"],
+                "lexical_candidates": 0,
+                "dense_candidates": 0,
+            },
+        }
+    feedback = _retrieval_feedback_scores(conn, candidate_ids)
+    query_normalized = _dedupe_text(query)
+    ranked: list[tuple[float, str, dict[str, Any]]] = []
+    for belief_id in candidate_ids:
+        row = eligible.get(belief_id)
+        if row is None:
+            continue
         scope = ScopeTag(
             str(row["scope_type"]),
             str(row["scope_id"]),
@@ -1506,40 +1580,91 @@ def search_core_v1(
             egress_policy=str(row["egress_policy"]),
             provenance=str(row["scope_provenance"]),
         )
-        weight = scope_match(scope, context, cross_scope=cross_scope)
-        if weight == 0:
-            excluded_count += 1
-            if len(excluded) < limit:
-                excluded.append(
-                    {
-                        "belief_id": row["belief_id"],
-                        "scope": scope.to_dict(),
-                        "reason": "scope_mismatch",
-                    }
-                )
+        scope_weight = scope_match(scope, context, cross_scope=cross_scope)
+        if scope_weight == 0:
             continue
-        confidence = float(row["confidence"] if row["confidence"] is not None else 0.5)
-        score = weight * confidence / (rank + 1)
-        items.append(
-            {
-                "belief_id": row["belief_id"],
-                "body": row["body"],
-                "scope": scope.to_dict(),
-                "score": round(score, 6),
-                "relevance": round(1.0 / (rank + 1), 6),
-                "scope_weight": weight,
-                "confidence": confidence,
-                "confidence_band": row["confidence_band"],
-                "evidence_ids": _json_list(row["evidence_ids"]),
-                "source": "core_v1",
-            }
+        attributes = json.loads(row["attributes_json"] or "{}")
+        confidence = float(row["confidence"] if row["confidence"] is not None else 0.65)
+        quality = _source_quality(attributes)
+        recency = _recency_score(str(row["last_compiled_at"]))
+        lexical_component = 0.0
+        if belief_id in lexical_rank:
+            lexical_component = 1.0 / (HYBRID_RRF_K + lexical_rank[belief_id])
+        dense_component = 0.0
+        if belief_id in dense_rank:
+            dense_component = dense_similarity[belief_id] / (HYBRID_RRF_K + dense_rank[belief_id])
+        rrf = lexical_component + dense_component
+        exact_boost = 0.0
+        body_normalized = _dedupe_text(str(row["body"]))
+        if query_normalized and query_normalized in body_normalized:
+            exact_boost += 0.25
+        if belief_id.lower() in query.lower():
+            exact_boost += 1.0
+        feedback_boost = feedback.get(belief_id, 0.0)
+        ranking_prior = (
+            scope_weight
+            * (0.85 + 0.15 * confidence)
+            * (0.85 + 0.15 * quality)
+            * (0.99 + 0.01 * recency)
         )
+        score = rrf * ranking_prior * (1.0 + feedback_boost) * (1.0 + exact_boost)
+        ranked.append(
+            (
+                score,
+                belief_id,
+                {
+                    "belief_id": belief_id,
+                    "body": row["body"],
+                    "scope": scope.to_dict(),
+                    "score": round(score, 8),
+                    "relevance": round(rrf, 8),
+                    "scope_weight": scope_weight,
+                    "confidence": confidence,
+                    "confidence_band": row["confidence_band"],
+                    "evidence_ids": _json_list(row["evidence_ids"]),
+                    "source": "core_v1_hybrid",
+                    "ranking": {
+                        "lexical_rank": lexical_rank.get(belief_id),
+                        "dense_rank": dense_rank.get(belief_id),
+                        "dense_similarity": dense_similarity.get(belief_id),
+                        "lexical_component": round(lexical_component, 8),
+                        "dense_component": round(dense_component, 8),
+                        "source_quality": round(quality, 4),
+                        "recency": round(recency, 4),
+                        "ranking_prior": round(ranking_prior, 6),
+                        "feedback_boost": round(feedback_boost, 6),
+                        "exact_boost": round(exact_boost, 6),
+                    },
+                },
+            )
+        )
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    items: list[dict[str, Any]] = []
+    seen_content: set[str] = set()
+    for _score, _belief_id, item in ranked:
+        content_key = sha256_text(_dedupe_text(str(item["body"])))
+        if content_key in seen_content:
+            continue
+        seen_content.add(content_key)
+        items.append(item)
         if len(items) >= limit:
             break
     return {
         "items": items,
-        "excluded": excluded,
-        "excluded_count": excluded_count,
+        "excluded": [],
+        "excluded_count": visibility_counts["excluded_scope_count"],
+        "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
+        "exclusion_count_basis": "current_serving_inventory",
+        "ranking": {
+            "mode": "lexical" if dense_fallback else "hybrid_rrf",
+            "dense_fallback": dense_fallback,
+            "eligible_count": visibility_counts["eligible_count"],
+            "lexical_candidates": len(lexical_rank),
+            "dense_candidates": len(dense_rank),
+            "deduplicated_candidates": len(ranked) - len(items),
+            "rrf_k": HYBRID_RRF_K,
+            "min_dense_cosine": MIN_DENSE_COSINE,
+        },
     }
 
 
@@ -1631,7 +1756,145 @@ def record_core_v1_retrieval(
 
 def _normalize_fts_query(query: str) -> str:
     terms = re.findall(r"[\w-]{2,}", query.lower())
-    return " OR ".join(f'"{term}"' for term in terms[:8])
+    stopwords = {
+        "about",
+        "after",
+        "again",
+        "also",
+        "and",
+        "are",
+        "can",
+        "could",
+        "for",
+        "from",
+        "have",
+        "how",
+        "into",
+        "just",
+        "make",
+        "our",
+        "should",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "this",
+        "very",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "with",
+        "would",
+        "your",
+    }
+    meaningful = list(dict.fromkeys(term for term in terms if term not in stopwords))
+    return " OR ".join(f'"{term}"' for term in meaningful[:24])
+
+
+def _delivery_sql(target: str) -> str:
+    if target == "hosted_model":
+        return (
+            "cb.egress_policy='hosted_ok' AND cb.scope_type!='client' "
+            "AND cb.visibility NOT IN ('confidential','secret')"
+        )
+    if target == "local_model":
+        return "cb.egress_policy!='prohibited'"
+    raise ValueError(f"unsupported delivery target: {target}")
+
+
+def _serving_visibility_counts(
+    conn: sqlite3.Connection,
+    *,
+    scope_sql: str,
+    scope_params: list[Any],
+    delivery_sql: str,
+) -> dict[str, int]:
+    """Partition current serving inventory without exposing excluded objects.
+
+    These counts describe the scope and delivery gates before query ranking.
+    They are intentionally query-independent so an empty or unmatched query
+    still reports whether the supplied context can see any serving inventory.
+    """
+    row = conn.execute(
+        f"""
+        WITH classified AS (
+          SELECT
+            CASE WHEN {scope_sql} THEN 1 ELSE 0 END AS scope_allowed,
+            CASE WHEN {delivery_sql} THEN 1 ELSE 0 END AS delivery_allowed
+          FROM current_beliefs cb
+          WHERE cb.serve=1 AND cb.status='current'
+        )
+        SELECT
+          COALESCE(SUM(CASE WHEN scope_allowed=0 THEN 1 ELSE 0 END), 0)
+            AS excluded_scope_count,
+          COALESCE(SUM(CASE WHEN scope_allowed=1 AND delivery_allowed=0 THEN 1 ELSE 0 END), 0)
+            AS excluded_delivery_count,
+          COALESCE(SUM(CASE WHEN scope_allowed=1 AND delivery_allowed=1 THEN 1 ELSE 0 END), 0)
+            AS eligible_count
+        FROM classified
+        """,  # noqa: S608 - clauses are selected from fixed local expressions
+        scope_params,
+    ).fetchone()
+    return {
+        "excluded_scope_count": int(row["excluded_scope_count"]),
+        "excluded_delivery_count": int(row["excluded_delivery_count"]),
+        "eligible_count": int(row["eligible_count"]),
+    }
+
+
+def _source_quality(attributes: dict[str, Any]) -> float:
+    raw = attributes.get("source_quality", attributes.get("quality_score", 0.75))
+    try:
+        return min(max(float(raw), 0.0), 1.0)
+    except (TypeError, ValueError):
+        return 0.75
+
+
+def _recency_score(value: str) -> float:
+    try:
+        observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=UTC)
+        days = max((datetime.now(UTC) - observed).total_seconds() / 86_400.0, 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return math.exp(-days / 365.0)
+
+
+def _retrieval_feedback_scores(conn: sqlite3.Connection, belief_ids: set[str]) -> dict[str, float]:
+    if not belief_ids:
+        return {}
+    placeholders = ",".join("?" for _ in belief_ids)
+    rows = conn.execute(
+        f"""
+        SELECT ri.object_id,
+          SUM(CASE ru.outcome
+                WHEN 'helpful' THEN 2.0 WHEN 'used' THEN 1.0
+                WHEN 'irrelevant' THEN -1.5 WHEN 'ignored' THEN -0.5
+                WHEN 'harmful' THEN -4.0 ELSE 0.0 END) AS signal,
+          SUM(CASE WHEN ru.outcome IN
+                ('helpful','used','irrelevant','ignored','harmful') THEN 1 ELSE 0 END) AS n
+        FROM retrieval_items ri JOIN retrieval_uses ru ON ru.id=ri.retrieval_use_id
+        WHERE ri.object_id IN ({placeholders})
+        GROUP BY ri.object_id
+        """,  # noqa: S608 - placeholder count derives only from selected belief ids
+        tuple(sorted(belief_ids)),
+    )
+    result: dict[str, float] = {}
+    for row in rows:
+        count = int(row["n"] or 0)
+        if count:
+            average = float(row["signal"] or 0.0) / count
+            result[str(row["object_id"])] = min(max(average * 0.006, -0.03), 0.018)
+    return result
+
+
+def _dedupe_text(value: str) -> str:
+    return " ".join(re.findall(r"[\w-]+", value.lower()))
 
 
 def _json_list(value: Any) -> list[str]:
@@ -1669,11 +1932,12 @@ def _restrictive_status(existing: str, imported: str) -> str:
 
 
 def _legacy_serve(row: dict[str, Any], status: str) -> bool:
-    return bool(
-        status == "current"
-        and not row.get("quarantine_reason")
-        and row.get("quality_label") not in {"bad", "excluded"}
-    )
+    # The full legacy snapshot remains immutable evidence/archive, never a
+    # retrieval corpus.  Serving requires a native v1 proposal plus explicit
+    # gate decision so catalog paths, plugin caches, transcript pointers, and
+    # package-store chatter cannot leak back into current memory on rebuild.
+    del row, status
+    return False
 
 
 def _confidence_band(confidence: float | None) -> str:

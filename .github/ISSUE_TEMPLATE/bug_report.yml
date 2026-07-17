@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible OCBrain defect using synthetic data.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach a live database, transcript, secret, private path, or personal identifier. Report security issues through the private vulnerability form instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v1.1.0 or a commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Python version, operating system, and MCP client
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include a minimal synthetic reproduction and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification evidence
+      description: Include relevant test output, redacted logs, or verifier details.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed private data, secrets, personal identifiers, and owner-specific paths.
+          required: true

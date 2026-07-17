@@ -16,6 +16,10 @@ SCOPE_TYPES = {
 VISIBILITIES = {"public", "internal", "confidential", "secret"}
 EGRESS_POLICIES = {"hosted_ok", "local_only", "approval_required", "prohibited"}
 
+LOCAL_MODEL_TARGET = "local_model"
+HOSTED_MODEL_TARGET = "hosted_model"
+DELIVERY_TARGETS = {LOCAL_MODEL_TARGET, HOSTED_MODEL_TARGET}
+
 DEFAULT_GLOBAL_SCOPE_ID = "global:doctrine"
 
 
@@ -185,13 +189,31 @@ def scope_match(
     return 0.15 if cross_scope else 0.0
 
 
-def egress_allowed(scope: ScopeTag, context: ScopeContext, target: str) -> tuple[bool, str]:
-    match = scope_match(scope, context)
+def normalize_delivery_target(
+    target: str | None,
+    *,
+    default: str = LOCAL_MODEL_TARGET,
+) -> str:
+    resolved = default if target is None else target
+    if not isinstance(resolved, str) or resolved not in DELIVERY_TARGETS:
+        allowed = ", ".join(sorted(DELIVERY_TARGETS))
+        raise ValueError(f"delivery_target must be one of: {allowed}")
+    return resolved
+
+
+def egress_allowed(
+    scope: ScopeTag,
+    context: ScopeContext,
+    target: str,
+    *,
+    cross_scope: bool = False,
+) -> tuple[bool, str]:
+    match = scope_match(scope, context, cross_scope=cross_scope)
     if match == 0:
         return False, "scope_mismatch"
-    if target == "local_model":
+    if target == LOCAL_MODEL_TARGET:
         return scope.egress_policy != "prohibited", "allowed_local"
-    if target == "hosted_teacher":
+    if target in {HOSTED_MODEL_TARGET, "hosted_teacher"}:
         if scope.hosted_egress_allowed:
             return True, "allowed_hosted"
         return False, f"egress_policy:{scope.egress_policy};visibility:{scope.visibility}"

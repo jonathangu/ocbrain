@@ -1,0 +1,35 @@
+{
+  "schema_version": "ocbrain.curated-memory.v1",
+  "project": "example-project",
+  "sources": [
+    {
+      "ref": "S1",
+      "path": "source.md",
+      "sha256": "28d8cd1b4287d12eb9bc21c67a7d916877c79dd330dffdff52b1ae8423e74d82"
+    }
+  ],
+  "facts": [
+    {
+      "id": "api-boundary",
+      "title": "API boundary",
+      "body": "The example service is read-only.",
+      "source_refs": ["S1"],
+      "visibility": "internal",
+      "egress_policy": "local_only",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 0.95
+    },
+    {
+      "id": "release-gate",
+      "title": "Release gate",
+      "body": "Every release requires a passing test suite.",
+      "source_refs": ["S1"],
+      "visibility": "internal",
+      "egress_policy": "local_only",
+      "lifecycle": "durable",
+      "source_quality": 1.0,
+      "confidence": 0.95
+    }
+  ]
+}

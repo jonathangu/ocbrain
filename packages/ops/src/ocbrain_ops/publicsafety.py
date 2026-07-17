@@ -89,6 +89,19 @@ _GIT_REVISION_CONTEXT_RE = re.compile(
     r"(?i)(?:git.{0,24}(?:commit|revision)|(?:commit|revision).{0,24}git)"
 )
 
+# A source SHA-256 next to an explicit `sha256` label is integrity metadata.
+# Keep unlabeled 64-hex values suspicious.
+_FULL_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_CONTEXT_RE = re.compile(r"(?i)\bsha-?256\b")
+
+# Repo documentation legitimately links to these public hosts. Suppress entropy
+# spans only when they are wholly inside a query-free HTTPS URL on this narrow
+# allowlist. Query strings and fragments remain scanned so tokenized links do
+# not gain an exemption.
+_PUBLIC_URL_RE = re.compile(
+    r"https://(?:github\.com|openclawbrain\.ai)/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*"
+)
+
 # One reviewed, public prompt-version label exceeds the generic entropy
 # threshold. Suppress only that exact literal when assigned to the exact
 # ``prompt_version`` field. Random strings, quoted blobs, similarly shaped
@@ -240,6 +253,23 @@ def filter_public_git_revision_spans(line: str, spans: list[str]) -> list[str]:
     if not _GIT_REVISION_CONTEXT_RE.search(line):
         return spans
     return [span for span in spans if not _FULL_GIT_OBJECT_RE.fullmatch(span)]
+
+
+def filter_public_sha256_spans(line: str, spans: list[str]) -> list[str]:
+    """Drop a full source digest only when the line labels it as SHA-256."""
+
+    if not _SHA256_CONTEXT_RE.search(line):
+        return spans
+    return [span for span in spans if not _FULL_SHA256_RE.fullmatch(span)]
+
+
+def filter_public_url_spans(line: str, spans: list[str]) -> list[str]:
+    """Drop spans wholly contained in a narrow, query-free public URL."""
+
+    public_urls = [match.group(0) for match in _PUBLIC_URL_RE.finditer(line)]
+    if not public_urls:
+        return spans
+    return [span for span in spans if not any(span in url for url in public_urls)]
 
 
 def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> list[str]:
@@ -432,6 +462,8 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
             # long high-entropy runs (see entropy_pathcheck_excluded).
             if not entropy_pathcheck_excluded(rel):
                 spans = filter_public_git_revision_spans(content, find_high_entropy_spans(content))
+                spans = filter_public_sha256_spans(content, spans)
+                spans = filter_public_url_spans(content, spans)
                 spans = filter_python_identifier_spans(rel, content, spans)
                 spans = filter_public_version_spans(rel, content, spans)
                 if spans:

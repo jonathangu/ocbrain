@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -37,6 +40,7 @@ from ocbrain.events import (
     record_tombstone,
 )
 from ocbrain.mcp_v1 import (
+    bind_retrieval_id_v1,
     build_context_v1,
     closeout_v1,
     correct_v1,
@@ -47,12 +51,19 @@ from ocbrain.mcp_v1 import (
     forget_v1,
     get_v1,
     ingest_v1,
+    prepare_retrieval_packet_v1,
     proposals_v1,
     record_context_v1,
     search_v1,
 )
 from ocbrain.retrieve import retrieve
-from ocbrain.scope import ScopeContext, ScopeTag
+from ocbrain.scope import (
+    HOSTED_MODEL_TARGET,
+    LOCAL_MODEL_TARGET,
+    ScopeContext,
+    ScopeTag,
+    normalize_delivery_target,
+)
 from ocbrain.shared_context import (
     build_context,
     expand_source,
@@ -100,6 +111,17 @@ ADMIN_ONLY_TOOLS = {
     "brain.forget",
 }
 
+LEGACY_HOSTED_READ_TOOLS = {
+    "brain.context",
+    "brain.source",
+    "brain.search",
+    "brain.preview",
+    "brain.egress_preview",
+    "brain.digest",
+    "brain.get",
+    "brain.proposals",
+}
+
 ACTIVE_DB_CHANGED_EXIT_CODE = 3
 ACTIVE_DB_CHANGED_ERROR_CODE = -32010
 ACTIVE_DB_CHANGED_MESSAGE = (
@@ -143,7 +165,12 @@ def serve(
     allow_writes: bool = False,
     profile: str | None = None,
     active_db_file: Path | None = None,
+    delivery_target: str = HOSTED_MODEL_TARGET,
+    idle_timeout_seconds: float | None = None,
 ) -> int:
+    delivery_target = normalize_delivery_target(delivery_target)
+    if idle_timeout_seconds is None:
+        idle_timeout_seconds = _configured_idle_timeout()
     if active_db_file is not None and not _active_db_pointer_matches(
         db_path,
         active_db_file,
@@ -160,7 +187,19 @@ def serve(
         init_db(conn)
     else:
         init_core_v1(conn)
-    for line in sys.stdin:
+    stdin_reader = _StdinLineReader(idle_timeout_seconds)
+    while True:
+        line = stdin_reader.readline()
+        if line is None:
+            sys.stderr.write(
+                f"ocbrain: MCP exited after {idle_timeout_seconds:g}s with no stdin activity\n"
+            )
+            sys.stderr.flush()
+            conn.close()
+            return 0
+        if line == "":
+            conn.close()
+            return 0
         if not line.strip():
             continue
         if active_db_file is not None and not _active_db_pointer_matches(
@@ -181,12 +220,68 @@ def serve(
             request,
             allow_writes=allow_writes,
             profile=profile,
+            delivery_target=delivery_target,
         )
         if response is None:
             continue
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
-    return 0
+
+
+def _configured_idle_timeout() -> float | None:
+    value = os.environ.get("OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS")
+    if value is None or not value.strip():
+        return None
+    try:
+        timeout = float(value)
+    except ValueError as exc:
+        raise ValueError("OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS must be numeric") from exc
+    if timeout <= 0:
+        return None
+    return timeout
+
+
+class _StdinLineReader:
+    """Read stdio frames without losing TextIOWrapper read-ahead.
+
+    ``select`` cannot see lines Python already buffered after an earlier read.
+    A single daemon reader therefore owns stdin and queues every decoded line;
+    the serving thread applies the idle deadline to the queue instead.
+    """
+
+    def __init__(self, idle_timeout_seconds: float | None) -> None:
+        self.idle_timeout_seconds = idle_timeout_seconds
+        self.lines: queue.Queue[str] | None = None
+        if idle_timeout_seconds is not None:
+            self.lines = queue.Queue()
+            threading.Thread(
+                target=self._pump,
+                name="ocbrain-mcp-stdin",
+                daemon=True,
+            ).start()
+
+    def _pump(self) -> None:
+        assert self.lines is not None
+        while True:
+            line = _readline_without_timeout()
+            self.lines.put(line)
+            if line == "":
+                return
+
+    def readline(self) -> str | None:
+        if self.lines is None:
+            return _readline_without_timeout()
+        try:
+            return self.lines.get(timeout=self.idle_timeout_seconds)
+        except queue.Empty:
+            return None
+
+
+def _readline_without_timeout() -> str:
+    readline = getattr(sys.stdin, "readline", None)
+    if callable(readline):
+        return str(readline())
+    return str(next(iter(sys.stdin), ""))
 
 
 def _active_db_pointer_matches(db_path: Path, active_db_file: Path) -> bool:
@@ -239,6 +334,7 @@ def handle_request(
     *,
     allow_writes: bool = False,
     profile: str | None = None,
+    delivery_target: str = LOCAL_MODEL_TARGET,
 ) -> dict[str, Any] | None:
     if not isinstance(request, dict):
         return error_response(
@@ -247,6 +343,7 @@ def handle_request(
             "invalid request: message must be a JSON object",
         )
     resolved_profile = resolve_profile(profile=profile, allow_writes=allow_writes)
+    resolved_delivery_target = normalize_delivery_target(delivery_target)
     method = request.get("method")
     request_id = request.get("id")
     is_notification = "id" not in request
@@ -257,7 +354,11 @@ def handle_request(
         if method == "initialize":
             result = {
                 "protocolVersion": "2025-11-25",
-                "serverInfo": {"name": "ocbrain", "version": __version__},
+                "serverInfo": {
+                    "name": "ocbrain",
+                    "version": __version__,
+                    "deliveryTarget": resolved_delivery_target,
+                },
                 "instructions": INSTRUCTIONS,
                 "capabilities": {"tools": {}, "resources": {}},
             }
@@ -272,11 +373,21 @@ def handle_request(
                 conn,
                 params,
                 profile=resolved_profile,
+                delivery_target=resolved_delivery_target,
             )
         elif method == "resources/list":
-            result = {"resources": resource_list(conn)}
+            result = {
+                "resources": resource_list(
+                    conn,
+                    delivery_target=resolved_delivery_target,
+                )
+            }
         elif method == "resources/read":
-            result = read_resource(conn, params.get("uri"))
+            result = read_resource(
+                conn,
+                params.get("uri"),
+                delivery_target=resolved_delivery_target,
+            )
         else:
             response = error_response(request_id, -32601, f"unknown method: {method}")
             return None if is_notification else response
@@ -299,6 +410,7 @@ def _call_tool_with_lock_retry(
     params: dict[str, Any],
     *,
     profile: str = RUNTIME_PROFILE,
+    delivery_target: str = LOCAL_MODEL_TARGET,
 ) -> dict[str, Any]:
     """Dispatch a tool call, bound-retrying on 'database is locked'.
 
@@ -308,7 +420,14 @@ def _call_tool_with_lock_retry(
     """
     for attempt in range(WRITE_LOCK_RETRIES):
         try:
-            return call_tool(conn, params, profile=profile)
+            if delivery_target == LOCAL_MODEL_TARGET:
+                return call_tool(conn, params, profile=profile)
+            return call_tool(
+                conn,
+                params,
+                profile=profile,
+                delivery_target=delivery_target,
+            )
         except sqlite3.OperationalError as exc:
             if "database is locked" not in str(exc).lower() or attempt == WRITE_LOCK_RETRIES - 1:
                 raise
@@ -395,8 +514,10 @@ def call_tool(
     params: dict[str, Any],
     *,
     profile: str = RUNTIME_PROFILE,
+    delivery_target: str = LOCAL_MODEL_TARGET,
 ) -> dict[str, Any]:
     profile = resolve_profile(profile=profile)
+    delivery_target = normalize_delivery_target(delivery_target)
     name = params.get("name")
     if not isinstance(name, str) or name not in tools_for_profile(profile):
         raise PermissionError(f"tool is not available in {profile} profile: {name}")
@@ -404,8 +525,20 @@ def call_tool(
     if not isinstance(raw_arguments, dict):
         raise ValueError("tool arguments must be an object")
     arguments = strip_explicit_nulls(raw_arguments)
+    if {"delivery_target", "deliveryTarget"} & arguments.keys():
+        raise ValueError("delivery_target is server-controlled and cannot be supplied by callers")
     if is_core_v1(conn):
-        return call_tool_v1(conn, name, arguments, profile=profile)
+        return call_tool_v1(
+            conn,
+            name,
+            arguments,
+            profile=profile,
+            delivery_target=delivery_target,
+        )
+    if delivery_target == HOSTED_MODEL_TARGET and name in LEGACY_HOSTED_READ_TOOLS:
+        raise PermissionError(
+            f"{name} is unavailable for hosted_model delivery on a legacy OCBrain core"
+        )
     if name == "brain.context":
         query = require_string(arguments, "query")
         limit = min(max(int(arguments.get("limit", 12)), 1), 50)
@@ -758,8 +891,10 @@ def call_tool_v1(
     arguments: dict[str, Any],
     *,
     profile: str,
+    delivery_target: str = LOCAL_MODEL_TARGET,
 ) -> dict[str, Any]:
     """Dispatch the stable MCP surface without consulting the v0.x archive."""
+    delivery_target = normalize_delivery_target(delivery_target)
     if (
         name in {"brain.context", "brain.search", "brain.preview"}
         and arguments.get("at_ts") is not None
@@ -775,10 +910,17 @@ def call_tool_v1(
             context=context,
             limit=limit,
             cross_scope=bool(arguments.get("cross_scope")),
+            delivery_target=delivery_target,
         )
-        retrieval_id = record_context_v1(conn, packet, handles, context=context)
-        packet["retrieval_use_id"] = retrieval_id
-        packet["retrieval_use_status"] = "recorded"
+        packet, handles = prepare_retrieval_packet_v1(packet, handles)
+        retrieval_id = record_context_v1(
+            conn,
+            packet,
+            handles,
+            context=context,
+            delivery_target=delivery_target,
+        )
+        bind_retrieval_id_v1(packet, retrieval_id)
         conn.commit()
         return text_result(packet)
     if name == "brain.source":
@@ -788,11 +930,12 @@ def call_tool_v1(
             require_string(arguments, "id"),
             context=context,
             max_chars=min(max(int(arguments.get("max_chars", 8_000)), 256), 20_000),
+            delivery_target=delivery_target,
         )
         retrieval_id = record_core_v1_retrieval(
             conn,
             query=f"source:{payload['id']}",
-            context=context.to_dict(),
+            context={**context.to_dict(), "delivery_target": delivery_target},
             items=[{"belief_id": payload["object_id"], "score": 1.0}],
             runtime=context.runtime or "mcp",
             task_ref=context.task or f"brain.source:{payload['id']}",
@@ -810,6 +953,7 @@ def call_tool_v1(
             context=context_from_arguments(arguments),
             limit=min(max(int(arguments.get("limit", 10)), 1), 50),
             cross_scope=bool(arguments.get("cross_scope")),
+            delivery_target=delivery_target,
         )
         conn.commit()
         return text_result(payload)
@@ -822,18 +966,27 @@ def call_tool_v1(
             context=context,
             limit=min(max(int(arguments.get("limit", 12)), 1), 50),
             cross_scope=bool(arguments.get("cross_scope")),
+            delivery_target=delivery_target,
         )
-        retrieval_id = record_context_v1(conn, packet, handles, context=context)
-        packet["retrieval_use_id"] = retrieval_id
-        packet["retrieval_use_status"] = "recorded"
-        packet["preview"] = True
+        packet, handles = prepare_retrieval_packet_v1(packet, handles, preview=True)
+        retrieval_id = record_context_v1(
+            conn,
+            packet,
+            handles,
+            context=context,
+            delivery_target=delivery_target,
+        )
+        bind_retrieval_id_v1(packet, retrieval_id)
         conn.commit()
         return text_result(packet)
     if name == "brain.egress_preview":
+        target = optional_string(arguments, "target") or "hosted_teacher"
+        if delivery_target == HOSTED_MODEL_TARGET:
+            target = "hosted_teacher"
         payload = egress_preview(
             conn,
             context=context_from_arguments(arguments),
-            target=optional_string(arguments, "target") or "hosted_teacher",
+            target=target,
             query=optional_string(arguments, "query"),
             record=bool(arguments.get("record")),
         )
@@ -848,11 +1001,12 @@ def call_tool_v1(
             conn,
             context=context,
             limit=min(max(int(arguments.get("limit", 12)), 1), 50),
+            delivery_target=delivery_target,
         )
         retrieval_id = record_core_v1_retrieval(
             conn,
             query="digest",
-            context=context.to_dict(),
+            context={**context.to_dict(), "delivery_target": delivery_target},
             items=[{"belief_id": item["id"], "score": 1.0} for item in payload["current"]],
             runtime=context.runtime or "mcp",
             task_ref=context.task or "brain.digest",
@@ -875,11 +1029,12 @@ def call_tool_v1(
             include_candidate=bool(arguments.get("include_candidate")),
             include_private=bool(arguments.get("include_private")),
             cross_scope=bool(arguments.get("cross_scope")),
+            delivery_target=delivery_target,
         )
         retrieval_id = record_core_v1_retrieval(
             conn,
             query=f"get:{object_id}",
-            context=context.to_dict(),
+            context={**context.to_dict(), "delivery_target": delivery_target},
             items=[
                 {
                     "belief_id": payload.get("canonical_id") or object_id,
@@ -965,6 +1120,8 @@ def call_tool_v1(
         conn.commit()
         return text_result(payload)
     if name == "brain.proposals":
+        if delivery_target == HOSTED_MODEL_TARGET:
+            raise PermissionError("brain.proposals is unavailable for hosted_model delivery")
         return text_result(
             proposals_v1(
                 conn,
@@ -985,7 +1142,12 @@ def call_tool_v1(
     raise ValueError(f"unknown v1 tool: {name}; profile={profile}")
 
 
-def resource_list(conn) -> list[dict[str, Any]]:
+def resource_list(
+    conn,
+    *,
+    delivery_target: str = LOCAL_MODEL_TARGET,
+) -> list[dict[str, Any]]:
+    delivery_target = normalize_delivery_target(delivery_target)
     if is_core_v1(conn):
         return [
             {
@@ -994,6 +1156,8 @@ def resource_list(conn) -> list[dict[str, Any]]:
                 "mimeType": "application/json",
             }
         ]
+    if delivery_target == HOSTED_MODEL_TARGET:
+        return []
     resources = [
         {
             "uri": "brain://digest/current",
@@ -1028,15 +1192,26 @@ def resource_list(conn) -> list[dict[str, Any]]:
     return resources
 
 
-def read_resource(conn, uri: str | None) -> dict[str, Any]:
+def read_resource(
+    conn,
+    uri: str | None,
+    *,
+    delivery_target: str = LOCAL_MODEL_TARGET,
+) -> dict[str, Any]:
+    delivery_target = normalize_delivery_target(delivery_target)
     if is_core_v1(conn):
         if uri != "brain://digest/current":
             raise ValueError(f"unknown resource: {uri}")
-        payload = digest_v1(conn, context=ScopeContext(), limit=12)
+        payload = digest_v1(
+            conn,
+            context=ScopeContext(),
+            limit=12,
+            delivery_target=delivery_target,
+        )
         retrieval_id = record_core_v1_retrieval(
             conn,
             query="resource:digest",
-            context={},
+            context={"delivery_target": delivery_target},
             items=[{"belief_id": item["id"], "score": 1.0} for item in payload["current"]],
             runtime="mcp",
             task_ref="resources/read:brain://digest/current",
@@ -1054,6 +1229,8 @@ def read_resource(conn, uri: str | None) -> dict[str, Any]:
                 }
             ]
         }
+    if delivery_target == HOSTED_MODEL_TARGET:
+        raise PermissionError("legacy OCBrain resources are unavailable for hosted_model delivery")
     if uri == "brain://digest/current":
         mime_type = "application/json"
         text = json.dumps(knowledge_digest(conn), sort_keys=True)
@@ -1619,7 +1796,14 @@ def tools_for_profile(profile: str) -> set[str]:
 
 
 def text_result(payload: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(payload, sort_keys=True)}]}
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            }
+        ]
+    }
 
 
 def checked_filters(value: Any) -> dict[str, Any]:
