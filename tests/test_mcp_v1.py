@@ -576,7 +576,8 @@ def test_v1_get_enforces_scope_and_context_does_not_ignore_at_ts(tmp_path):
             },
         },
     )
-    assert "at_ts is not supported" in unsupported["error"]["message"]
+    assert "at_ts" in unsupported["error"]["message"]
+    assert "not supported" in unsupported["error"]["message"]
 
 
 def test_v1_hosted_delivery_filters_context_search_digest_and_resource(tmp_path):

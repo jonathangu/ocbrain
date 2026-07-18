@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Reconcile the published v1 MCP tool schemas with the dispatcher so every
+  advertised property is callable. The v1 core no longer advertises the
+  `at_ts` (as-of time-travel) parameter it cannot serve, and a null or blank
+  `at_ts` from a provider that eagerly populates every schema field is treated
+  as omitted instead of rejected; only a meaningful timestamp is refused.
+  Legacy v0.x cores continue to advertise and honor `at_ts`.
+- Accept a double-encoded `context`, `scope`, or `filters` argument — a JSON
+  string that decodes to an object — at the single argument-parsing seam, so a
+  client that stringifies a nested object is not rejected when its fields are
+  correct. A string that is not a JSON object is still refused.
+- Document `brain.closeout`'s conditionally required `task_ref` (required
+  unless supplied through `context.task`) and its required `summary` directly
+  in the tool schema.
+- Report `coverage.feedback_needed` on context and search packets and instruct
+  agents not to file feedback on, or re-poll, a retrieval that returned no
+  items; `brain.context` is not a task-state store.
+- Add a schema/validator consistency contract test asserting, for every
+  `brain.*` tool, that the fields the dispatcher requires are exactly the ones
+  the published schema marks non-nullable.
+
 ## 1.1.0 — 2026-07-17
 
 - Add optional hybrid lexical/dense retrieval with an explicit local vector
