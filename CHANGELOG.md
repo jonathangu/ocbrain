@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Default the local stdio MCP server to `local_model` delivery so local coding
+  agents retrieve their own memory at full fidelity, and add a
+  `--delivery-target` flag plus `OCBRAIN_DELIVERY_TARGET` env to select
+  `hosted_model` (egress-filtered) delivery when feeding a hosted teacher.
+  Restores the pre-1.1.0 local default while keeping hosted delivery explicit.
+- Add opt-in unattended promotion (`automatic_activation`, off by default,
+  toggled with `ocbrain automatic-activation --enable/--disable`). When enabled,
+  `brain.ingest` and `brain.closeout` auto-compile evidence and closeout
+  summaries into served beliefs with no human review, so continuity accrues
+  automatically. Promotion is idempotent, scopes to the shared project so any
+  client on it can recall the belief, and never widens egress beyond
+  `local_only`. Off, promotion stays human-gated exactly as before.
 - Reconcile the published v1 MCP tool schemas with the dispatcher so every
   advertised property is callable. The v1 core no longer advertises the
   `at_ts` (as-of time-travel) parameter it cannot serve, and a null or blank

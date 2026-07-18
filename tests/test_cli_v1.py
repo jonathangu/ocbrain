@@ -35,6 +35,7 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
         "init",
         "status",
         "sync",
+        "automatic-activation",
         "evidence",
         "knowledge",
         "value",
@@ -136,7 +137,7 @@ def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
     assert _run(capsys, db, ["runtime-check"])["healthy"] is True
     assert doctor_calls == [False, True]
 
-    mcp_calls: list[tuple[Path, bool, str, Path | None]] = []
+    mcp_calls: list[tuple[Path, bool, str, Path | None, str]] = []
 
     def fake_serve(
         path: Path,
@@ -144,13 +145,25 @@ def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
         allow_writes: bool,
         profile: str,
         active_db_file: Path | None,
+        delivery_target: str = "local_model",
     ) -> int:
-        mcp_calls.append((path, allow_writes, profile, active_db_file))
+        mcp_calls.append((path, allow_writes, profile, active_db_file, delivery_target))
         return 0
 
     monkeypatch.setattr(cli_module, "serve", fake_serve)
     assert main(["--db", str(db), "mcp", "--profile", "runtime"]) == 0
-    assert mcp_calls == [(db, False, "runtime", None)]
+    assert mcp_calls == [(db, False, "runtime", None, "local_model")]
+
+    mcp_calls.clear()
+    assert (
+        main(["--db", str(db), "mcp", "--profile", "runtime", "--delivery-target", "hosted_model"])
+        == 0
+    )
+    assert mcp_calls == [(db, False, "runtime", None, "hosted_model")]
+
+    assert _run(capsys, db, ["automatic-activation"])["automatic_activation"] is False
+    assert _run(capsys, db, ["automatic-activation", "--enable"])["automatic_activation"] is True
+    assert _run(capsys, db, ["automatic-activation", "--disable"])["automatic_activation"] is False
 
 
 def test_fresh_v1_cli_read_surfaces_and_event_lifecycle(tmp_path, capsys) -> None:

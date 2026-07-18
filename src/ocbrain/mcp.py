@@ -167,7 +167,7 @@ def serve(
     allow_writes: bool = False,
     profile: str | None = None,
     active_db_file: Path | None = None,
-    delivery_target: str = HOSTED_MODEL_TARGET,
+    delivery_target: str = LOCAL_MODEL_TARGET,
     idle_timeout_seconds: float | None = None,
 ) -> int:
     delivery_target = normalize_delivery_target(delivery_target)

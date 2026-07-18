@@ -18,11 +18,13 @@ from ocbrain.core_ops import (
 )
 from ocbrain.core_v1 import (
     append_core_event,
+    automatic_activation_enabled,
     get_core_v1_belief,
     get_core_v1_evidence,
     init_core_v1,
     is_core_v1,
     record_core_v1_evidence,
+    set_automatic_activation,
 )
 from ocbrain.curation import apply_curated_manifest
 from ocbrain.db import (
@@ -1011,8 +1013,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deprecated alias for --profile admin",
     )
+    mcp_parser.add_argument(
+        "--delivery-target",
+        choices=["local_model", "hosted_model"],
+        help=(
+            "delivery filter for served memory; default local_model. "
+            "Overrides OCBRAIN_DELIVERY_TARGET."
+        ),
+    )
     mcp_parser.add_argument("--active-db-file", type=Path, help=argparse.SUPPRESS)
     mcp_parser.set_defaults(func=cmd_mcp)
+    automatic_activation_parser = commands.add_parser(
+        "automatic-activation",
+        help="Show or set unattended evidence/closeout to belief promotion",
+    )
+    automatic_activation_group = automatic_activation_parser.add_mutually_exclusive_group()
+    automatic_activation_group.add_argument(
+        "--enable",
+        action="store_true",
+        help="auto-promote ingested evidence and closeouts into served beliefs",
+    )
+    automatic_activation_group.add_argument(
+        "--disable",
+        action="store_true",
+        help="keep promotion human-gated (the default)",
+    )
+    automatic_activation_parser.set_defaults(func=cmd_automatic_activation)
     parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
     return parser
 
@@ -3050,12 +3076,34 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    import os
+
+    from ocbrain.scope import normalize_delivery_target
+
+    # Local coding agents get full-fidelity local delivery by default. Hosted
+    # (egress-filtered) delivery stays available via --delivery-target or the
+    # OCBRAIN_DELIVERY_TARGET env, for feeding a hosted teacher model.
+    selected = getattr(args, "delivery_target", None) or os.environ.get(
+        "OCBRAIN_DELIVERY_TARGET"
+    )
     return serve(
         args.db,
         allow_writes=args.allow_writes,
         profile=args.profile,
         active_db_file=getattr(args, "active_db_file", None),
+        delivery_target=normalize_delivery_target(selected or None),
     )
+
+
+def cmd_automatic_activation(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    if not is_core_v1(conn):
+        raise SystemExit("automatic-activation requires an OCBrain v1 core")
+    if args.enable or args.disable:
+        set_automatic_activation(conn, bool(args.enable))
+        conn.commit()
+    output(args, {"automatic_activation": automatic_activation_enabled(conn)})
+    return 0
 
 
 # --------------------------------------------------------------------------- #
