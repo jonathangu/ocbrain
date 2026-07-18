@@ -133,6 +133,7 @@ def build_context_v1(
         "coverage": {
             "requested_limit": limit,
             "returned": len(items),
+            "feedback_needed": len(items) > 0,
             "excluded_scope_count": int(raw.get("excluded_count") or 0),
             "excluded_delivery_count": (
                 int(raw.get("delivery_excluded_count") or 0) + delivery_excluded
@@ -1042,6 +1043,7 @@ def _enforce_context_packet_limit(
     }
     handles = [handle for handle in handles if str(handle["id"]) in kept_source_ids]
     coverage["returned"] = len(packet["items"])
+    coverage["feedback_needed"] = len(packet["items"]) > 0
     coverage["trimmed_for_packet_limit"] = previously_trimmed + trimmed
     coverage["source_handle_count"] = len(handles)
     coverage["unavailable_sources"] = [
