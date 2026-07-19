@@ -103,6 +103,7 @@ class ReviewConfig:
             "~/.openclaw/agents",
             "~/.claude/projects",
             "~/.codex",
+            "~/.hermes/sessions",
         ]
     )
 

@@ -50,6 +50,8 @@ def history_runtime(path: Path) -> str:
         return "claude"
     if ".openclaw" in parts:
         return "openclaw"
+    if ".hermes" in parts or "hermes-home" in parts:
+        return "hermes"
     return "unknown"
 
 

@@ -342,6 +342,20 @@ def test_embedded_openclaw_harness_runtime_attribution(tmp_path: Path):
     assert history_runtime(claude_path) == "claude"
 
 
+def test_hermes_runtime_attribution(tmp_path: Path):
+    export = (
+        tmp_path
+        / ".hermes"
+        / "sessions"
+        / "export"
+        / "hermes-20260719_101552_e5038d20.jsonl"
+    )
+    assert history_runtime(export) == "hermes"
+
+    dump = tmp_path / ".hermes" / "sessions" / "request_dump_x.json"
+    assert history_runtime(dump) == "hermes"
+
+
 def test_telegram_envelope_author_verification():
     envelope = {"message_id": "1", "sender_id": "1000000001"}
     text = (
