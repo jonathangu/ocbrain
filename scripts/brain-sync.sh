@@ -80,7 +80,7 @@ run_with_budget "$HARVEST_BUDGET_SECONDS" \
   "$HOME/.claude/projects" \
   "$HOME/.hermes/sessions" \
   "$HOME/.ocbrain/exports/cursor" \
-  --project coframe --privacy-scope private --batch-size 25
+  --project coframe --privacy-scope workspace --batch-size 25
 
 # 4. Agent memory/instruction files.
 "$PY" -m ocbrain.cli --db "$DB" import-memory \
@@ -88,7 +88,7 @@ run_with_budget "$HARVEST_BUDGET_SECONDS" \
   "$HOME/.codex/AGENTS.md" \
   "$HOME/.hermes/SOUL.md" \
   "$HOME/.hermes/memories" \
-  --project coframe --privacy-scope private
+  --project coframe --privacy-scope workspace
 
 # 5. Reconcile core projections.
 "$PY" -m ocbrain.cli --db "$DB" sync
