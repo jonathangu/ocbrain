@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Harvest Cursor AI chat history: `scripts/export-cursor-chats.py` renders each
+  Cursor workspace's `state.vscdb` (prompts, generations, and composer bubbles)
+  to secret-redacted, content-compared JSONL under `~/.ocbrain/exports/cursor/`,
+  and `history_runtime()` now attributes those exports (and `.cursor` paths) to
+  the `cursor` runtime. `brain-sync.sh` includes the export step and sweeps the
+  export directory, so Cursor sessions accrue to the shared core alongside
+  Codex, Claude Code, and Hermes.
+- Harden `brain-sync.sh` for macOS operators: replace the non-portable
+  `flock(1)` single-instance guard (absent on macOS, which made the script
+  exit silently before every harvest) with an atomic mkdir lock that reclaims
+  stale locks via PID liveness, and bound the harvest with a hard time budget
+  (`OCBRAIN_SYNC_BUDGET_SECONDS`, default 45 minutes) so a stuck import can
+  never block the launchd schedule — partial batches stay committed and the
+  next run resumes. The script now logs `brain_events` counts before and after
+  each run for operator visibility.
 - Keep stdio MCP transports alive by default instead of imposing a two-hour
   launcher idle exit. Hosts that do not reconnect treated that intentional
   exit as `Transport closed`; orphan cleanup remains available through an

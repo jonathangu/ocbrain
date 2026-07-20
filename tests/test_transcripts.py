@@ -352,6 +352,20 @@ def test_hermes_runtime_attribution(tmp_path: Path):
     )
     assert history_runtime(export) == "hermes"
 
+
+def test_cursor_runtime_attribution(tmp_path: Path):
+    export = (
+        tmp_path
+        / ".ocbrain"
+        / "exports"
+        / "cursor"
+        / "cursor-0d254e880906ec61816dd14b697edff1.jsonl"
+    )
+    assert history_runtime(export) == "cursor"
+
+    dot_home = tmp_path / ".cursor" / "chats" / "current.jsonl"
+    assert history_runtime(dot_home) == "cursor"
+
     dump = tmp_path / ".hermes" / "sessions" / "request_dump_x.json"
     assert history_runtime(dump) == "hermes"
 
