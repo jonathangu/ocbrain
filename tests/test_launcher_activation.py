@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -86,3 +87,42 @@ def test_launcher_rejects_relative_activation_pointer(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "must contain one absolute database path" in result.stderr
+
+
+def test_launcher_does_not_impose_idle_timeout_but_preserves_explicit_opt_in(
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "print-idle-timeout"
+    probe.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os\n"
+        "print(json.dumps({'timeout': os.environ.get('OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS')}))\n"
+    )
+    probe.chmod(0o700)
+
+    base_env = {
+        **os.environ,
+        "OCBRAIN_ROOT": str(tmp_path),
+        "OCBRAIN_PYTHON": str(probe),
+    }
+    base_env.pop("OCBRAIN_DB", None)
+    base_env.pop("OCBRAIN_ACTIVE_DB_FILE", None)
+    base_env.pop("OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS", None)
+
+    default = subprocess.run(  # noqa: S603 - generated local test probe
+        [str(LAUNCHER)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=base_env,
+    )
+    assert json.loads(default.stdout)["timeout"] is None
+
+    explicit = subprocess.run(  # noqa: S603 - generated local test probe
+        [str(LAUNCHER)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**base_env, "OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS": "900"},
+    )
+    assert json.loads(explicit.stdout)["timeout"] == "900"

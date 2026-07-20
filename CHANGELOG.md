@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep stdio MCP transports alive by default instead of imposing a two-hour
+  launcher idle exit. Hosts that do not reconnect treated that intentional
+  exit as `Transport closed`; orphan cleanup remains available through an
+  explicit positive `OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS` value.
 - Default the local stdio MCP server to `local_model` delivery so local coding
   agents retrieve their own memory at full fidelity, and add a
   `--delivery-target` flag plus `OCBRAIN_DELIVERY_TARGET` env to select
