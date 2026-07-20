@@ -902,16 +902,12 @@ def call_tool_v1(
 ) -> dict[str, Any]:
     """Dispatch the stable MCP surface without consulting the v0.x archive."""
     delivery_target = normalize_delivery_target(delivery_target)
-    # ``at_ts`` requests an as-of time-travel view the v1 core cannot serve.
-    # A null/blank value means "no time travel" and is treated as omitted, so a
-    # provider that eagerly populates every schema field is not blocked. Only a
-    # meaningful timestamp is rejected, since silently ignoring one would return
+    # The v1 core cannot serve an as-of view. Null/blank means no time travel,
+    # but every meaningful value must be rejected rather than silently serving
     # a current view under the guise of a historical query.
     at_ts = arguments.get("at_ts")
-    if (
-        name in {"brain.context", "brain.search", "brain.preview"}
-        and isinstance(at_ts, str)
-        and at_ts.strip()
+    if name in {"brain.context", "brain.search", "brain.preview"} and (
+        at_ts is not None and (not isinstance(at_ts, str) or bool(at_ts.strip()))
     ):
         raise ValueError(
             "at_ts (as-of time travel) is not supported by ocbrain.core.v1; omit it"
@@ -1854,10 +1850,9 @@ def coerce_object_arg(value: Any, name: str) -> dict[str, Any] | None:
         if not text:
             return None
         try:
-            decoded = json.loads(text)
+            value = json.loads(text)
         except json.JSONDecodeError:
             raise ValueError(f"{name} must be an object") from None
-        value = decoded
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be an object")
     return value

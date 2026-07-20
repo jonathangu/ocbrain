@@ -19,7 +19,7 @@ import json
 from test_mcp_v1 import _payload, _seed_v1, _tool_call
 
 from ocbrain.db import connect, init_db
-from ocbrain.mcp import handle_request
+from ocbrain.mcp import checked_filters, handle_request, scope_from_arguments
 
 # The semantic-required set per tool: the fields the dispatcher enforces. Any
 # field NOT listed here must be published as nullable (optional) by the schema.
@@ -80,9 +80,16 @@ def test_v1_schema_required_matches_dispatcher_for_every_tool(tmp_path):
         assert _non_nullable_properties(schema) == expected, name
 
 
+def test_closeout_schema_documents_conditional_requirements(tmp_path):
+    tools = _tools_by_name(_seed_v1(tmp_path))
+    properties = tools["brain.closeout"]["inputSchema"]["properties"]
+    assert "Required" in properties["summary"]["description"]
+    task_ref_schema = properties["task_ref"]["anyOf"][0]
+    assert "Required unless context.task" in task_ref_schema["description"]
+
+
 def test_v1_core_does_not_publish_at_ts(tmp_path):
-    conn = _seed_v1(tmp_path)
-    tools = _tools_by_name(conn, allow_writes=True)
+    tools = _tools_by_name(_seed_v1(tmp_path), allow_writes=True)
     for name in ("brain.context", "brain.search", "brain.preview"):
         assert "at_ts" not in tools[name]["inputSchema"]["properties"], name
 
@@ -114,15 +121,17 @@ def test_v1_context_accepts_omitted_null_and_blank_at_ts(tmp_path):
         assert _payload(response)["schema_version"] == "ocbrain.context.v1"
 
 
-def test_v1_context_rejects_meaningful_at_ts(tmp_path):
+def test_v1_context_rejects_every_meaningful_at_ts(tmp_path):
     conn = _seed_v1(tmp_path)
-    for name in ("brain.context", "brain.search"):
+    for name, at_ts in (
+        ("brain.context", "2026-07-01T00:00:00Z"),
+        ("brain.search", "2026-07-01T00:00:00Z"),
+        ("brain.preview", 123),
+    ):
         response = handle_request(
             conn,
-            _tool_call(
-                name,
-                {"query": "Shared Context", "at_ts": "2026-07-01T00:00:00Z"},
-            ),
+            _tool_call(name, {"query": "Shared Context", "at_ts": at_ts}),
+            profile="admin" if name == "brain.preview" else None,
         )
         message = response["error"]["message"]
         assert "at_ts" in message and "not supported" in message, name
@@ -167,6 +176,26 @@ def test_v1_context_rejects_non_object_context_string(tmp_path):
             _tool_call("brain.context", {"query": "Shared Context", "context": bad}),
         )
         assert response["error"]["message"] == "context must be an object", bad
+
+
+def test_double_encoded_scope_and_filters_use_shared_object_seam():
+    filters = checked_filters(json.dumps({"project": "ocbrain", "unknown": "ignored"}))
+    assert filters == {"project": "ocbrain"}
+
+    scope = scope_from_arguments(
+        {
+            "scope": json.dumps(
+                {
+                    "scope_type": "project",
+                    "scope_id": "project:ocbrain",
+                    "visibility": "internal",
+                    "egress_policy": "hosted_ok",
+                }
+            )
+        }
+    )
+    assert scope is not None
+    assert scope.scope_id == "project:ocbrain"
 
 
 def test_v1_context_reports_feedback_needed(tmp_path):
