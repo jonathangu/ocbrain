@@ -2329,8 +2329,16 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-200000")
-    existing_sources = set() if is_core_v1(conn) else imported_history_sources(conn)
-    current_fingerprints = current_history_fingerprints(conn)
+    core_v1 = is_core_v1(conn)
+    existing_sources = set() if core_v1 else imported_history_sources(conn)
+    if core_v1:
+        # Persisted stat-fingerprint gate: unchanged files skip the full
+        # redact-and-read pass. import_source_v1 stays authoritative for any
+        # file whose fingerprint changed; this only fast-paths files that
+        # provably have not changed since their last completed import.
+        current_fingerprints = load_v1_history_fingerprints(conn)
+    else:
+        current_fingerprints = current_history_fingerprints(conn)
     imported = 0
     existing = 0
     by_runtime: dict[str, int] = {}
@@ -2376,7 +2384,11 @@ def cmd_import_history(args: argparse.Namespace) -> int:
         existing_sources.add((result["path"], f"{result['runtime']}_history_file"))
         current_fingerprints[source_key] = fingerprint
         if imported % batch_size == 0:
+            if core_v1:
+                store_v1_history_fingerprints(conn, current_fingerprints)
             conn.commit()
+    if core_v1:
+        store_v1_history_fingerprints(conn, current_fingerprints)
     conn.commit()
     output(
         args,
@@ -2865,6 +2877,53 @@ def imported_history_sources(conn) -> set[tuple[str, str]]:
             """
         )
     }
+
+
+_V1_HISTORY_FINGERPRINTS_KEY = "history_file_fingerprints_v1"
+
+
+def _v1_fingerprint_key(source_key: tuple[str, str]) -> str:
+    return json.dumps([source_key[0], source_key[1]])
+
+
+def load_v1_history_fingerprints(conn) -> dict[tuple[str, str], str]:
+    """Load the persisted stat-fingerprint gate for v1 history imports.
+
+    Stored as one JSON blob in ``schema_meta`` so no schema migration is
+    needed. Keys are ``[path, source_type]`` JSON pairs; values are
+    ``file_fingerprint`` digests from the last completed import.
+    """
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (_V1_HISTORY_FINGERPRINTS_KEY,)
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        raw = json.loads(row[0])
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    loaded: dict[tuple[str, str], str] = {}
+    for key, fingerprint in raw.items():
+        try:
+            path, source_type = json.loads(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(path, str) and isinstance(source_type, str) and isinstance(fingerprint, str):
+            loaded[(path, source_type)] = fingerprint
+    return loaded
+
+
+def store_v1_history_fingerprints(conn, fingerprints: dict[tuple[str, str], str]) -> None:
+    blob = json.dumps(
+        {_v1_fingerprint_key(key): value for key, value in fingerprints.items()},
+        sort_keys=True,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+        (_V1_HISTORY_FINGERPRINTS_KEY, blob),
+    )
 
 
 def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:

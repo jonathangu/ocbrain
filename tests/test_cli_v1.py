@@ -395,6 +395,45 @@ def test_v1_private_source_imports_are_cold_evidence_and_idempotent(tmp_path, ca
     _strict_v1(db).close()
 
 
+def test_v1_history_import_persists_stat_fingerprint_gate(tmp_path, capsys) -> None:
+    db = tmp_path / "core.sqlite"
+    history = tmp_path / ".codex" / "sessions" / "rollout.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text(
+        json.dumps({"role": "user", "content": "fingerprint gate sentinel"}) + "\n",
+        encoding="utf-8",
+    )
+
+    first = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (first["imported"], first["existing"]) == (1, 0)
+
+    conn = _strict_v1(db)
+    blob = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'history_file_fingerprints_v1'"
+    ).fetchone()
+    assert blob is not None
+    stored = json.loads(blob[0])
+    assert any("rollout.jsonl" in key for key in stored)
+    conn.close()
+
+    # Unchanged file: the fingerprint gate reports it existing without a
+    # changed/unchanged recompilation.
+    second = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (second["imported"], second["existing"]) == (0, 1)
+    assert second["counts"]["brain_events"] == first["counts"]["brain_events"]
+
+    # Appending to the file busts the fingerprint and forces a real re-import.
+    with history.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"role": "assistant", "content": "gate reopened"}) + "\n")
+    third = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (third["imported"], third["existing"]) == (1, 0)
+
+    # And the gate settles again after the re-import.
+    fourth = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (fourth["imported"], fourth["existing"]) == (0, 1)
+    _strict_v1(db).close()
+
+
 def test_memory_import_dry_run_is_db_free_and_default_import_is_private(tmp_path, capsys) -> None:
     db = tmp_path / "dry-run-must-not-exist.sqlite"
     memory = tmp_path / "memory.md"

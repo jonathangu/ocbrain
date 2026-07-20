@@ -17,6 +17,12 @@
   never block the launchd schedule — partial batches stay committed and the
   next run resumes. The script now logs `brain_events` counts before and after
   each run for operator visibility.
+- Persist a stat-fingerprint gate for v1 history imports (`schema_meta` key
+  `history_file_fingerprints_v1`). Previously the v1 path re-read and
+  re-redacted every history file on every run to make its unchanged decision,
+  so multi-GB transcript corpora never converged on a recurring schedule.
+  Unchanged files now skip in O(stat); `import_source_v1` remains the
+  authoritative changed/unchanged judge for any file whose fingerprint moved.
 - Keep stdio MCP transports alive by default instead of imposing a two-hour
   launcher idle exit. Hosts that do not reconnect treated that intentional
   exit as `Transport closed`; orphan cleanup remains available through an
