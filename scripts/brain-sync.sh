@@ -59,6 +59,9 @@ run_with_budget() {
   wait "$pid"
 }
 
+# Yield CPU to interactive/agent work; the harvest is background maintenance.
+renice -n 10 -p $$ >/dev/null 2>&1 || true
+
 event_count() {
   sqlite3 "$DB" "SELECT COUNT(*) FROM brain_events;" 2>/dev/null || echo "?"
 }

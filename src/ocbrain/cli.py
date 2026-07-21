@@ -997,7 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
     import_history.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_history.add_argument("--limit", type=int)
     import_history.add_argument("--max-bytes", type=int, default=20_000)
-    import_history.add_argument("--batch-size", type=int, default=500)
+    import_history.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Deprecated: history imports commit per file to bound SQLite writer-lock windows",
+    )
     import_history.add_argument("--dry-run", action="store_true")
     import_history.set_defaults(func=cmd_import_history)
 
@@ -2344,7 +2349,6 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     by_runtime: dict[str, int] = {}
     samples: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = list(selection_skipped)
-    batch_size = max(args.batch_size, 1)
     for path in files:
         source_key = (str(path), f"{history_runtime(path)}_history_file")
         fingerprint = file_fingerprint(path)
@@ -2383,10 +2387,17 @@ def cmd_import_history(args: argparse.Namespace) -> int:
             samples.append(result)
         existing_sources.add((result["path"], f"{result['runtime']}_history_file"))
         current_fingerprints[source_key] = fingerprint
-        if imported % batch_size == 0:
-            if core_v1:
-                store_v1_history_fingerprints(conn, current_fingerprints)
-            conn.commit()
+        # Commit after every file. History files can take minutes to redact,
+        # and an implicit write transaction held across that work monopolises
+        # SQLite's single writer slot: every other local writer (MCP
+        # ingest/closeout/retrieval logging from Codex/Claude/Cursor/Hermes)
+        # then fails with "database is locked". Per-file commits bound the
+        # writer window to one file's actual DB writes; the slow redaction
+        # of the next file happens outside any transaction. Same rationale
+        # as DatasetWriteBatch for the dataset miners.
+        if core_v1:
+            store_v1_history_fingerprints(conn, current_fingerprints)
+        conn.commit()
     if core_v1:
         store_v1_history_fingerprints(conn, current_fingerprints)
     conn.commit()

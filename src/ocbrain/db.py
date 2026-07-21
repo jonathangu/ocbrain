@@ -16,7 +16,7 @@ DEFAULT_DB_PATH = Path(os.environ.get("OCBRAIN_DB", "~/.ocbrain/ocbrain.sqlite")
 # stallcheck, MCP feedback). Wait on a lock rather than fail-fast so migrations
 # and ledger writes don't crash with "database is locked". Set in the core
 # connect() factory so ALL consumers inherit it. Config-overridable via env.
-DB_BUSY_TIMEOUT_MS = int(os.environ.get("OCBRAIN_BUSY_TIMEOUT_MS", "5000"))
+DB_BUSY_TIMEOUT_MS = int(os.environ.get("OCBRAIN_BUSY_TIMEOUT_MS", "30000"))
 PUBLIC_SCOPES = ("workspace", "project", "public")
 SCOPE_RANK = {"private": 0, "workspace": 1, "project": 2, "public": 3}
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Bound SQLite writer-lock windows so concurrent agents stop seeing "database
+  is locked": `import-history` now commits after every file instead of holding
+  one implicit write transaction across up to `--batch-size` slow redactions
+  (the same rationale as `DatasetWriteBatch` for dataset miners; the flag is
+  now deprecated), and the default `busy_timeout` rises 5s -> 30s
+  (`OCBRAIN_BUSY_TIMEOUT_MS` still overrides) so MCP ingest/closeout/feedback
+  writes from Codex/Claude/Cursor/Hermes queue instead of failing. WAL +
+  per-file commits + a generous busy timeout is the local queuing model.
 - Harvest Cursor AI chat history: `scripts/export-cursor-chats.py` renders each
   Cursor workspace's `state.vscdb` (prompts, generations, and composer bubbles)
   to secret-redacted, content-compared JSONL under `~/.ocbrain/exports/cursor/`,

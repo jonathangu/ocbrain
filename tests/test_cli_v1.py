@@ -434,6 +434,42 @@ def test_v1_history_import_persists_stat_fingerprint_gate(tmp_path, capsys) -> N
     _strict_v1(db).close()
 
 
+def test_v1_history_import_commits_per_file(tmp_path, capsys, monkeypatch):
+    """The writer lock must be released between files: one implicit
+    transaction spanning many slow redactions blocks every concurrent MCP
+    writer with 'database is locked'. Count commits over a 3-file import."""
+    import sqlite3 as _sqlite3
+
+    db = tmp_path / "core.sqlite"
+    history = tmp_path / ".codex" / "sessions"
+    history.mkdir(parents=True)
+    for i in range(3):
+        (history / f"rollout-{i}.jsonl").write_text(
+            json.dumps({"role": "user", "content": f"per-file commit sentinel {i}"}) + "\n",
+            encoding="utf-8",
+        )
+
+    commits = 0
+
+    class CountingConnection(_sqlite3.Connection):
+        def commit(self):
+            nonlocal commits
+            commits += 1
+            return super().commit()
+
+    real_connect = _sqlite3.connect
+
+    def counting_connect(*args, **kwargs):
+        kwargs["factory"] = CountingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(_sqlite3, "connect", counting_connect)
+    result = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+
+    assert result["imported"] == 3
+    assert commits >= 3, f"expected per-file commits, got {commits}"
+
+
 def test_memory_import_dry_run_is_db_free_and_default_import_is_private(tmp_path, capsys) -> None:
     db = tmp_path / "dry-run-must-not-exist.sqlite"
     memory = tmp_path / "memory.md"
