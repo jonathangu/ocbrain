@@ -167,7 +167,7 @@ def serve(
     allow_writes: bool = False,
     profile: str | None = None,
     active_db_file: Path | None = None,
-    delivery_target: str = HOSTED_MODEL_TARGET,
+    delivery_target: str = LOCAL_MODEL_TARGET,
     idle_timeout_seconds: float | None = None,
 ) -> int:
     delivery_target = normalize_delivery_target(delivery_target)
@@ -909,7 +909,9 @@ def call_tool_v1(
     if name in {"brain.context", "brain.search", "brain.preview"} and (
         at_ts is not None and (not isinstance(at_ts, str) or bool(at_ts.strip()))
     ):
-        raise ValueError("at_ts (as-of time travel) is not supported by ocbrain.core.v1; omit it")
+        raise ValueError(
+            "at_ts (as-of time travel) is not supported by ocbrain.core.v1; omit it"
+        )
     if name == "brain.context":
         query = require_string(arguments, "query")
         context = context_from_arguments(arguments)
@@ -1759,8 +1761,10 @@ def tool_list(*, profile: str = RUNTIME_PROFILE, time_travel: bool = False) -> l
     allowed = tools_for_profile(profile)
     tools = [tool for tool in tools if str(tool["name"]) in allowed]
     if not time_travel:
-        # A v1 core cannot honor as-of queries, so do not advertise a property
-        # that provider-safe schemas would prompt eager clients to populate.
+        # The v1 core cannot serve an as-of view, so it must not advertise the
+        # ``at_ts`` property. Leaving it published makes ``provider_safe_schema``
+        # mark it required-but-nullable, prompting eager providers to send a
+        # value the dispatcher then rejects. Legacy cores keep the parameter.
         for tool in tools:
             properties = tool["inputSchema"].get("properties")
             if isinstance(properties, dict):
@@ -1833,7 +1837,12 @@ def text_result(payload: Any) -> dict[str, Any]:
 
 
 def coerce_object_arg(value: Any, name: str) -> dict[str, Any] | None:
-    """Accept an object, an omitted value, or a JSON string containing an object."""
+    """Accept an object, a null/blank, or a JSON string that decodes to an object.
+
+    Some MCP clients double-encode a nested object argument as a JSON string.
+    Tolerating that at this single seam keeps an otherwise well-formed call from
+    failing with "must be an object" when the fields themselves are correct.
+    """
     if value is None:
         return None
     if isinstance(value, str):

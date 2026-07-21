@@ -35,6 +35,7 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
         "init",
         "status",
         "sync",
+        "automatic-activation",
         "evidence",
         "knowledge",
         "value",
@@ -136,7 +137,7 @@ def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
     assert _run(capsys, db, ["runtime-check"])["healthy"] is True
     assert doctor_calls == [False, True]
 
-    mcp_calls: list[tuple[Path, bool, str, Path | None]] = []
+    mcp_calls: list[tuple[Path, bool, str, Path | None, str]] = []
 
     def fake_serve(
         path: Path,
@@ -144,13 +145,25 @@ def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
         allow_writes: bool,
         profile: str,
         active_db_file: Path | None,
+        delivery_target: str = "local_model",
     ) -> int:
-        mcp_calls.append((path, allow_writes, profile, active_db_file))
+        mcp_calls.append((path, allow_writes, profile, active_db_file, delivery_target))
         return 0
 
     monkeypatch.setattr(cli_module, "serve", fake_serve)
     assert main(["--db", str(db), "mcp", "--profile", "runtime"]) == 0
-    assert mcp_calls == [(db, False, "runtime", None)]
+    assert mcp_calls == [(db, False, "runtime", None, "local_model")]
+
+    mcp_calls.clear()
+    assert (
+        main(["--db", str(db), "mcp", "--profile", "runtime", "--delivery-target", "hosted_model"])
+        == 0
+    )
+    assert mcp_calls == [(db, False, "runtime", None, "hosted_model")]
+
+    assert _run(capsys, db, ["automatic-activation"])["automatic_activation"] is False
+    assert _run(capsys, db, ["automatic-activation", "--enable"])["automatic_activation"] is True
+    assert _run(capsys, db, ["automatic-activation", "--disable"])["automatic_activation"] is False
 
 
 def test_fresh_v1_cli_read_surfaces_and_event_lifecycle(tmp_path, capsys) -> None:
@@ -380,6 +393,81 @@ def test_v1_private_source_imports_are_cold_evidence_and_idempotent(tmp_path, ca
         ["search", "runtime bridge acceptance sentinel", "--project", "ocbrain"],
     )["items"]
     _strict_v1(db).close()
+
+
+def test_v1_history_import_persists_stat_fingerprint_gate(tmp_path, capsys) -> None:
+    db = tmp_path / "core.sqlite"
+    history = tmp_path / ".codex" / "sessions" / "rollout.jsonl"
+    history.parent.mkdir(parents=True)
+    history.write_text(
+        json.dumps({"role": "user", "content": "fingerprint gate sentinel"}) + "\n",
+        encoding="utf-8",
+    )
+
+    first = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (first["imported"], first["existing"]) == (1, 0)
+
+    conn = _strict_v1(db)
+    blob = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = 'history_file_fingerprints_v1'"
+    ).fetchone()
+    assert blob is not None
+    stored = json.loads(blob[0])
+    assert any("rollout.jsonl" in key for key in stored)
+    conn.close()
+
+    # Unchanged file: the fingerprint gate reports it existing without a
+    # changed/unchanged recompilation.
+    second = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (second["imported"], second["existing"]) == (0, 1)
+    assert second["counts"]["brain_events"] == first["counts"]["brain_events"]
+
+    # Appending to the file busts the fingerprint and forces a real re-import.
+    with history.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"role": "assistant", "content": "gate reopened"}) + "\n")
+    third = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (third["imported"], third["existing"]) == (1, 0)
+
+    # And the gate settles again after the re-import.
+    fourth = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+    assert (fourth["imported"], fourth["existing"]) == (0, 1)
+    _strict_v1(db).close()
+
+
+def test_v1_history_import_commits_per_file(tmp_path, capsys, monkeypatch):
+    """The writer lock must be released between files: one implicit
+    transaction spanning many slow redactions blocks every concurrent MCP
+    writer with 'database is locked'. Count commits over a 3-file import."""
+    import sqlite3 as _sqlite3
+
+    db = tmp_path / "core.sqlite"
+    history = tmp_path / ".codex" / "sessions"
+    history.mkdir(parents=True)
+    for i in range(3):
+        (history / f"rollout-{i}.jsonl").write_text(
+            json.dumps({"role": "user", "content": f"per-file commit sentinel {i}"}) + "\n",
+            encoding="utf-8",
+        )
+
+    commits = 0
+
+    class CountingConnection(_sqlite3.Connection):
+        def commit(self):
+            nonlocal commits
+            commits += 1
+            return super().commit()
+
+    real_connect = _sqlite3.connect
+
+    def counting_connect(*args, **kwargs):
+        kwargs["factory"] = CountingConnection
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(_sqlite3, "connect", counting_connect)
+    result = _run(capsys, db, ["import-history", str(history), "--project", "ocbrain"])
+
+    assert result["imported"] == 3
+    assert commits >= 3, f"expected per-file commits, got {commits}"
 
 
 def test_memory_import_dry_run_is_db_free_and_default_import_is_private(tmp_path, capsys) -> None:

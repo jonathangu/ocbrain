@@ -18,11 +18,13 @@ from ocbrain.core_ops import (
 )
 from ocbrain.core_v1 import (
     append_core_event,
+    automatic_activation_enabled,
     get_core_v1_belief,
     get_core_v1_evidence,
     init_core_v1,
     is_core_v1,
     record_core_v1_evidence,
+    set_automatic_activation,
 )
 from ocbrain.curation import apply_curated_manifest
 from ocbrain.db import (
@@ -995,7 +997,12 @@ def build_parser() -> argparse.ArgumentParser:
     import_history.add_argument("--privacy-scope", choices=PRIVACY_SCOPES, default="private")
     import_history.add_argument("--limit", type=int)
     import_history.add_argument("--max-bytes", type=int, default=20_000)
-    import_history.add_argument("--batch-size", type=int, default=500)
+    import_history.add_argument(
+        "--batch-size",
+        type=int,
+        default=500,
+        help="Deprecated: history imports commit per file to bound SQLite writer-lock windows",
+    )
     import_history.add_argument("--dry-run", action="store_true")
     import_history.set_defaults(func=cmd_import_history)
 
@@ -1011,8 +1018,32 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="deprecated alias for --profile admin",
     )
+    mcp_parser.add_argument(
+        "--delivery-target",
+        choices=["local_model", "hosted_model"],
+        help=(
+            "delivery filter for served memory; default local_model. "
+            "Overrides OCBRAIN_DELIVERY_TARGET."
+        ),
+    )
     mcp_parser.add_argument("--active-db-file", type=Path, help=argparse.SUPPRESS)
     mcp_parser.set_defaults(func=cmd_mcp)
+    automatic_activation_parser = commands.add_parser(
+        "automatic-activation",
+        help="Show or set unattended evidence/closeout to belief promotion",
+    )
+    automatic_activation_group = automatic_activation_parser.add_mutually_exclusive_group()
+    automatic_activation_group.add_argument(
+        "--enable",
+        action="store_true",
+        help="auto-promote ingested evidence and closeouts into served beliefs",
+    )
+    automatic_activation_group.add_argument(
+        "--disable",
+        action="store_true",
+        help="keep promotion human-gated (the default)",
+    )
+    automatic_activation_parser.set_defaults(func=cmd_automatic_activation)
     parser.add_argument("--input", type=Path, help=argparse.SUPPRESS)
     return parser
 
@@ -2303,14 +2334,21 @@ def cmd_import_history(args: argparse.Namespace) -> int:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.execute("PRAGMA cache_size=-200000")
-    existing_sources = set() if is_core_v1(conn) else imported_history_sources(conn)
-    current_fingerprints = current_history_fingerprints(conn)
+    core_v1 = is_core_v1(conn)
+    existing_sources = set() if core_v1 else imported_history_sources(conn)
+    if core_v1:
+        # Persisted stat-fingerprint gate: unchanged files skip the full
+        # redact-and-read pass. import_source_v1 stays authoritative for any
+        # file whose fingerprint changed; this only fast-paths files that
+        # provably have not changed since their last completed import.
+        current_fingerprints = load_v1_history_fingerprints(conn)
+    else:
+        current_fingerprints = current_history_fingerprints(conn)
     imported = 0
     existing = 0
     by_runtime: dict[str, int] = {}
     samples: list[dict[str, str]] = []
     skipped: list[dict[str, str]] = list(selection_skipped)
-    batch_size = max(args.batch_size, 1)
     for path in files:
         source_key = (str(path), f"{history_runtime(path)}_history_file")
         fingerprint = file_fingerprint(path)
@@ -2349,8 +2387,19 @@ def cmd_import_history(args: argparse.Namespace) -> int:
             samples.append(result)
         existing_sources.add((result["path"], f"{result['runtime']}_history_file"))
         current_fingerprints[source_key] = fingerprint
-        if imported % batch_size == 0:
-            conn.commit()
+        # Commit after every file. History files can take minutes to redact,
+        # and an implicit write transaction held across that work monopolises
+        # SQLite's single writer slot: every other local writer (MCP
+        # ingest/closeout/retrieval logging from Codex/Claude/Cursor/Hermes)
+        # then fails with "database is locked". Per-file commits bound the
+        # writer window to one file's actual DB writes; the slow redaction
+        # of the next file happens outside any transaction. Same rationale
+        # as DatasetWriteBatch for the dataset miners.
+        if core_v1:
+            store_v1_history_fingerprints(conn, current_fingerprints)
+        conn.commit()
+    if core_v1:
+        store_v1_history_fingerprints(conn, current_fingerprints)
     conn.commit()
     output(
         args,
@@ -2841,6 +2890,53 @@ def imported_history_sources(conn) -> set[tuple[str, str]]:
     }
 
 
+_V1_HISTORY_FINGERPRINTS_KEY = "history_file_fingerprints_v1"
+
+
+def _v1_fingerprint_key(source_key: tuple[str, str]) -> str:
+    return json.dumps([source_key[0], source_key[1]])
+
+
+def load_v1_history_fingerprints(conn) -> dict[tuple[str, str], str]:
+    """Load the persisted stat-fingerprint gate for v1 history imports.
+
+    Stored as one JSON blob in ``schema_meta`` so no schema migration is
+    needed. Keys are ``[path, source_type]`` JSON pairs; values are
+    ``file_fingerprint`` digests from the last completed import.
+    """
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (_V1_HISTORY_FINGERPRINTS_KEY,)
+    ).fetchone()
+    if not row:
+        return {}
+    try:
+        raw = json.loads(row[0])
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    loaded: dict[tuple[str, str], str] = {}
+    for key, fingerprint in raw.items():
+        try:
+            path, source_type = json.loads(key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(path, str) and isinstance(source_type, str) and isinstance(fingerprint, str):
+            loaded[(path, source_type)] = fingerprint
+    return loaded
+
+
+def store_v1_history_fingerprints(conn, fingerprints: dict[tuple[str, str], str]) -> None:
+    blob = json.dumps(
+        {_v1_fingerprint_key(key): value for key, value in fingerprints.items()},
+        sort_keys=True,
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+        (_V1_HISTORY_FINGERPRINTS_KEY, blob),
+    )
+
+
 def current_history_fingerprints(conn) -> dict[tuple[str, str], str]:
     """Return the fingerprint backing each currently searchable history doc.
 
@@ -3050,12 +3146,34 @@ def cmd_liveness_check(args: argparse.Namespace) -> int:
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
+    import os
+
+    from ocbrain.scope import normalize_delivery_target
+
+    # Local coding agents get full-fidelity local delivery by default. Hosted
+    # (egress-filtered) delivery stays available via --delivery-target or the
+    # OCBRAIN_DELIVERY_TARGET env, for feeding a hosted teacher model.
+    selected = getattr(args, "delivery_target", None) or os.environ.get(
+        "OCBRAIN_DELIVERY_TARGET"
+    )
     return serve(
         args.db,
         allow_writes=args.allow_writes,
         profile=args.profile,
         active_db_file=getattr(args, "active_db_file", None),
+        delivery_target=normalize_delivery_target(selected or None),
     )
+
+
+def cmd_automatic_activation(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    if not is_core_v1(conn):
+        raise SystemExit("automatic-activation requires an OCBrain v1 core")
+    if args.enable or args.disable:
+        set_automatic_activation(conn, bool(args.enable))
+        conn.commit()
+    output(args, {"automatic_activation": automatic_activation_enabled(conn)})
+    return 0
 
 
 # --------------------------------------------------------------------------- #

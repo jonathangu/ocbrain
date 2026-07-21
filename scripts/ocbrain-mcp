@@ -28,10 +28,10 @@ else
 fi
 
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-# Client-owned stdio children should not survive indefinitely after a wedged
-# host stops using them. This only terminates an idle process; it schedules no
-# brain work, hosted call, loop, timer task, or watchdog action.
-export OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS="${OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS:-7200}"
+# Keep client-owned stdio transports alive by default. Some MCP hosts do not
+# reconnect after a clean idle exit and surface the next call as
+# "Transport closed". Operators that need orphan cleanup may still set an
+# explicit positive OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS value.
 if [[ "$DB_SELECTED_FROM_POINTER" == 1 ]]; then
   exec "$PYTHON" -m ocbrain.cli --db "$DB" mcp --active-db-file "$ACTIVE_DB_FILE" "$@"
 fi

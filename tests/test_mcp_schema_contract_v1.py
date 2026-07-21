@@ -1,4 +1,16 @@
-"""Regression tests for the published v1 MCP schema/dispatcher contract."""
+"""Contract tests reconciling the published v1 MCP schemas with the dispatcher.
+
+Every published property must be callable, and every field the dispatcher
+actually requires must be the one the schema advertises as non-nullable. These
+tests lock the three schema/validator mismatches that made tools uncallable:
+
+1. ``at_ts`` was published (and, via ``provider_safe_schema``, marked
+   required-but-nullable) on a v1 core that rejects any value for it.
+2. ``brain.closeout.task_ref`` is conditionally required and must be honored
+   when supplied through ``context.task``.
+3. A double-encoded ``context`` (a JSON string instead of an object) failed at
+   the parse seam even though its fields were correct.
+"""
 
 from __future__ import annotations
 
@@ -9,8 +21,8 @@ from test_mcp_v1 import _payload, _seed_v1, _tool_call
 from ocbrain.db import connect, init_db
 from ocbrain.mcp import checked_filters, handle_request, scope_from_arguments
 
-# Semantic requirements enforced by the dispatcher. Provider-safe schemas put
-# every property in ``required`` and represent optionality with a null branch.
+# The semantic-required set per tool: the fields the dispatcher enforces. Any
+# field NOT listed here must be published as nullable (optional) by the schema.
 SEMANTIC_REQUIRED = {
     "brain.context": {"query"},
     "brain.source": {"id"},
@@ -39,6 +51,12 @@ def _tools_by_name(conn, *, allow_writes=False):
 
 
 def _non_nullable_properties(schema):
+    """Top-level properties the schema advertises as required (not …|null).
+
+    ``provider_safe_schema`` wraps every optional field as
+    ``{"anyOf": [<schema>, {"type": "null"}]}`` and leaves required fields
+    unwrapped, so the unwrapped set is the real required signal on the wire.
+    """
     required = set()
     for name, value in schema["properties"].items():
         branches = value.get("anyOf") if isinstance(value, dict) else None
@@ -55,6 +73,8 @@ def test_v1_schema_required_matches_dispatcher_for_every_tool(tmp_path):
     for name, expected in SEMANTIC_REQUIRED.items():
         assert name in tools, f"{name} missing from published surface"
         schema = tools[name]["inputSchema"]
+        # The provider-safe invariant: closed shape, every property listed in
+        # ``required``, real optionality carried only by the …|null wrapper.
         assert schema["additionalProperties"] is False
         assert set(schema["required"]) == set(schema["properties"])
         assert _non_nullable_properties(schema) == expected, name
@@ -75,6 +95,8 @@ def test_v1_core_does_not_publish_at_ts(tmp_path):
 
 
 def test_legacy_core_still_publishes_at_ts(tmp_path):
+    # The legacy v0.x core supports as-of queries, so it must keep advertising
+    # the parameter. Only the v1 surface drops it.
     conn = connect(tmp_path / "legacy.sqlite")
     init_db(conn)
     tools = _tools_by_name(conn)
@@ -83,13 +105,15 @@ def test_legacy_core_still_publishes_at_ts(tmp_path):
 
 def test_v1_context_accepts_omitted_null_and_blank_at_ts(tmp_path):
     conn = _seed_v1(tmp_path)
-    variants = [
-        {"query": "Shared Context", "context": {"project": "ocbrain"}},
-        {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": None},
-        {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": ""},
-        {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": "   "},
-    ]
-    for request_id, arguments in enumerate(variants, start=1):
+    for request_id, arguments in enumerate(
+        [
+            {"query": "Shared Context", "context": {"project": "ocbrain"}},
+            {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": None},
+            {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": ""},
+            {"query": "Shared Context", "context": {"project": "ocbrain"}, "at_ts": "   "},
+        ],
+        start=1,
+    ):
         response = handle_request(
             conn, _tool_call("brain.context", arguments, request_id=request_id)
         )
@@ -206,7 +230,10 @@ def test_v1_closeout_requires_summary(tmp_path):
     conn = _seed_v1(tmp_path)
     response = handle_request(
         conn,
-        _tool_call("brain.closeout", {"task_ref": "task:demo", "status": "completed"}),
+        _tool_call(
+            "brain.closeout",
+            {"task_ref": "task:demo", "status": "completed"},
+        ),
     )
     assert "summary" in response["error"]["message"]
 

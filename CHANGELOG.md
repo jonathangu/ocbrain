@@ -2,22 +2,70 @@
 
 ## Unreleased
 
+- Bound SQLite writer-lock windows so concurrent agents stop seeing "database
+  is locked": `import-history` now commits after every file instead of holding
+  one implicit write transaction across up to `--batch-size` slow redactions
+  (the same rationale as `DatasetWriteBatch` for dataset miners; the flag is
+  now deprecated), and the default `busy_timeout` rises 5s -> 30s
+  (`OCBRAIN_BUSY_TIMEOUT_MS` still overrides) so MCP ingest/closeout/feedback
+  writes from Codex/Claude/Cursor/Hermes queue instead of failing. WAL +
+  per-file commits + a generous busy timeout is the local queuing model.
+- Harvest Cursor AI chat history: `scripts/export-cursor-chats.py` renders each
+  Cursor workspace's `state.vscdb` (prompts, generations, and composer bubbles)
+  to secret-redacted, content-compared JSONL under `~/.ocbrain/exports/cursor/`,
+  and `history_runtime()` now attributes those exports (and `.cursor` paths) to
+  the `cursor` runtime. `brain-sync.sh` includes the export step and sweeps the
+  export directory, so Cursor sessions accrue to the shared core alongside
+  Codex, Claude Code, and Hermes.
+- Harden `brain-sync.sh` for macOS operators: replace the non-portable
+  `flock(1)` single-instance guard (absent on macOS, which made the script
+  exit silently before every harvest) with an atomic mkdir lock that reclaims
+  stale locks via PID liveness, and bound the harvest with a hard time budget
+  (`OCBRAIN_SYNC_BUDGET_SECONDS`, default 45 minutes) so a stuck import can
+  never block the launchd schedule — partial batches stay committed and the
+  next run resumes. The script now logs `brain_events` counts before and after
+  each run for operator visibility.
+- Persist a stat-fingerprint gate for v1 history imports (`schema_meta` key
+  `history_file_fingerprints_v1`). Previously the v1 path re-read and
+  re-redacted every history file on every run to make its unchanged decision,
+  so multi-GB transcript corpora never converged on a recurring schedule.
+  Unchanged files now skip in O(stat); `import_source_v1` remains the
+  authoritative changed/unchanged judge for any file whose fingerprint moved.
+- Keep stdio MCP transports alive by default instead of imposing a two-hour
+  launcher idle exit. Hosts that do not reconnect treated that intentional
+  exit as `Transport closed`; orphan cleanup remains available through an
+  explicit positive `OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS` value.
+- Default the local stdio MCP server to `local_model` delivery so local coding
+  agents retrieve their own memory at full fidelity, and add a
+  `--delivery-target` flag plus `OCBRAIN_DELIVERY_TARGET` env to select
+  `hosted_model` (egress-filtered) delivery when feeding a hosted teacher.
+  Restores the pre-1.1.0 local default while keeping hosted delivery explicit.
+- Add opt-in unattended promotion (`automatic_activation`, off by default,
+  toggled with `ocbrain automatic-activation --enable/--disable`). When enabled,
+  `brain.ingest` and `brain.closeout` auto-compile evidence and closeout
+  summaries into served beliefs with no human review, so continuity accrues
+  automatically. Promotion is idempotent, scopes to the shared project so any
+  client on it can recall the belief, and never widens egress beyond
+  `local_only`. Off, promotion stays human-gated exactly as before.
 - Reconcile the published v1 MCP tool schemas with the dispatcher so every
   advertised property is callable. The v1 core no longer advertises the
   `at_ts` (as-of time-travel) parameter it cannot serve, and a null or blank
   `at_ts` from a provider that eagerly populates every schema field is treated
-  as omitted instead of rejected; only a meaningful value is refused. Legacy
-  v0.x cores continue to advertise and honor `at_ts`.
-- Accept a double-encoded `context` argument — a JSON string that decodes to an
-  object — across v1 and legacy calls, and apply the same coercion to the
-  legacy `scope` and `filters` parser paths. A string that is not a JSON object
-  is still refused.
+  as omitted instead of rejected; only a meaningful timestamp is refused.
+  Legacy v0.x cores continue to advertise and honor `at_ts`.
+- Accept a double-encoded `context`, `scope`, or `filters` argument — a JSON
+  string that decodes to an object — at the single argument-parsing seam, so a
+  client that stringifies a nested object is not rejected when its fields are
+  correct. A string that is not a JSON object is still refused.
 - Document `brain.closeout`'s conditionally required `task_ref` (required
   unless supplied through `context.task`) and its required `summary` directly
   in the tool schema.
-- Report `coverage.feedback_needed` on context packets and instruct agents not
-  to file feedback on, or re-poll, a retrieval that returned no items.
-- Add a schema/validator consistency contract test for every `brain.*` tool.
+- Report `coverage.feedback_needed` on context and search packets and instruct
+  agents not to file feedback on, or re-poll, a retrieval that returned no
+  items; `brain.context` is not a task-state store.
+- Add a schema/validator consistency contract test asserting, for every
+  `brain.*` tool, that the fields the dispatcher requires are exactly the ones
+  the published schema marks non-nullable.
 
 ## 1.1.0 — 2026-07-17
 

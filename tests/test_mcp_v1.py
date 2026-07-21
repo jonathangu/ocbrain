@@ -968,7 +968,9 @@ def test_v1_source_handles_follow_current_linkage_and_policy_revocation(tmp_path
     assert "not eligible for hosted_model" in revoked["error"]["message"]
 
 
-def test_v1_stdio_is_hosted_and_tool_arguments_cannot_override_delivery(tmp_path, monkeypatch):
+def test_v1_stdio_defaults_local_and_tool_arguments_cannot_override_delivery(
+    tmp_path, monkeypatch
+):
     conn, _ids = _seed_delivery_v1(tmp_path)
     conn.close()
     frames = "\n".join(
@@ -980,7 +982,7 @@ def test_v1_stdio_is_hosted_and_tool_arguments_cannot_override_delivery(tmp_path
                     {
                         "query": "Delivery target sentinel",
                         "context": {"project": "ocbrain"},
-                        "delivery_target": "local_model",
+                        "delivery_target": "hosted_model",
                     },
                     request_id=2,
                 )
@@ -991,9 +993,25 @@ def test_v1_stdio_is_hosted_and_tool_arguments_cannot_override_delivery(tmp_path
     output = io.StringIO()
     monkeypatch.setattr(sys, "stdout", output)
 
+    # The stdio server defaults to local_model so local coding agents get
+    # full-fidelity delivery of their own memory.
     assert serve(tmp_path / "delivery-v1.sqlite") == 0
 
     initialize, override = [json.loads(line) for line in output.getvalue().splitlines()]
-    assert initialize["result"]["serverInfo"]["deliveryTarget"] == "hosted_model"
+    assert initialize["result"]["serverInfo"]["deliveryTarget"] == "local_model"
     assert override["error"]["code"] == -32602
     assert "server-controlled" in override["error"]["message"]
+
+
+def test_v1_stdio_delivery_target_is_selectable(tmp_path, monkeypatch):
+    conn, _ids = _seed_delivery_v1(tmp_path)
+    conn.close()
+    frames = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n'
+    monkeypatch.setattr(sys, "stdin", io.StringIO(frames))
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", output)
+
+    assert serve(tmp_path / "delivery-v1.sqlite", delivery_target="hosted_model") == 0
+
+    initialize = json.loads(output.getvalue().splitlines()[0])
+    assert initialize["result"]["serverInfo"]["deliveryTarget"] == "hosted_model"
