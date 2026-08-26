@@ -19,9 +19,16 @@ SCOPE_TYPES = {
     "session",
     "legacy_unscoped",
 }
-# "public" was published for two years and never once written; every stored row
-# is internal, confidential, or secret.
+# Retired scope types may still exist in the immutable event ledger. They are
+# accepted only through this narrowing map so a replay can quarantine them
+# without restoring them as writable vocabulary.
+LEGACY_SCOPE_TYPE_ALIASES = {"personal_finance": "legacy_unscoped"}
+# ``public`` is not a writable visibility. A small number of historical events
+# and projections do carry it, however, so ``ScopeTag`` narrows that legacy
+# spelling to ``internal`` at construction. This keeps immutable event replay
+# working without reopening a wider visibility to current writers.
 VISIBILITIES = {"internal", "confidential", "secret"}
+LEGACY_VISIBILITY_ALIASES = {"public": "internal"}
 EGRESS_POLICIES = {"hosted_ok", "local_only", "approval_required", "prohibited"}
 
 LOCAL_MODEL_TARGET = "local_model"
@@ -252,6 +259,16 @@ class ScopeTag:
     provenance: str = "explicit"
 
     def __post_init__(self) -> None:
+        normalized_scope_type = LEGACY_SCOPE_TYPE_ALIASES.get(
+            self.scope_type, self.scope_type
+        )
+        if normalized_scope_type != self.scope_type:
+            object.__setattr__(self, "scope_type", normalized_scope_type)
+        normalized_visibility = LEGACY_VISIBILITY_ALIASES.get(
+            self.visibility, self.visibility
+        )
+        if normalized_visibility != self.visibility:
+            object.__setattr__(self, "visibility", normalized_visibility)
         if self.scope_type not in SCOPE_TYPES:
             raise ValueError(f"invalid scope_type: {self.scope_type}")
         if not self.scope_id:
