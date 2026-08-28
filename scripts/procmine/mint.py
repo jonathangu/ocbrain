@@ -37,7 +37,7 @@ from ocbrain.core_v1 import append_core_event, record_core_v1_evidence
 from ocbrain.db import connect
 from ocbrain.ids import stable_id
 from ocbrain.mcp_v1 import decide_proposal_v1
-from ocbrain.scope import ScopeTag
+from ocbrain.scope import ScopeTag, fold_scope_id, resolve_scope_alias
 from ocbrain.text import find_probable_secret_leaks, redact_secrets
 
 from . import __version__
@@ -160,6 +160,12 @@ def _scope_for(signature: str, attribution: dict[str, dict[str, Any]]) -> tuple[
     # projects do not make the scope depend on dict ordering.
     dominant = sorted(projects.items(), key=lambda item: (-item[1], item[0]))[0][0]
     scope_id = dominant if dominant.startswith("project:") else f"project:{dominant}"
+    # Closeouts store whatever project string the writing agent typed on the
+    # day, and historical rows keep those variants forever. Retrieval reaches a
+    # stored scope only after folding the caller's string through the alias
+    # table, so a gotcha minted into the raw variant lands where no caller can
+    # match it. Canonicalize at write time -- the same repair the read side got.
+    scope_id = resolve_scope_alias(fold_scope_id(scope_id))
     return _scope_tag(scope_id), quality
 
 

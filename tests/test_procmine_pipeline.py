@@ -423,6 +423,37 @@ def test_belief_id_depends_on_signature_and_scope_only():
     assert left != mint_mod.gotcha_belief_id("bash:other", "project:ocbrain")
 
 
+def test_gotcha_scope_folds_through_the_alias_table(monkeypatch):
+    """A gotcha must mint into the scope callers can actually reach.
+
+    Historical closeouts carry whatever project string the writing agent typed
+    (the live core attributes signatures to 'personalization-headroom' and
+    friends), and retrieval only reaches a stored scope after folding the
+    caller's string through the alias table. Minting into the raw variant
+    parks the gotcha where no folded caller matches it.
+    """
+    monkeypatch.setenv(
+        "OCBRAIN_SCOPES_ALIASES",
+        json.dumps({"project:personalization-headroom": "project:coframe-personalization"}),
+    )
+    attribution = {
+        "bash:flaky": {
+            "qualities": [1.0],
+            "projects": {"personalization-headroom": 3, "coframe": 1},
+        }
+    }
+    scope, quality = mint_mod._scope_for("bash:flaky", attribution)
+    assert scope.scope_id == "project:coframe-personalization"
+    assert quality == 1.0
+
+    # Without an alias entry the fold still normalizes case and spacing, and
+    # an unmapped variant stays itself rather than being guessed at.
+    monkeypatch.setenv("OCBRAIN_SCOPES_ALIASES", json.dumps({}))
+    attribution["bash:flaky"]["projects"] = {"Personalization Headroom": 2}
+    scope, _ = mint_mod._scope_for("bash:flaky", attribution)
+    assert scope.scope_id == "project:personalization-headroom"
+
+
 def test_a_gotcha_with_no_joined_episode_falls_back_to_the_workspace_scope(tmp_path):
     brain = _core_with_closeout(tmp_path, "unused-session")
     candidates = mint_mod.build_candidates(_flaky_traces(), brain_db=brain)
