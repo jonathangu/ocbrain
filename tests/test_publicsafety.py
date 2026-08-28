@@ -78,6 +78,8 @@ def test_source_distribution_explicitly_excludes_runtime_private_roots() -> None
     ignored = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "data/" in ignored and "logs/" in ignored
     assert ps.content_scan_excluded("src/ocbrain/publicsafety.py")
+    assert ps.builtin_scan_excluded("scripts/procmine/normalize.py")
+    assert not ps.content_scan_excluded("scripts/procmine/normalize.py")
 
 
 # --- clean tree passes ---------------------------------------------------- #
@@ -111,6 +113,20 @@ def test_catches_denylist_hit(repo: Path) -> None:
     assert deny and deny[0].path == "notes.md"
     # Value must NEVER appear in the finding output.
     assert FAKE_DENY not in result.report()
+
+
+def test_redaction_module_remains_subject_to_private_denylist(repo: Path) -> None:
+    """A heuristic exemption must not weaken the local denylist baseline."""
+    _write_denylist(repo, [FAKE_DENY])
+    path = repo / "scripts" / "procmine" / "normalize.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(f'REDACTION_EXAMPLE = "{FAKE_DENY}"\n', encoding="utf-8")
+    _git(repo, "add", "scripts/procmine/normalize.py")
+    _git(repo, "commit", "-q", "-m", "add redactor")
+    result = ps.scan(repo)
+    findings = [f for f in result.findings if f.rule == "denylist"]
+    assert len(findings) == 1, result.report()
+    assert findings[0].path == "scripts/procmine/normalize.py"
 
 
 def test_catches_tracked_data_file(repo: Path) -> None:
@@ -255,6 +271,19 @@ def test_plist_still_subject_to_placement_and_denylist(repo: Path) -> None:
     ), result.report()
 
 
+def test_plist_still_subject_to_infrastructure_identifier_scan(repo: Path) -> None:
+    (repo / "ops").mkdir()
+    (repo / "ops" / "svc.plist").write_text(
+        '<plist><string>host="10.11.12.13"</string></plist>\n', encoding="utf-8"
+    )
+    _git(repo, "add", "ops/svc.plist")
+    _git(repo, "commit", "-q", "-m", "plist with private host")
+    result = ps.scan(repo)
+    findings = [f for f in result.findings if f.rule == "infra_identifier"]
+    assert len(findings) == 1, result.report()
+    assert "10.11.12.13" not in result.report()
+
+
 def test_entropy_pathcheck_excluded_unit() -> None:
     assert ps.entropy_pathcheck_excluded("ops/com.example.agent.plist")
     assert not ps.entropy_pathcheck_excluded("src/ocbrain/cli.py")
@@ -366,3 +395,77 @@ def test_diff_range_ignores_removed_lines(repo: Path) -> None:
     head = _git(repo, "rev-parse", "HEAD").strip()
     result = ps.scan(repo, diff_range=f"{base}..{head}")
     assert not any(f.rule == "secret_leak" for f in result.findings), result.report()
+
+
+# --------------------------------------------------------------------------- #
+# The detector shapes the 2026-08-24 leaks proved missing
+# --------------------------------------------------------------------------- #
+
+
+def test_private_path_flags_developer_and_documents_containers():
+    hits = ps.private_path_segments(
+        "see /Users/bob/Developer/secret-repo/src/x.py and /Users/bob/Documents/private-notes/a.md",
+        ps.WORKSPACE_ALLOWLIST,
+    )
+    assert hits == ["secret-repo", "private-notes"]
+
+
+def test_private_path_still_allowlists_this_repo_under_developer():
+    assert (
+        ps.private_path_segments(
+            "/Users/example/Developer/ocbrain/src/x.py", ps.WORKSPACE_ALLOWLIST
+        )
+        == []
+    )
+
+
+def test_private_path_flags_a_home_dotdir():
+    """An absolute home dot-dir path always reveals a username; `~/…` does not."""
+    hits = ps.private_path_segments(
+        "wrote /Users/bob/.privatebrain/logs/run.log", ps.WORKSPACE_ALLOWLIST
+    )
+    assert hits == [".privatebrain"]
+    assert ps.private_path_segments("wrote ~/.privatebrain/logs/run.log", set()) == []
+
+
+def test_infra_identifiers_flag_a_routable_ipv4_but_not_documentation_ranges():
+    assert ps.infrastructure_identifier_kinds('host="10.11.12.13"', None) == [
+        "routable IPv4 literal"
+    ]
+    for exempt in ("127.0.0.1", "0.0.0.0", "192.0.2.7", "198.51.100.9", "203.0.113.4"):
+        assert ps.infrastructure_identifier_kinds(f"connect to {exempt}", None) == []
+    # Not an address at all: an octet over 255 is a version or a counter.
+    assert ps.infrastructure_identifier_kinds("build 300.1.1.1", None) == []
+
+
+def test_infra_identifiers_flag_the_oslogin_spelling_but_not_snake_case_code():
+    assert ps.infrastructure_identifier_kinds('user="alice_example_com"', None) == [
+        "OS Login account spelling"
+    ]
+    # The live tree's proven false-positive shapes must stay silent.
+    assert ps.infrastructure_identifier_kinds("search_documents_ai trigger", None) == []
+    assert ps.infrastructure_identifier_kinds("run_stage_dev pipeline", None) == []
+
+
+def test_local_account_pattern_guards_against_generic_and_short_names():
+    assert ps.local_account_pattern("runner") is None
+    assert ps.local_account_pattern("root") is None
+    assert ps.local_account_pattern("bob") is None
+    pattern = ps.local_account_pattern("localx")
+    assert pattern is not None
+    assert ps.infrastructure_identifier_kinds(
+        "log at /Users/localx/.openclaw/run.log", pattern
+    ) == ["this machine's account name"]
+
+
+def test_infra_findings_withhold_the_matched_value(repo):
+    """CI logs on a public repo are public; a finding must not re-leak its match."""
+    (repo / "docs").mkdir()
+    (repo / "docs" / "note.md").write_text('the box is at host="10.11.12.13"\n', encoding="utf-8")
+    _git(repo, "add", "docs/note.md")
+    _git(repo, "commit", "-qm", "add note")
+    result = ps.scan(repo)
+    findings = [f for f in result.findings if f.rule == "infra_identifier"]
+    assert len(findings) == 1
+    assert "10.11.12.13" not in findings[0].detail
+    assert "routable IPv4 literal" in findings[0].detail
