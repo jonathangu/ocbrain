@@ -84,9 +84,15 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
     # Covered in tests/test_compact.py, which drives the dry run, the --apply
     # refusal without --yes, the applying path, and the undo.
     compaction_acceptance = {"compact"}
+    # Covered in tests/test_curator_volatility.py, which drives the plan, the
+    # --apply refusal without --yes, and the applying path.
+    volatility_acceptance = {"wiki-volatility"}
     # Covered in tests/test_briefing.py, which drives determinism, the budget,
     # section order, and the ledger projection against seeded cores.
     harness_acceptance = {"briefing", "ledger"}
+    # Covered in tests/test_feedback_semantics.py, which drives the reporting
+    # default, the --apply rewrite, and the counts in both directions.
+    feedback_acceptance = {"feedback-repair"}
     assert commands == (
         exercised_here
         | subprocess_or_migration_acceptance
@@ -96,7 +102,9 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
         | repo_guard_acceptance
         | selftest_acceptance
         | compaction_acceptance
+        | volatility_acceptance
         | harness_acceptance
+        | feedback_acceptance
     )
 
 

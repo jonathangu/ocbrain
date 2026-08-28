@@ -40,7 +40,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -340,6 +340,19 @@ THRESHOLDS: dict[str, Threshold] = {
         1.0,
         "SQLite quick_check plus foreign_key_check. Binary: either the core is "
         "structurally sound or it is not.",
+    ),
+    "egress_refusable_policies": Threshold(
+        HIGHER_BETTER,
+        1.0,
+        1.0,
+        "How many egress policies present in this brain's curation-eligible "
+        "evidence the declared allow-list would refuse. Binary by construction: "
+        "at zero the gate has no reachable failing input, so a clean audit means "
+        "nothing. Measured 0 on the live core on 2026-08-28 -- the allow-list "
+        "named all three policies the corpus contains, and all 240 egress audits "
+        "carried rejected_json='[]' across 25,106 transmitted items. Set "
+        "curator.egress_allowlist_ack to declare that as intended; the "
+        "acknowledgement downgrades the verdict and is recorded with it.",
     ),
     "vector_sidecar_lag_events": Threshold(
         LOWER_BETTER,
@@ -1835,6 +1848,97 @@ def _storage(conn: sqlite3.Connection, cutoff: str, since_days: int) -> list[Met
     return metrics
 
 
+def _egress_gate(conn: sqlite3.Connection) -> Metric:
+    """Can the curator's egress allow-list refuse anything this corpus contains?
+
+    Not "did it refuse something" -- that is the number the audits already give,
+    and on this brain it was zero 240 times running. A guard that admits every
+    value its input can take has no failing input, and every clean run of it is
+    evidence of nothing. So the question asked here is whether a refusal is
+    *reachable*, and the answer is a property of the configuration and the
+    corpus rather than of any one run.
+    """
+    from ocbrain.curator import (
+        ELIGIBLE_KINDS,
+        FORBIDDEN_EGRESS_POLICIES,
+        FORBIDDEN_VISIBILITIES,
+        refusable_policies,
+        resolve_selection_policy,
+    )
+
+    if not _table_exists(conn, "evidence_objects"):
+        return _unmeasured(
+            "egress_refusable_policies", "D", "Egress allow-list has teeth", "no evidence_objects"
+        )
+    acknowledgement = ""
+    declared: tuple[str, ...] = ()
+    try:
+        from ocbrain.config import load_config
+
+        section = load_config().curator
+        acknowledgement = " ".join(str(section.egress_allowlist_ack or "").split())
+        declared, _visibilities = resolve_selection_policy(
+            egress_policies=list(section.egress_policies),
+            visibilities=list(section.visibilities),
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken config is its own finding
+        return _unmeasured(
+            "egress_refusable_policies",
+            "D",
+            "Egress allow-list has teeth",
+            f"curator config unreadable: {type(exc).__name__}",
+        )
+    placeholders = ",".join("?" for _ in ELIGIBLE_KINDS)
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT egress_policy FROM evidence_objects "  # noqa: S608 - kind count only
+            f"WHERE kind IN ({placeholders}) AND scope_type='project'",
+            tuple(sorted(ELIGIBLE_KINDS)),
+        )
+        if row[0]
+    }
+    # The floor is not part of the operator's declaration and is enforced in
+    # code, so a corpus containing `prohibited` evidence does not earn the
+    # allow-list credit for refusing it. Shared with the audit row's own
+    # `allowlist_vacuous` field, so a stored audit and this scorecard cannot
+    # disagree about whether the gate had teeth.
+    refusable = refusable_policies(declared, present)
+    audits = 0
+    audits_with_refusals = 0
+    if _table_exists(conn, "egress_audits"):
+        audits = int(_scalar(conn, "SELECT COUNT(*) FROM egress_audits") or 0)
+        audits_with_refusals = int(
+            _scalar(
+                conn,
+                "SELECT COUNT(*) FROM egress_audits "
+                "WHERE rejected_json IS NOT NULL AND rejected_json NOT IN ('', '[]')",
+            )
+            or 0
+        )
+    metric = _measured(
+        "egress_refusable_policies",
+        "D",
+        "Egress allow-list has teeth",
+        float(len(refusable)),
+        display=f"{len(refusable)} of {len(present)} present policies refusable",
+        basis="egress policies on curation-eligible evidence the allow-list would refuse",
+        declared_egress_policies=list(declared),
+        present_egress_policies=sorted(present),
+        refusable_policies=refusable,
+        forbidden_in_code=sorted(FORBIDDEN_EGRESS_POLICIES | FORBIDDEN_VISIBILITIES),
+        egress_audits=audits,
+        egress_audits_with_refusals=audits_with_refusals,
+        acknowledgement=acknowledgement or None,
+    )
+    if metric.status == ALARM and acknowledgement:
+        # Declared, not enumerated: an operator who says why an all-admitting
+        # allow-list is intended here gets a WATCH carrying their reason, not a
+        # silent pass and not a permanent red.
+        return replace(metric, status=WATCH)
+    return metric
+
+
 def _sidecar_freshness(conn: sqlite3.Connection) -> Metric:
     from ocbrain.hybrid import VECTOR_SCHEMA_VERSION, connection_path, vector_db_path
 
@@ -2233,6 +2337,7 @@ def run_selftest(
     metrics.append(_closeout_join(conn, cutoff, transcript_root))
     metrics.append(_harvest(conn, now))
     metrics.extend(_storage(conn, cutoff, since_days))
+    metrics.append(_egress_gate(conn))
     metrics.append(_sidecar_freshness(conn))
     metrics.append(_integrity(conn))
     metrics.extend(_harness_surface(conn, now))

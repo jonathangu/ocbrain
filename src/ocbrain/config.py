@@ -96,6 +96,17 @@ class RetrievalConfig:
     min_lexical_query_term_matches: int = 2
     min_redundant_lexical_strength_ratio: float = 0.50
     require_dense_support: bool = True
+    # Whether `ranking_prior` keeps its `0.85 + 0.15 * confidence` term.
+    #
+    # `confidence` is authored, not measured: 345 of the 347 serving beliefs on
+    # the reference corpus carry one, all in [0.65, 1.0], and 116 of them are
+    # the same round 0.85. Joined to recorded feedback it points the wrong way
+    # -- packets judged irrelevant or harmful held items averaging 0.8707,
+    # packets judged used or helpful averaged 0.7263 -- so the term rewards the
+    # rows readers liked least. Whether that means the term should go or the
+    # number should be re-derived is an operator decision, so this ships True:
+    # the default reproduces every packet built to date.
+    confidence_prior_enabled: bool = True
     # Retrieval feedback shifts a belief's score by ``1 + boost``. The boost is
     # ``avg_signal * weight``, damped by observation count and clamped to
     # +/-``feedback_clamp``. Set ``feedback_weight`` to 0 to ignore feedback.
@@ -162,6 +173,57 @@ class CuratorConfig:
     # skipped, rather than spending a hosted call on a handful of rows. Set to 1
     # to curate every project with any eligible evidence at all.
     min_evidence_per_project: int = 3
+
+    # What a new-key claim gets when the duplicate gate cannot see the corpus --
+    # no sidecar, no local embedder, a model digest that moved. `pend` records
+    # the claim as an undecided proposal instead of minting it; `admit` mints it,
+    # which is the behaviour that let one fact reach the corpus five times under
+    # five keys. Fail-closed by default: a gate that disappears when its
+    # instrument is down is the gate this repo keeps finding, and pending loses
+    # nothing -- the claim is in the ledger, and an identical re-derivation on
+    # the next cycle writes nothing at all.
+    duplicate_gate_fallback: str = "pend"
+
+    # How many candidate bodies one duplicate-gate call may embed on demand --
+    # the beliefs written since the last sidecar build, whose stored vectors no
+    # longer match. Past this, the extra candidates are reported as `uncovered`,
+    # the gate reports itself unavailable, and `duplicate_gate_fallback` decides.
+    # So on the `pend` default this is an availability cliff: a cycle that
+    # touches more than this many beliefs pends the rest of its claims rather
+    # than compiling them. Raise it (each extra candidate is one local embedding
+    # call) if your cycles are larger than this; do not lower it expecting a
+    # cheaper gate, because what gets cheaper is the gate refusing to answer.
+    document_embed_budget: int = 32
+
+    # Whether a claim's TTL comes from its volatility class (a host name expires
+    # in days, a measurement in weeks, doctrine not at all) or from the single
+    # `current_ttl_days` number that lifecycle used to buy. Applies to newly
+    # compiled claims only; existing beliefs are re-dated by the explicit
+    # `wiki-volatility --apply` maintenance command, never by a background sweep.
+    volatility_ttl: bool = True
+    volatile_ttl_days: int = 14
+    measured_ttl_days: int = 45
+
+    # An operator's declared reason for an egress allow-list that admits every
+    # policy the corpus contains. Empty means undeclared, and the selftest
+    # reports the allow-list as vacuous -- a gate no input can fail is a
+    # transmission log, not a control. Set it to say why that is intended here;
+    # the text is recorded with the metric, not just the fact that it was set.
+    egress_allowlist_ack: str = ""
+
+    # Per-cadence model profile. Empty means "same as `provider`/`model`", so an
+    # install that sets neither runs exactly one model, as it does today.
+    nightly_provider: str = ""
+    nightly_model: str = ""
+
+    # An independent critic of a DIFFERENT provider family, consulted only for
+    # high-impact changes: a supersession of a pinned belief or of anything in a
+    # `global:*` scope. Correlated error is the failure this addresses -- one
+    # model grading its own family's output agrees with itself -- so a critic
+    # configured to the curator's own provider is refused rather than run.
+    # Empty `critic_provider` disables it, which is the default.
+    critic_provider: str = ""
+    critic_model: str = ""
 
 
 @dataclass(frozen=True)

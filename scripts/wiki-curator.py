@@ -36,17 +36,19 @@ from pathlib import Path
 from ocbrain.config import load_config
 from ocbrain.core_v1 import is_core_v1
 from ocbrain.curator import (
+    CURATION_CADENCES,
     PROVIDER_DEFAULTS,
     WIKI_STATE_SCHEMA,
     apply_claims,
     input_digest,
     load_env_value,
     now_iso,
+    partition_evidence,
     project_digests,
     record_curation_egress,
     request_claims,
+    resolve_model_profile,
     resolve_selection_policy,
-    select_evidence,
     validate_claims,
 )
 from ocbrain.db import connect
@@ -105,14 +107,44 @@ def read_state(state_path: Path) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def main() -> int:
+def resolve_ttl_policy(args: argparse.Namespace, curator_cfg) -> tuple[int, bool]:
+    """The ``(current_ttl_days, volatility_ttl)`` one run compiles claims under.
+
+    Both are three-valued on the command line -- unset means "whatever the
+    config says" -- because the config fields are the scheduled curator's only
+    voice and a flag defaulted in argparse silently outranks them.
+    """
+    current_ttl_days = (
+        int(curator_cfg.current_ttl_days)
+        if args.current_ttl_days is None
+        else int(args.current_ttl_days)
+    )
+    volatility_ttl = (
+        bool(curator_cfg.volatility_ttl)
+        if args.volatility_ttl is None
+        else bool(args.volatility_ttl)
+    )
+    return max(0, current_ttl_days), volatility_ttl
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument(
         "--provider",
-        default="anthropic",
+        default=None,
         choices=sorted(PROVIDER_DEFAULTS),
-        help="hosted model provider (default: anthropic)",
+        help="hosted model provider; defaults to the cadence profile, then curator.provider",
+    )
+    parser.add_argument(
+        "--cadence",
+        default="hourly",
+        choices=sorted(CURATION_CADENCES),
+        help=(
+            "which curation cadence this run is, which selects the "
+            "curator.<cadence>_provider/_model profile when one is set "
+            "(default: hourly)"
+        ),
     )
     parser.add_argument(
         "--env-file",
@@ -161,10 +193,25 @@ def main() -> int:
     parser.add_argument(
         "--current-ttl-days",
         type=int,
-        default=90,
+        default=None,
         help=(
-            "expiry stamped on 'current' lifecycle claims so they can age out; "
-            "0 disables expiry. Durable claims never expire"
+            "0 disables expiry entirely, under either TTL scheme. Under the "
+            "default volatility scheme the class TTLs decide the number, so a "
+            "positive value here is the number only with --no-volatility-ttl, "
+            "where it is the expiry stamped on 'current' lifecycle claims. "
+            "Defaults to curator.current_ttl_days"
+        ),
+    )
+    parser.add_argument(
+        "--volatility-ttl",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "key a claim's expiry on how fast its subject moves (a rotating host "
+            "in days, a measurement in weeks, doctrine never) rather than on its "
+            "lifecycle. --no-volatility-ttl restores the lifecycle rule, where "
+            "--current-ttl-days is the number and durable claims never expire. "
+            "Defaults to curator.volatility_ttl"
         ),
     )
     parser.add_argument("--wiki-dir", type=Path)
@@ -193,10 +240,22 @@ def main() -> int:
         action="store_true",
         help="re-run even when the input digest is unchanged since the last run",
     )
-    args = parser.parse_args()
+    return parser
 
-    defaults = PROVIDER_DEFAULTS[args.provider]
-    model = args.model or defaults["model"]
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    # A flag beats the cadence profile beats `curator.provider`/`curator.model`.
+    provider, model = resolve_model_profile(
+        cadence=args.cadence, provider=args.provider, model=args.model
+    )
+    if provider not in PROVIDER_DEFAULTS:
+        raise SystemExit(
+            f"unknown provider {provider!r}; expected one of {', '.join(sorted(PROVIDER_DEFAULTS))}"
+        )
+    defaults = PROVIDER_DEFAULTS[provider]
+    model = model or defaults["model"]
     api_key_env = args.api_key_env or defaults["api_key_env"]
     base_url = args.base_url or defaults["base_url"]
 
@@ -218,6 +277,7 @@ def main() -> int:
             visibilities=curator_cfg.visibilities,
             allow_hosted_egress=bool(args.allow_hosted_egress),
         )
+        current_ttl_days, volatility_ttl = resolve_ttl_policy(args, curator_cfg)
         projects = resolve_projects(args, list(curator_cfg.projects))
         min_evidence = (
             curator_cfg.min_evidence_per_project
@@ -246,16 +306,19 @@ def main() -> int:
             "beliefs_coexist_marked": 0,
             "beliefs_deferred": 0,
             "beliefs_pending_deduped": 0,
+            "beliefs_pended_unverified": 0,
+            "beliefs_duplicate_routed": 0,
         }
         by_status: dict[str, list[str]] = {}
         for project in projects:
-            evidence = select_evidence(
+            partition = partition_evidence(
                 conn,
                 limit=max(1, args.max_evidence),
                 project=project,
                 egress_policies=resolved_egress,
                 visibilities=resolved_visibility,
             )
+            evidence = partition["included"]
             existing = current_wiki_beliefs(
                 conn,
                 project=project,
@@ -267,7 +330,7 @@ def main() -> int:
                 "action": "wiki-curate",
                 "project": project,
                 "apply": bool(args.apply),
-                "provider": args.provider,
+                "provider": provider,
                 "model": model,
                 "eligible_evidence": len(evidence),
                 "eligible_kinds": sorted({str(row["kind"]) for row in evidence}),
@@ -279,6 +342,9 @@ def main() -> int:
                 "hosted_egress_acknowledged": bool(args.allow_hosted_egress),
                 "egress_policies": list(resolved_egress),
                 "visibilities": list(resolved_visibility),
+                "refused_evidence": partition["rejected_count"],
+                "present_egress_policies": partition["present_egress_policies"],
+                "present_visibilities": partition["present_visibilities"],
             }
             totals["eligible_evidence"] += len(evidence)
 
@@ -317,13 +383,18 @@ def main() -> int:
                 audit_id = record_curation_egress(
                     conn,
                     evidence=evidence,
-                    provider=args.provider,
+                    provider=provider,
                     model=model,
                     project=project,
                     egress_policies=resolved_egress,
+                    rejected=partition["rejected"],
+                    rejected_count=partition["rejected_count"],
+                    visibilities=resolved_visibility,
+                    present_egress_policies=partition["present_egress_policies"],
+                    present_visibilities=partition["present_visibilities"],
                 )
                 response = request_claims(
-                    provider=args.provider,
+                    provider=provider,
                     api_key=api_key,
                     base_url=base_url,
                     model=model,
@@ -347,8 +418,9 @@ def main() -> int:
                     claims,
                     model=model,
                     project=project,
-                    provider=args.provider,
-                    current_ttl_days=max(0, args.current_ttl_days),
+                    provider=provider,
+                    current_ttl_days=current_ttl_days,
+                    volatility_ttl=volatility_ttl,
                 )
             except Exception as exc:  # noqa: BLE001 - one bad scope must not stop the rest
                 # Do not advance this project's digest. Letting the exception out
@@ -370,6 +442,8 @@ def main() -> int:
             totals["beliefs_coexist_marked"] += len(applied["coexist_marked"])
             totals["beliefs_deferred"] += len(applied["deferred"])
             totals["beliefs_pending_deduped"] += len(applied["pending_deduped"])
+            totals["beliefs_pended_unverified"] += len(applied["pended_unverified"])
+            totals["beliefs_duplicate_routed"] += len(applied["duplicate_routed"])
             next_digests[project] = digest
             close_project(
                 by_status,
@@ -386,6 +460,10 @@ def main() -> int:
                     "coexist_marked": len(applied["coexist_marked"]),
                     "deferred": len(applied["deferred"]),
                     "pending_deduped": len(applied["pending_deduped"]),
+                    "pended_unverified": len(applied["pended_unverified"]),
+                    "duplicate_routed": len(applied["duplicate_routed"]),
+                    "duplicate_sample": applied["duplicate_routed"][:4],
+                    "pended_sample": applied["pended_unverified"][:4],
                     "rejection_sample": rejected[:8],
                 },
             )
@@ -394,8 +472,14 @@ def main() -> int:
         rollup = {
             "action": "wiki-curate-rollup",
             "apply": bool(args.apply),
-            "provider": args.provider,
+            "cadence": args.cadence,
+            "provider": provider,
             "model": model,
+            # What the TTL controls actually resolved to. A flag that reads its
+            # input and does nothing is only findable if the run says which rule
+            # it compiled under.
+            "current_ttl_days": current_ttl_days,
+            "volatility_ttl": volatility_ttl,
             "projects": projects,
             "projects_by_status": dict(sorted(by_status.items())),
             **totals,
@@ -415,7 +499,7 @@ def main() -> int:
                 "schema_version": WIKI_STATE_SCHEMA,
                 "at": now,
                 "action": "wiki-curate",
-                "provider": args.provider,
+                "provider": provider,
                 "model": model,
                 "projects": {
                     name: {"input_digest": value, "at": now}
@@ -431,6 +515,8 @@ def main() -> int:
                 "coexist_marked_count": totals["beliefs_coexist_marked"],
                 "deferred_count": totals["beliefs_deferred"],
                 "pending_deduped_count": totals["beliefs_pending_deduped"],
+                "pended_unverified_count": totals["beliefs_pended_unverified"],
+                "duplicate_routed_count": totals["beliefs_duplicate_routed"],
             },
         )
         emit(

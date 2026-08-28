@@ -150,6 +150,32 @@ def test_golden_context_and_source_contract(
         len(item["sources"]) for item in packet["items"]
     )
     assert packet["coverage"]["unavailable_sources"] == []
+    # The item key set is part of the contract, not an accident of the builder.
+    # `confidence` and `confidence_band` were served here until they were
+    # measured against recorded feedback and found to run backwards; pinning the
+    # keys is what stops them drifting back in, and what makes any future
+    # addition to the packet a deliberate edit to this list.
+    for item in packet["items"]:
+        assert set(item) == {
+            "id",
+            "kind",
+            "excerpt",
+            "excerpt_truncated",
+            "scope",
+            "score",
+            "relevance",
+            "evidence_count",
+            "evidence_latest_at",
+            "status",
+            "evidence_ids",
+            "sources",
+            "ranking",
+        }
+    # Belt as well as braces: the empty-packet cases have no items to key-check,
+    # and the field must not reappear anywhere else in the envelope either.
+    serialized = json.dumps(packet, sort_keys=True)
+    assert '"confidence"' not in serialized
+    assert '"confidence_band"' not in serialized
     if case["delivery_target"] == "hosted_model":
         assert packet["coverage"]["excluded_sample"] == []
     # There is no second retrieval pass to declare any more.

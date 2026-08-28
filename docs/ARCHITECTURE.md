@@ -21,7 +21,7 @@ The runtime path combines them:
 
 1. Scope and lexical retrieval filter the unbounded lake.
 2. `brain.context` creates a stable `ocbrain.context.v1` dossier with coverage,
-   exclusions, contradictions, confidence, and source handles.
+   exclusions, contradictions, evidence support, and source handles.
 3. `brain.source` expands the few exact sources needed for comparison or global
    reasoning. The handle is scope-bound, size-bounded, and content-hash checked.
 4. The model performs the work.
@@ -127,7 +127,11 @@ project claim.
 `ocbrain.context.v1` is deliberately model-neutral. It returns:
 
 - query plus resolved runtime, project, repository, client, task, and session context;
-- ranked current serving beliefs with confidence and evidence IDs;
+- ranked current serving beliefs with evidence IDs, an evidence-support count,
+  and the recording time of their newest supporting evidence. The authored
+  `confidence` / `confidence_band` pair is deliberately *not* served: measured
+  against recorded feedback it ran backwards, so a reader weighting on it was
+  being steered toward the rows readers liked least;
 - visible contradictions;
 - bounded OCBrain-issued source handles;
 - returned counts plus separate scope- and delivery-excluded serving-inventory

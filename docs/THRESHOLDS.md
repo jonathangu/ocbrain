@@ -373,6 +373,30 @@ real byte delta needs two snapshots, which is what `--baseline` is for.
 PR #33 cut projected growth from ~106 MB/month to ~14 MB/month by storing
 transcript evidence as verified file pointers rather than inline copies.
 
+### `egress_refusable_policies` — ok ≥ 1, watch ≥ 1 (higher is better)
+
+How many egress policies present on this brain's curation-eligible evidence the
+operator's declared allow-list would refuse. Not "how many did it refuse" — that
+number is in the audits, and it is a different question.
+
+**Measured**, 2026-08-28 on the live core: **0**. `egress_audits` holds 240 rows
+covering 2026-08-04 to 2026-08-28, and `SELECT DISTINCT rejected_json` returns
+exactly one value: the literal string `'[]'`. Across those audits 25,106 evidence
+items were transmitted and none was ever refused. The reason is structural rather
+than lucky — the declared allow-list named `approval_required`, `hosted_ok`, and
+`local_only`, which is every policy an operator may declare, so no input could
+fail the check.
+
+Binary by construction, which is why `ok` and `watch` are the same number: either
+a refusal is reachable or the gate is a transmission log. `prohibited` is
+subtracted before counting, because it is refused in code whatever an operator
+declares, and crediting the declaration for the floor would let an
+everything-admitting allow-list look like one with teeth.
+
+Set `curator.egress_allowlist_ack` to a sentence saying why an all-admitting
+allow-list is intended on this install. The acknowledgement downgrades `alarm` to
+`watch` and is recorded in the metric's detail — declared, not enumerated away.
+
 ### `vector_sidecar_lag_events` — ok ≤ 500, watch ≤ 5000 (lower is better)
 
 Events appended to the core since the sidecar recorded its `core_event_seq`.
@@ -427,6 +451,190 @@ Age of the oldest open goal. Goal drift is a distinct failure that pass/fail
 benchmarks cannot see, and an objective nobody has closed or abandoned in six
 weeks is the observable form of it. Judgement: no measurement exists yet
 because goals ship with this release.
+
+---
+
+## Constants outside the scorecard
+
+Not every number that decides something is a selftest threshold. These sit in
+`src/ocbrain/curator.py`, on the compile path, and get the same treatment.
+
+### `NEAR_DUPLICATE_COSINE = 0.88`
+
+Document-to-document cosine at or above which a new-key claim is treated as a
+restatement of a belief already serving in its scope, and routed to supersession
+rather than minted under its own key.
+
+**Measured**, and deliberately not an independent number: it is pinned equal to
+`compact.DEFAULT_COSINE_FLOOR`, which v2.2 Phase 7 calibrated by finding 38
+same-scope clusters on the live corpus and proposing 18 merges retiring 25
+beliefs. `tests/test_curator_duplicate_gate.py::test_the_gate_and_the_compactor_share_one_floor`
+holds them equal. A claim the gate admits and the compactor then proposes
+retiring would be a gate that moved the work rather than doing it.
+
+Re-measured on a copy of the live core, 2026-08-28, with this repo's own
+`compact.find_clusters`: 35 same-scope clusters at 0.88 covering 98 of 347
+serving beliefs, 63 of which are excess copies. At 0.85 the same corpus gives 51
+clusters over 145 beliefs, and at 0.90, 28 over 77.
+
+What the number is *not* doing is worth stating, because it would be easy to
+claim credit for it. Replaying each cluster's second member as a fresh claim
+through `apply_claims` — real key, real body, real local embedder — the existing
+0.60 query-side cascade already collapses **34 of 34** replayed clusters when the
+sidecar is freshly built. This floor earns its place only in the state a curation
+cycle actually leaves the sidecar in, where the query-side arm is blind: **23 of
+34 grow a second serving belief before this gate, 2 after**. Choosing 0.85 or
+0.90 instead would move that "2" a little; keeping the compactor's number keeps
+the two stages agreeing about what one fact is, which matters more.
+
+The scale matters: this is a **document-side** score, comparable with the
+sidecar's stored vectors, and it is not the same scale as
+`CONTRADICTION_COSINE_FLOOR = 0.60`, which scores a *query*-side embedding
+against those documents. Two floors, two scales, one reason each.
+
+### `NEAR_DUPLICATE_NEIGHBORS = 5`
+
+How many of the scored candidates the gate looks at before deciding. The list is
+sorted by descending similarity, so this only ever matters when the top match is
+below the floor and a lower one is not — which cannot happen. It is a bound on
+the returned list, not a decision: the decision is the first neighbour's score
+against `NEAR_DUPLICATE_COSINE`.
+
+**Judgement**, matched deliberately to `CONTRADICTION_NEIGHBORS = 5` so the two
+readers of the same sidecar ask for the same shape of answer. Nothing measured
+argues for 5 over 3 or 10; what would change behaviour is the floor, not this.
+
+### `DEFAULT_DOCUMENT_EMBED_BUDGET = 32` (`src/ocbrain/hybrid.py`)
+
+How many candidate bodies one duplicate-gate call may embed on demand. The
+candidates that need it are exactly the beliefs written since the last sidecar
+build, because those are the rows whose stored vector no longer matches their
+body. Past the budget the extra candidates come back as `uncovered`, the gate
+returns `candidates_uncovered:N`, and that reason is **not** in
+`DUPLICATE_GATE_EXEMPT_REASONS` — so on the shipped `pend` fallback every
+remaining claim in that cycle is pended rather than compiled.
+
+So this is an **availability cliff, not a performance dial**, and it is stated
+that way in `curator.document_embed_budget` because the failure it produces
+looks like the curator quietly doing nothing.
+
+**Judgement, bounded by a measured quantity.** The number that has to fit under
+it is one cycle's own output: `wiki-curator.py --max-beliefs` defaults to 24 and
+is capped at 40, and `scripts/brain-promote.sh` rebuilds the sidecar (line 214)
+only after curation has finished, so every belief a cycle writes stays uncovered
+for the rest of that cycle. 32 sits above the default and below the cap.
+`tests/test_curator_duplicate_gate.py::test_the_shipped_embed_budget_covers_a_full_max_beliefs_cycle`
+holds it above 24 and equal to the config default.
+
+The cliff was measured by this change's adversarial reviewer, not by its author,
+on a `.backup` copy of the live core with a live embedder (2026-08-28): with 40
+serving beliefs' bodies no longer matching their stored vectors,
+`document_neighbors` answered with coverage `{candidates 301, reused 261,
+embedded 32, uncovered 8}` and the gate returned `candidates_uncovered:8`.
+Recorded here as a second-hand measurement because it is one.
+
+Raise the config field if your cycles are larger; each extra candidate is one
+local embedding call. Lowering it does not buy a cheaper gate, it buys a gate
+that refuses to answer.
+
+### `DEFAULT_VOLATILE_TTL_DAYS = 14`, `DEFAULT_MEASURED_TTL_DAYS = 45`
+
+TTL by how fast a claim's subject moves, replacing a flat 90 days for `current`
+and no expiry at all for `durable`.
+
+**Judgement, anchored on one measured incident.** On 2026-08-28 a serving belief
+still named which ClickHouse host was live "as of 2026-07-24" — 35 days after the
+state it describes — under a `valid_until` running to 2026-11-02, with a second
+belief repeating it. 14 days is
+chosen to be shorter than that observed staleness by a factor of about 2.5, so a
+fact of that kind expires while it is still true rather than long after; 45 days
+is half the previous flat figure, on the reasoning that a measurement is re-run on
+roughly a monthly cadence.
+
+An honest note on what could not be measured: the obvious provenance would be the
+observed interval between a volatile belief being compiled and being corrected.
+On this corpus that is **1.87 days median across 364 corrected volatile beliefs**
+— and 0.94 days for doctrine and 0.99 for measurements, which is the hourly
+curator rewriting its own output rather than the world changing. The measurement
+does not discriminate between the classes, so it is not used as the source.
+
+The mechanical detectors (`VOLATILITY_PATTERNS`) are tuned for precision, not
+recall: a false positive puts a two-week clock on a durable truth and stops it
+serving, a false negative leaves today's behaviour. Measured on the 347 serving
+beliefs, 2026-08-28: they fire on **33 (9.5%)**, of which 11 are `durable`-marked
+beliefs carrying a dated, versioned, host-named, credential-named or live-state
+statement.
+
+Re-dating the existing corpus is a separate decision and a separate command.
+`ocbrain wiki-volatility` prints the plan; it needs both `--apply` and `--yes` to
+write. On a copy of the live core: 174 doctrine / 140 measured / 33 volatile, 15
+beliefs gain a TTL they never had, 158 move to a shorter one, and **7 are already
+expired** under the new scheme — which is the number to read before running it,
+because those seven stop serving at the next hygiene sweep.
+
+Every corpus figure in this section was taken from a 347-serving-belief snapshot
+on 2026-08-28. Two operator compactions ran later the same day (347 → 303
+serving, 51 retired via supersession), so the date alone no longer identifies the
+snapshot; the rates are what travel, not the counts. Re-measured read-only at
+2026-08-28T19:34Z: 303 serving beliefs, 164 `durable` of which **0** carry a
+`valid_until`, and 139 `current`. The premise — durable buys no expiry at all —
+is unchanged.
+
+### Turning expiry off
+
+`--current-ttl-days 0` (or `curator.current_ttl_days = 0`) means no expiry at
+all, under **either** scheme. Re-keying TTL on volatility initially left that
+number read and then ignored, so a run started with 0 still stamped 14 days on a
+volatile claim. `--no-volatility-ttl` restores the lifecycle rule, where a
+positive `--current-ttl-days` is again the number and `durable` claims never
+expire; `tests/test_wiki_curator_operator_controls.py` holds the chain from the
+flag to the stored `valid_until`.
+
+`ocbrain wiki-volatility` reads the same `curator.current_ttl_days`, so a brain
+that has turned expiry off plans and applies zero rewrites. The compile path and
+the sweep honouring one switch differently is the shape of defect this whole
+section exists to record.
+## Section F — serving policy dials
+
+Not selftest thresholds: these are constants in the *served read path* that an
+operator can change. They are documented here because the same rule applies —
+a number nobody can trace is a number nobody should trust.
+
+### `confidence_prior_enabled` — ships `True`
+
+`retrieval.confidence_prior_enabled` (`src/ocbrain/config.py`, default mirrored
+by `CONFIDENCE_PRIOR_ENABLED` in `src/ocbrain/core_v1.py`) decides whether
+`ranking_prior` keeps its `0.85 + 0.15 * confidence` factor.
+
+**Measured**, 2026-08-28, on a `mode=ro` backup copy of the 208 MB live core
+(347 serving beliefs):
+
+- 345 of 347 serving beliefs carry a `confidence`, every one inside
+  `[0.65, 1.0]`, clustered on authored round numbers — 0.85 ×116, 0.80 ×85,
+  0.75 ×64, 0.70 ×26, 0.90 ×24, 0.99 ×11. Bands: strong 317, moderate 28,
+  unknown 2.
+- Joining `retrieval_items` to `retrieval_uses.outcome` over judged outcomes
+  (`used`, `helpful`, `irrelevant`, `harmful`): moderate-band items drew 68
+  `irrelevant` and 0 `harmful` of 1,061 (6.41%); strong-band items drew 463
+  `irrelevant` and 23 `harmful` of 1,331 (36.51%). Ratio 5.70x.
+- `outcome` is recorded per *retrieval*, not per item, so one verdict tars every
+  item in that packet and the 5.70x is not identified. Re-measured with one vote
+  per packet — 470 judged retrievals — the direction holds: packets judged
+  irrelevant/harmful held items averaging **0.8707** confidence and 89.63%
+  strong-band, against **0.7263** and 40.90% for packets judged used/helpful.
+- Replaying the 200 most recent distinct recorded queries against that copy,
+  switching the term off moved the served *set* on 30 of 200 queries (31 items
+  in, 31 out), reordered another 113, and changed the top-1 item on 13. Total
+  items served was 2,236 either way.
+
+**Judgement, deferred.** The default is `True` because that is the behaviour
+every packet ever served was built with, and because the honest reading of the
+measurement is "this field does not mean what it says", which is an argument for
+re-deriving it, not automatically for deleting its ranking weight. Whether the
+term should go, or `confidence` should be re-derived from evidence count,
+evidence recency, and verifier status, is an operator decision. Flip it with
+`OCBRAIN_RETRIEVAL_CONFIDENCE_PRIOR_ENABLED=0` or the config file, and read
+`ranking.confidence_prior_enabled` on any packet to see which way it ran.
 
 ---
 

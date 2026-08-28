@@ -28,15 +28,23 @@ def _curator_module():
 
 
 @pytest.mark.parametrize(
-    ("provider", "model", "expected_field", "unsupported_field"),
+    ("provider", "expected_field", "unsupported_field"),
     [
-        ("openai", "gpt-5-mini", "max_completion_tokens", "max_tokens"),
-        ("moonshot", "moonshot-v1-32k", "max_tokens", "max_completion_tokens"),
+        ("openai", "max_completion_tokens", "max_tokens"),
+        ("moonshot", "max_tokens", "max_completion_tokens"),
     ],
 )
 def test_openai_compatible_provider_uses_supported_token_budget_field(
-    monkeypatch, provider, model, expected_field, unsupported_field
+    monkeypatch, provider, expected_field, unsupported_field
 ):
+    """The model id comes from PROVIDER_DEFAULTS, not from a literal here.
+
+    Both parameters used to spell a retired model id. Correcting the defaults
+    left those spellings standing in this file, so the test went on exercising
+    models neither provider serves. Reading the id from the dict is what makes
+    the correction travel; `test_curator_model_profile` names the retired ids.
+    """
+    model = ocbrain.curator.PROVIDER_DEFAULTS[provider]["model"]
     captured: dict[str, bytes] = {}
 
     def fake_urlopen(request, timeout):
