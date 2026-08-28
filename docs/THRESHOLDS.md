@@ -468,8 +468,8 @@ rather than minted under its own key.
 **Measured**, and deliberately not an independent number: it is pinned equal to
 `compact.DEFAULT_COSINE_FLOOR`, which v2.2 Phase 7 calibrated by finding 38
 same-scope clusters on the live corpus and proposing 18 merges retiring 25
-beliefs. `tests/test_curator_duplicate_gate.py::test_the_gate_and_the_compactor_share_one_floor`
-holds them equal. A claim the gate admits and the compactor then proposes
+beliefs. The duplicate-gate/compactor floor equality test holds them equal. A
+claim the gate admits and the compactor then proposes
 retiring would be a gate that moved the work rather than doing it.
 
 Re-measured on a copy of the live core, 2026-08-28, with this repo's own
@@ -522,9 +522,9 @@ looks like the curator quietly doing nothing.
 it is one cycle's own output: `wiki-curator.py --max-beliefs` defaults to 24 and
 is capped at 40, and `scripts/brain-promote.sh` rebuilds the sidecar (line 214)
 only after curation has finished, so every belief a cycle writes stays uncovered
-for the rest of that cycle. 32 sits above the default and below the cap.
-`tests/test_curator_duplicate_gate.py::test_the_shipped_embed_budget_covers_a_full_max_beliefs_cycle`
-holds it above 24 and equal to the config default.
+for the rest of that cycle. 32 sits above the default and below the cap. The
+shipped embed-budget cycle test holds it above 24 and equal to the config
+default.
 
 The cliff was measured by this change's adversarial reviewer, not by its author,
 on a `.backup` copy of the live core with a live embedder (2026-08-28): with 40
@@ -587,8 +587,8 @@ all, under **either** scheme. Re-keying TTL on volatility initially left that
 number read and then ignored, so a run started with 0 still stamped 14 days on a
 volatile claim. `--no-volatility-ttl` restores the lifecycle rule, where a
 positive `--current-ttl-days` is again the number and `durable` claims never
-expire; `tests/test_wiki_curator_operator_controls.py` holds the chain from the
-flag to the stored `valid_until`.
+expire; the wiki-curator operator-control tests hold the chain from the flag to
+the stored `valid_until`.
 
 `ocbrain wiki-volatility` reads the same `curator.current_ttl_days`, so a brain
 that has turned expiry off plans and applies zero rewrites. The compile path and
@@ -632,8 +632,8 @@ every packet ever served was built with, and because the honest reading of the
 measurement is "this field does not mean what it says", which is an argument for
 re-deriving it, not automatically for deleting its ranking weight. Whether the
 term should go, or `confidence` should be re-derived from evidence count,
-evidence recency, and verifier status, is an operator decision. Flip it with
-`OCBRAIN_RETRIEVAL_CONFIDENCE_PRIOR_ENABLED=0` or the config file, and read
+evidence recency, and verifier status, is an operator decision. Disable it by
+setting the config key `retrieval.confidence_prior_enabled` to `false`, and read
 `ranking.confidence_prior_enabled` on any packet to see which way it ran.
 
 ---
