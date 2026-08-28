@@ -908,3 +908,96 @@ def test_cli_refuses_an_unreadable_baseline(core: Path, tmp_path: Path, capsys) 
     broken.write_text("{not json", encoding="utf-8")
     assert main(["--db", str(core), "selftest", "--baseline", str(broken)]) == 2
     assert "cannot read baseline" in capsys.readouterr().err
+
+
+def test_lossy_supersession_flags_a_machine_rewording_that_drops_checkable_tokens(core):
+    """The 2026-08-26 finding: curator rewordings frequently destroy specifics."""
+    conn = connect(core)
+    _belief(
+        conn,
+        belief_id="belief_lossy_old",
+        body="PR #3495 fixed the anyOf-null break; verify with `wiki-lint` and the A/A pass.",
+        days_ago=10,
+    )
+    _belief(
+        conn,
+        belief_id="belief_lossy_new",
+        body="A schema break was repaired across all client integrations.",
+        days_ago=2,
+    )
+    _correct(
+        conn,
+        target="belief_lossy_old",
+        op="supersede",
+        days_ago=2,
+        writer="operator-approved:wiki-curator-v2",
+        successor="belief_lossy_new",
+    )
+    conn.commit()
+
+    metric = _metric(_score(core), "lossy_supersession_share")
+    assert metric["value"] == 1.0
+    assert metric["status"] == "alarm"
+    assert metric["detail"]["sample_lossy_targets"] == ["belief_lossy_old"]
+    assert (
+        metric["detail"]["by_writer"]["operator-approved:wiki-curator-v2"]["lossy"] == 1
+    )
+    conn.close()
+
+
+def test_lossy_supersession_passes_a_rewording_that_keeps_every_token(core):
+    conn = connect(core)
+    _belief(
+        conn,
+        belief_id="belief_kept_old",
+        body="PR #3495 fixed the anyOf-null break; verify with `wiki-lint`.",
+        days_ago=10,
+    )
+    _belief(
+        conn,
+        belief_id="belief_kept_new",
+        body="The anyOf-null break was fixed by PR #3495 -- `wiki-lint` verifies it.",
+        days_ago=2,
+    )
+    _correct(
+        conn,
+        target="belief_kept_old",
+        op="supersede",
+        days_ago=2,
+        writer="operator-approved:wiki-curator-v2",
+        successor="belief_kept_new",
+    )
+    conn.commit()
+
+    metric = _metric(_score(core), "lossy_supersession_share")
+    assert metric["value"] == 0.0
+    assert metric["status"] == "ok"
+    conn.close()
+
+
+def test_lossy_supersession_excludes_agent_corrections(core):
+    """An agent correction is SUPPOSED to drop the tokens of the fact it refutes."""
+    conn = connect(core)
+    _belief(conn, belief_id="belief_agent_old", body="The live VM is asa1 (#100).", days_ago=10)
+    _belief(conn, belief_id="belief_agent_new", body="The live VM is asa2.", days_ago=2)
+    _correct(
+        conn,
+        target="belief_agent_old",
+        op="supersede",
+        days_ago=2,
+        writer="hermes:squirtlecoframe",
+        successor="belief_agent_new",
+    )
+    conn.commit()
+
+    metric = _metric(_score(core), "lossy_supersession_share")
+    assert metric["status"] == "not_measured"
+    # Mine plus the agent pair the shared core fixture seeds; the point is that
+    # neither reaches the machine population, so the metric stays unmeasured.
+    assert metric["detail"]["agent_supersessions"] >= 1
+    conn.close()
+
+
+def test_lossy_supersession_is_unmeasured_on_a_quiet_core(core):
+    metric = _metric(_score(core), "lossy_supersession_share")
+    assert metric["status"] == "not_measured"

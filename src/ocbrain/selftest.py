@@ -238,6 +238,19 @@ THRESHOLDS: dict[str, Threshold] = {
         "replacement buried in the correction body. Verified on the live core at "
         "2026-08-25 -- 11 agent corrections, all op=retract, zero supersedes.",
     ),
+    "lossy_supersession_share": Threshold(
+        LOWER_BETTER,
+        0.15,
+        0.40,
+        "Share of machine-authored supersessions whose successor drops a "
+        "checkable token (an issue ref, backticked literal, path, flag, "
+        "identifier, or figure) the predecessor carried. The 2026-08-26 backlog "
+        "triage found 15 of 28 curator-proposed supersessions would have "
+        "silently destroyed checkable facts; the landed population measures "
+        "46/82 (56%) with this extractor, 2026-08-26 -- an honest alarm at "
+        "ship. A refresh that legitimately updates a count moves this too, "
+        "which is why the ok band is not zero. Judgement.",
+    ),
     "pending_supersede_age_hours": Threshold(
         LOWER_BETTER,
         72.0,
@@ -1208,6 +1221,88 @@ def _correction_adoption(conn: sqlite3.Connection, cutoff: str) -> Metric:
     )
 
 
+# Something a reader could look up, run, or verify: an issue ref (#3495), a
+# backticked literal, a path, a dotted/underscored/hyphenated identifier, a
+# flag, a figure (with its % or unit prefix intact), a slash pair (A/A), or an
+# acronym. Extends the deslop checkable-content arms from a presence test into
+# a set extractor -- deslop asks "is there anything checkable", this asks
+# "which checkable things, exactly", because a rewording is judged by the
+# difference of the two sets.
+_CHECKABLE_TOKEN_RE = re.compile(
+    r"(?:#\d+|`[^`\n]+`|[~/][\w./-]+|--\w[\w-]*|\w+(?:[._-]\w+)+"
+    r"|\b\d+(?:\.\d+)?%?\b|\b[A-Z][\w]*/[A-Z][\w]*\b|\b[A-Z]{2,}\b)"
+)
+
+
+def _checkable_tokens(body: str) -> set[str]:
+    return set(_CHECKABLE_TOKEN_RE.findall(body or ""))
+
+
+def _lossy_supersessions(conn: sqlite3.Connection, cutoff: str) -> Metric:
+    """Do machine rewordings preserve the facts a reader could check?
+
+    A machine-authored supersession -- a curator refresh or a compactor merge --
+    claims to restate or consolidate, not to correct. When its successor drops a
+    PR reference, a profile list, or a named figure the predecessor carried, the
+    corpus got smoother and knows less. The 2026-08-26 triage found this was the
+    COMMON case among pending curator proposals, not the exception. Agent-issued
+    supersessions are excluded: a correction is SUPPOSED to drop the tokens of
+    the fact it refutes.
+    """
+    rows = list(
+        conn.execute(
+            "SELECT e.writer AS writer,"
+            "       json_extract(e.body_json, '$.target_id') AS old_id,"
+            "       o.body AS old_body, n.body AS new_body"
+            " FROM brain_events e"
+            " JOIN current_beliefs o ON o.belief_id = json_extract(e.body_json, '$.target_id')"
+            " JOIN current_beliefs n ON n.belief_id = json_extract(e.body_json, '$.successor_id')"
+            " WHERE e.kind='correction_recorded'"
+            "   AND json_extract(e.body_json, '$.op')='supersede'"
+            "   AND e.ts >= ?",
+            (cutoff,),
+        )
+    )
+    machine = [row for row in rows if _is_machine_writer(str(row["writer"] or ""))]
+    if not machine:
+        return _unmeasured(
+            "lossy_supersession_share",
+            "C",
+            "Machine rewordings that drop checkable tokens",
+            "no machine-authored supersessions in the window",
+            agent_supersessions=len(rows),
+        )
+    by_writer: dict[str, dict[str, int]] = {}
+    lossy_ids: list[str] = []
+    for row in machine:
+        writer = str(row["writer"] or "")
+        bucket = by_writer.setdefault(writer, {"pairs": 0, "lossy": 0})
+        bucket["pairs"] += 1
+        dropped = _checkable_tokens(str(row["old_body"])) - _checkable_tokens(
+            str(row["new_body"])
+        )
+        if dropped:
+            bucket["lossy"] += 1
+            if len(lossy_ids) < 5:
+                lossy_ids.append(str(row["old_id"]))
+    lossy = sum(bucket["lossy"] for bucket in by_writer.values())
+    share = lossy / len(machine)
+    return _measured(
+        "lossy_supersession_share",
+        "C",
+        "Machine rewordings that drop checkable tokens",
+        share,
+        display=f"{share:.1%} ({lossy}/{len(machine)})",
+        basis=(
+            "machine-authored supersessions whose successor body lost at least "
+            "one checkable token / all machine-authored supersessions"
+        ),
+        by_writer=by_writer,
+        sample_lossy_targets=lossy_ids,
+        agent_supersessions=len(rows) - len(machine),
+    )
+
+
 def _pending_queue(conn: sqlite3.Connection, now: datetime) -> list[Metric]:
     """Distinct beliefs awaiting a supersede decision, and the age of the oldest.
 
@@ -2131,6 +2226,7 @@ def run_selftest(
     metrics.append(_calibration(conn, now))
     metrics.extend(_duplicates(conn))
     metrics.append(_correction_adoption(conn, cutoff))
+    metrics.append(_lossy_supersessions(conn, cutoff))
     metrics.extend(_pending_queue(conn, now))
     metrics.append(_contradiction_rate(conn, cutoff))
     metrics.append(_provenance(conn, cutoff))

@@ -209,6 +209,22 @@ signal this metric exists to carry.
 Measured 0.0% (0/10) over the trailing 30 days on 2026-08-25. A true alarm: the
 structured pathway exists and agents are not yet using it.
 
+### `lossy_supersession_share` — ok ≤ 0.15, watch ≤ 0.40 (lower is better)
+
+Share of machine-authored supersessions (curator refreshes, compactor merges)
+whose successor drops a checkable token — an issue ref, backticked literal,
+path, flag, identifier, or figure — that the predecessor carried. A machine
+rewording claims to restate, not to correct; when it loses the tokens a reader
+could look up, the corpus got smoother and knows less. Agent supersessions are
+excluded: a correction is supposed to drop the tokens of the fact it refutes.
+
+The 2026-08-26 backlog triage found 15 of 28 curator-proposed supersessions
+would have silently destroyed checkable facts, and the landed population
+measures 46/82 (56%) with this extractor (2026-08-26) — the common case, not
+the exception, and an honest alarm at ship. A refresh that legitimately updates
+a count (473 sessions → 500 sessions) moves this metric too, which is why the
+ok band is not zero. Both bands are judgement.
+
 ### `pending_supersede_depth` — informational, never gated
 
 Undecided compilation proposals carrying `attributes.supersedes`. An undecided
@@ -379,6 +395,38 @@ exhaustive per-row index cross-check, which is what makes the full check take
 tens of seconds on a 180 MB core. Everything this command exists to catch — a
 torn page, a corrupt b-tree, a broken foreign key — it still catches, and a
 check too slow to run hourly does not get run.
+
+---
+
+## Section E — harness surface
+
+### `briefing_determinism` — ok ≥ 1.0 (binary)
+
+`brain.briefing` promises byte-identical output for the same scope and corpus
+state, and a harness that reorients through it every iteration inherits that
+promise. Anything below 1.0 means the promise is already broken, so there is no
+watch band to sit in.
+
+### `briefing_budget_compliance` — ok ≥ 1.0 (binary)
+
+Also binary. The budget is a hard ceiling the renderer enforces before it
+spends anything on items; a briefing over budget means the skeleton reservation
+is wrong, not that a scope got busy.
+
+### `goal_pointer_resolution` — ok ≥ 1.0, watch ≥ 0.80 (higher is better)
+
+Share of open goals whose `source_pointer` still resolves on this machine. A
+goal is a pointer to a spec in the repo; when the spec moves and the goal does
+not, the goal is pointing at nothing. Watch rather than alarm at 80% because a
+pointer written on another machine can legitimately not resolve on this one.
+Judgement.
+
+### `goal_open_age_days` — ok ≤ 14, watch ≤ 45 (lower is better)
+
+Age of the oldest open goal. Goal drift is a distinct failure that pass/fail
+benchmarks cannot see, and an objective nobody has closed or abandoned in six
+weeks is the observable form of it. Judgement: no measurement exists yet
+because goals ship with this release.
 
 ---
 
