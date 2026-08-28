@@ -81,7 +81,7 @@
   *partitions* instead of filtering and the audit records what was refused, with
   `declared_egress_policies` beside `present_egress_policies` so a later reader
   can tell a gate that had nothing to reject from a gate that could not reject
-  anything. On a copy of the live core the `coframe` project's next audit carries
+  anything. On a copy of the live core the `example` project's next audit carries
   **3 refusals** where every previous audit carried 0 — three `confidential` +
   `prohibited` rows that the code floor had always been dropping invisibly — and
   the other two projects record 0 refusals beside `allowlist_vacuous: true`. The
