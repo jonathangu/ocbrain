@@ -418,6 +418,38 @@ def test_selection_policy_floor_cannot_be_configured_away() -> None:
         resolve_selection_policy(visibilities=["secret"])
 
 
+def test_selection_policy_materializes_one_shot_iterables_once() -> None:
+    """Policy resolution must not consume an advertised Iterable twice."""
+    from ocbrain.curator import resolve_selection_policy
+
+    class OneShotIterable:
+        def __init__(self, values: tuple[str, ...]) -> None:
+            self.values = values
+            self.iterations = 0
+
+        def __iter__(self):
+            if self.iterations:
+                raise AssertionError("selection-policy iterable was consumed twice")
+            self.iterations += 1
+            return iter(self.values)
+
+    egress = OneShotIterable(("hosted_ok",))
+    visibility = OneShotIterable(("internal", "confidential"))
+    assert resolve_selection_policy(
+        egress_policies=egress,
+        visibilities=visibility,
+        allow_hosted_egress=True,
+    ) == (("approval_required", "hosted_ok"), ("confidential", "internal"))
+    assert egress.iterations == visibility.iterations == 1
+
+    one_shot_local = (policy for policy in ("hosted_ok", "local_only"))
+    with pytest.raises(ValueError, match="local_only.*hosted curator"):
+        resolve_selection_policy(
+            egress_policies=one_shot_local,
+            allow_hosted_egress=True,
+        )
+
+
 def test_local_only_policy_is_rejected_before_evidence_selection(tmp_path: Path) -> None:
     """Local-only evidence must be reclassified before any hosted selection."""
     conn = connect(tmp_path / "core.sqlite")

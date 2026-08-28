@@ -267,25 +267,29 @@ def resolve_selection_policy(
     allow_hosted_egress: bool = False,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Resolve the effective egress/visibility allow-lists, enforcing the floor."""
-    if egress_policies is None:
-        egress_policies = (
-            ("hosted_ok", "approval_required") if allow_hosted_egress else ("hosted_ok",)
-        )
-    elif allow_hosted_egress and "approval_required" not in egress_policies:
-        egress_policies = (*egress_policies, "approval_required")
-    requested_egress = {str(policy) for policy in egress_policies}
-    if "local_only" in requested_egress:
+    requested_egress = (
+        tuple(str(policy) for policy in egress_policies)
+        if egress_policies is not None
+        else ("hosted_ok",)
+    )
+    if allow_hosted_egress and "approval_required" not in requested_egress:
+        requested_egress = (*requested_egress, "approval_required")
+    requested_egress_set = set(requested_egress)
+    if "local_only" in requested_egress_set:
         raise ValueError(
             "local_only evidence is not eligible for the hosted curator; "
             "reclassify it before curation"
         )
-    if visibilities is None:
-        visibilities = ("internal",)
+    requested_visibility = (
+        tuple(str(visibility) for visibility in visibilities)
+        if visibilities is not None
+        else ("internal",)
+    )
     resolved_egress = tuple(
-        sorted(requested_egress - FORBIDDEN_EGRESS_POLICIES)
+        sorted(requested_egress_set - FORBIDDEN_EGRESS_POLICIES)
     )
     resolved_visibility = tuple(
-        sorted({str(v) for v in visibilities} - FORBIDDEN_VISIBILITIES)
+        sorted(set(requested_visibility) - FORBIDDEN_VISIBILITIES)
     )
     if not resolved_egress or not resolved_visibility:
         raise ValueError(

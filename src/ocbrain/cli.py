@@ -45,7 +45,7 @@ from ocbrain.core_v1 import (
     record_core_v1_evidence,
 )
 from ocbrain.curation import apply_curated_manifest
-from ocbrain.curator import PROVIDER_DEFAULTS, resolve_selection_policy
+from ocbrain.curator import PROVIDER_DEFAULTS
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -3006,10 +3006,8 @@ def cmd_compact(args: argparse.Namespace) -> int:
             output(args, {"action": "compact", "undone": result})
             return 0
         curator_cfg = load_config().curator
-        egress_policies, visibilities = resolve_selection_policy(
-            egress_policies=tuple(curator_cfg.egress_policies),
-            visibilities=tuple(curator_cfg.visibilities),
-        )
+        egress_policies = tuple(curator_cfg.egress_policies)
+        visibilities = tuple(curator_cfg.visibilities)
         plan = plan_compaction(
             conn,
             cosine_floor=args.cosine,
