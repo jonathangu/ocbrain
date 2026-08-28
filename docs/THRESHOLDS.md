@@ -760,11 +760,11 @@ have ever seen, that reconciliation moves 8 rows (the spelling `cli`, from
 `unknown` to `host-batch`) and regresses none.
 ## Section H — dual-path containment constants
 
-These are not selftest metrics. They are the hand-typed numbers in
-`tests/test_legacy_retriever_unreachable_v1.py`, which pins the boundary between
-the two rankers this repo still carries: the live v1 path in `core_v1.py` (FTS5
-bm25 with tuned column weights, a 1024-dim dense sidecar, weighted RRF at k=60,
-and a multiplicative scope/confidence/quality/recency/feedback prior) and the
+These are not selftest metrics. They are the hand-typed numbers in the
+legacy-retriever gate test, which pins the boundary between the two rankers this
+repo still carries: the live v1 path in `core_v1.py` (FTS5 bm25 with tuned
+column weights, a 1024-dim dense sidecar, weighted RRF at k=60, and a
+multiplicative scope, confidence, quality, recency and feedback prior) and the
 retired legacy blend in `retrieve.py` (a flat `relevance * scope_weight *
 confidence * pinned * catalog_stub` product with a repo-FTS fallback).
 
@@ -772,7 +772,7 @@ confidence * pinned * catalog_stub` product with a repo-FTS fallback).
 
 Measured 2026-08-28 by tracing `sys.settrace` over `src/ocbrain/retrieve.py`
 while dispatching the complete advertised admin tool surface against
-`~/.ocbrain/backups/pre-compaction-20260828-claude.sqlite` — a frozen 208,285,696-byte
+`pre-compaction-20260828-claude.sqlite` — a frozen 208,285,696-byte
 copy of the live core holding 1,247 current-belief rows and 6,492 evidence
 objects, `schema_meta.core_schema = ocbrain.core.v1`. Those two counts describe
 **that file**, not the live corpus: the live core is compacted and re-minted
@@ -818,9 +818,9 @@ count is the backstop, and it is an AST binding resolver rather than a line
 scan: it resolves function-local, relative, aliased, parenthesized and
 attribute-qualified imports, and it counts every *reference* to the bound name,
 not only a direct `retrieve(` call. The first version of this gate matched
-import lines by prefix and found **0 of 9** planted evasive call sites;
-`test_the_call_site_scanner_resolves_every_evasive_binding_form` is what holds
-the replacement to all nine. Adding a call site fails this test on purpose: the
+import lines by prefix and found **0 of 9** planted evasive call sites; the
+evasive-binding self-test is what holds the replacement to all nine. Adding a
+call site fails this test on purpose: the
 new guard has to be proved by hand before the table is updated.
 
 ### Dispatch counts — 23 MCP tool calls, 8 CLI commands
@@ -846,8 +846,7 @@ The tracer keys on a filename. Under a bare interpreter `ocbrain` resolves
 through the editable install rather than the checkout under test, no frame ever
 matches, and every count in this section reads a clean zero for the wrong
 reason. `_RETRIEVE_SOURCE` is therefore derived from the imported module and
-pinned to this worktree's path by
-`test_the_tracer_is_keyed_to_the_module_under_test`.
+pinned to this worktree's path by the tracer-keying self-test.
 
 ---
 
@@ -864,8 +863,8 @@ entry has a non-trivial source string, and
 without one.
 
 Section H's constants are not in `selftest.THRESHOLDS`; they are module-level
-names in `tests/test_legacy_retriever_unreachable_v1.py`, so neither test above
-governs them. The same rule applies by hand: change the constant and its
+names in the legacy-retriever gate test, so neither test above governs them. The
+same rule applies by hand: change the constant and its
 Section H paragraph in the same commit, and re-run the mutation proof the
 paragraph names. A constant that only a test file holds is the easiest kind to
 edit until green, which is why its provenance is written down here rather than

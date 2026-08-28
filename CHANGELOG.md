@@ -438,7 +438,7 @@ number here without that instant attached would not reproduce by evening.
 - Pin the boundary between the two rankers this repo still carries. `core_v1.py`
   serves the live path — FTS5 bm25 with tuned column weights, a 1024-dim dense
   sidecar, weighted RRF at k=60, and a multiplicative
-  scope/confidence/quality/recency/feedback prior. `retrieve.py` independently
+  scope, confidence, quality, recency and feedback prior. `retrieve.py` independently
   implements a retired blend: a flat `relevance * scope_weight * confidence *
   pinned * catalog_stub` product with a repo-FTS fallback. `mcp.py`, `cli.py`
   and `shared_context.py` all still import it, each behind an `is_core_v1` early
@@ -470,8 +470,8 @@ number here without that instant attached would not reproduce by evening.
   elsewhere. Against nine planted call sites written in nine legal binding
   forms, it found **0 of 9**. It is now an AST binding resolver with no
   import-form filter, counting every *reference* to the bound name rather than
-  only a direct `retrieve(` — and `test_the_call_site_scanner_resolves_every_evasive_binding_form`
-  plants all nine and requires all nine. Mutating the resolver back three ways
+  only a direct `retrieve(` — and the scanner's evasive-binding self-test plants
+  all nine and requires all nine. Mutating the resolver back three ways
   (top-level-only import scan, dropped attribute branch, calls-only counting)
   fails that test each time.
   **The dynamic gate had zero coverage of `cli.py`.** The driver dispatched
