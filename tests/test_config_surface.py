@@ -169,3 +169,78 @@ def test_retired_sections_and_keys_are_ignored_not_fatal(tmp_path: Path) -> None
     assert not hasattr(cfg, "review")
     assert not hasattr(cfg.curator, "judge_enabled")
     assert cfg.curator.provider == "anthropic"
+
+
+# --------------------------------------------------------------------------- #
+# Malformed files fail loudly, once, by name
+# --------------------------------------------------------------------------- #
+
+
+def _write_raw(tmp_path: Path, text: str, name: str = "broken.json") -> Path:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_a_malformed_config_names_the_file_and_is_not_a_valueerror(tmp_path: Path):
+    """The trap this guards: json.JSONDecodeError IS a ValueError.
+
+    The curator's per-claim loop catches ValueError to mean "previously
+    tombstoned target". A malformed config riding that channel reported every
+    claim in a run as blocked. ConfigError must therefore never be catchable
+    as ValueError.
+    """
+    path = _write_raw(tmp_path, '{"curator": {')
+    with pytest.raises(config_module.ConfigError) as err:
+        load_config(path)
+    assert str(path) in str(err.value)
+    assert "line" in str(err.value)
+    assert not isinstance(err.value, ValueError)
+
+
+def test_describe_config_reports_a_malformed_file_the_same_way(tmp_path: Path):
+    path = _write_raw(tmp_path, "not json at all")
+    with pytest.raises(config_module.ConfigError):
+        describe_config(path)
+
+
+def test_cli_config_reports_a_malformed_file_instead_of_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = _write_raw(tmp_path, '{"scopes": [}')
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(path))
+    with pytest.raises(SystemExit) as err:
+        cli_main(["config"])
+    assert str(path) in str(err.value)
+
+
+def test_a_non_dict_top_level_is_still_tolerated_as_empty(tmp_path: Path):
+    # Valid JSON that is not an object was always silently ignored; that is a
+    # shape mistake, not a syntax error, and the old tolerance stands.
+    path = _write_raw(tmp_path, '["not", "an", "object"]')
+    cfg = load_config(path)
+    assert cfg.curator.provider == load_config(tmp_path / "absent.json").curator.provider
+
+
+# --------------------------------------------------------------------------- #
+# One parse per config state
+# --------------------------------------------------------------------------- #
+
+
+def test_config_is_cached_until_the_file_changes(tmp_path: Path):
+    path = _write_cfg(tmp_path, {"supersede": {"direct_cap": 3}})
+    first = load_config(path)
+    assert first.supersede.direct_cap == 3
+    assert load_config(path) is first  # same state -> same object, no re-parse
+
+    path.write_text(json.dumps({"supersede": {"direct_cap": 5}}), encoding="utf-8")
+    assert load_config(path).supersede.direct_cap == 5
+
+
+def test_config_cache_respects_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = _write_cfg(tmp_path, {"supersede": {"direct_cap": 3}})
+    assert load_config(path).supersede.direct_cap == 3
+    monkeypatch.setenv("OCBRAIN_SUPERSEDE_DIRECT_CAP", "7")
+    assert load_config(path).supersede.direct_cap == 7
+    monkeypatch.delenv("OCBRAIN_SUPERSEDE_DIRECT_CAP")
+    assert load_config(path).supersede.direct_cap == 3

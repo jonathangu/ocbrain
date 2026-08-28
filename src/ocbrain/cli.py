@@ -27,7 +27,7 @@ from ocbrain.compact import (
     undo_command,
     undo_merge,
 )
-from ocbrain.config import describe_config, load_config
+from ocbrain.config import ConfigError, describe_config, load_config
 from ocbrain.core_ops import (
     backup_database,
     database_status,
@@ -914,7 +914,12 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    report = describe_config()
+    # The one command an operator runs to debug their config must report a
+    # malformed file, not crash on it.
+    try:
+        report = describe_config()
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.section:
         if args.section not in report["sections"]:
             available = ", ".join(sorted(report["sections"]))
