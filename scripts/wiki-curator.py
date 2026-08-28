@@ -172,11 +172,11 @@ def main() -> int:
     parser.add_argument(
         "--egress-policy",
         action="append",
-        choices=["hosted_ok", "approval_required", "local_only"],
+        choices=["hosted_ok", "approval_required"],
         help=(
             "evidence egress policy the curator may read; repeatable. Overrides "
-            "curator.egress_policies from config. `prohibited` egress and `secret` "
-            "visibility are never eligible and cannot be enabled"
+            "curator.egress_policies from config. `local_only` and `prohibited` "
+            "egress and `secret` visibility are never eligible and cannot be enabled"
         ),
     )
     parser.add_argument(
@@ -209,7 +209,8 @@ def main() -> int:
             raise ValueError("database is not an OCBrain v1 core")
         # The operator's standing declaration of what their curator may read,
         # from config (OCBRAIN_CURATOR_EGRESS_POLICIES / the config file), with a
-        # CLI override. `prohibited` and `secret` are refused in code either way.
+        # CLI override. `local_only`, `prohibited`, and `secret` are refused in
+        # code either way.
         curator_cfg = load_config().curator
         egress_policies = args.egress_policy or curator_cfg.egress_policies
         resolved_egress, resolved_visibility = resolve_selection_policy(

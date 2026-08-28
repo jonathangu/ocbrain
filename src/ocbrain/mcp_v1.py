@@ -1299,13 +1299,25 @@ def feedback_v1(
     allowed = {"helpful", "used", "irrelevant", "ignored", "harmful"}
     if outcome not in allowed:
         raise ValueError(f"outcome must be one of: {', '.join(sorted(allowed))}")
+    eligibility = conn.execute(
+        "SELECT EXISTS(SELECT 1 FROM retrieval_uses WHERE id=?), "
+        "EXISTS(SELECT 1 FROM retrieval_items WHERE retrieval_use_id=?)",
+        (retrieval_use_id, retrieval_use_id),
+    ).fetchone()
+    if not eligibility[0]:
+        raise ValueError(f"retrieval use not found: {retrieval_use_id}")
+    if not eligibility[1]:
+        raise ValueError(
+            "empty_retrieval_not_feedback_eligible: retrieval use has no items: "
+            f"{retrieval_use_id}"
+        )
     updated = conn.execute(
         "UPDATE retrieval_uses SET outcome=?, note=COALESCE(?, note), "
         "feedback_source='runtime_explicit', feedback_at=? WHERE id=?",
         (outcome, note, now_iso(), retrieval_use_id),
     )
-    if updated.rowcount == 0:
-        raise ValueError(f"retrieval use not found: {retrieval_use_id}")
+    if updated.rowcount == 0:  # pragma: no cover - existence was checked above.
+        raise RuntimeError(f"retrieval feedback update failed: {retrieval_use_id}")
     return {"retrieval_use_id": retrieval_use_id, "outcome": outcome}
 
 

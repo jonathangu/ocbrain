@@ -458,6 +458,57 @@ def test_v1_context_reports_feedback_needed(tmp_path):
     assert empty["coverage"]["feedback_needed"] is False
 
 
+def test_v1_feedback_rejects_empty_retrieval_without_mutating_telemetry(tmp_path):
+    conn = _seed_v1(tmp_path)
+    empty = _payload(
+        handle_request(
+            conn,
+            _tool_call(
+                "brain.context",
+                {"query": "quartz zeppelin nonsense", "context": {"project": "ocbrain"}},
+            ),
+        )
+    )
+    retrieval_use_id = empty["retrieval_use_id"]
+    assert empty["coverage"]["returned"] == 0
+    before = tuple(
+        conn.execute(
+            "SELECT outcome, note, feedback_source, feedback_at "
+            "FROM retrieval_uses WHERE id=?",
+            (retrieval_use_id,),
+        ).fetchone()
+    )
+
+    refused = handle_request(
+        conn,
+        _tool_call(
+            "brain.feedback",
+            {"retrieval_use_id": retrieval_use_id, "outcome": "irrelevant"},
+            request_id=2,
+        ),
+    )
+
+    assert refused["error"]["code"] == -32602
+    assert refused["error"]["message"].startswith(
+        "empty_retrieval_not_feedback_eligible:"
+    )
+    after = tuple(
+        conn.execute(
+            "SELECT outcome, note, feedback_source, feedback_at "
+            "FROM retrieval_uses WHERE id=?",
+            (retrieval_use_id,),
+        ).fetchone()
+    )
+    assert after == before
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM retrieval_items WHERE retrieval_use_id=?",
+            (retrieval_use_id,),
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_v1_closeout_requires_summary(tmp_path):
     conn = _seed_v1(tmp_path)
     response = handle_request(

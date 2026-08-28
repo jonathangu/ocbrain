@@ -119,9 +119,8 @@ class CuratorConfig:
     #
     # `egress_policies` is the operator's standing declaration of intent. It
     # ships as `hosted_ok` only, so a fresh install sends nothing it was not
-    # explicitly given. An operator running a brain whose evidence is all
-    # `local_only` -- the default for anything written through a client -- can add
-    # that policy here to let their own curator read their own notes.
+    # explicitly given. `local_only` is rejected: using that material with this
+    # hosted curator requires an explicit reclassification before selection.
     #
     # Two things are NOT configurable and are enforced in code regardless:
     # `prohibited` egress and `secret` visibility are never eligible. Those are

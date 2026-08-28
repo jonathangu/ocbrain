@@ -254,8 +254,8 @@ def load_env_value(path: Path | None, name: str) -> str | None:
 
 
 # Never eligible for curation, whatever the operator configures. `prohibited` and
-# `secret` are the floor: an operator can widen what their own curator may read,
-# but not past the two markers that mean "this must not leave".
+# `secret` are the floor. `local_only` is rejected explicitly below so a label
+# that means "this must not leave" can never become hosted consent by allow-list.
 FORBIDDEN_EGRESS_POLICIES = frozenset({"prohibited"})
 FORBIDDEN_VISIBILITIES = frozenset({"secret"})
 
@@ -273,10 +273,16 @@ def resolve_selection_policy(
         )
     elif allow_hosted_egress and "approval_required" not in egress_policies:
         egress_policies = (*egress_policies, "approval_required")
+    requested_egress = {str(policy) for policy in egress_policies}
+    if "local_only" in requested_egress:
+        raise ValueError(
+            "local_only evidence is not eligible for the hosted curator; "
+            "reclassify it before curation"
+        )
     if visibilities is None:
         visibilities = ("internal",)
     resolved_egress = tuple(
-        sorted({str(p) for p in egress_policies} - FORBIDDEN_EGRESS_POLICIES)
+        sorted(requested_egress - FORBIDDEN_EGRESS_POLICIES)
     )
     resolved_visibility = tuple(
         sorted({str(v) for v in visibilities} - FORBIDDEN_VISIBILITIES)
@@ -302,11 +308,11 @@ def select_evidence(
 
     The egress gate is what decides this. By default only ``public``/
     ``internal`` visibility and ``hosted_ok`` policy qualify, so a fresh install
-    sends nothing it was not explicitly given. An operator may widen the
-    allow-lists via ``curator.egress_policies`` -- necessary on any brain whose
-    evidence is written as ``local_only``, which is the default for client
-    writes -- but ``prohibited`` egress and ``secret`` visibility are refused in
-    code regardless. Raw transcripts stay ineligible by kind either way.
+    sends nothing it was not explicitly given. ``approval_required`` may be
+    admitted explicitly; ``local_only`` must first be reclassified and is never
+    accepted as a hosted allow-list override. ``prohibited`` egress and
+    ``secret`` visibility are refused in code regardless. Raw transcripts stay
+    ineligible by kind either way.
 
     The project gate matches by canonical spelling, not by exact string. Clients
     name their own scope, so one project arrives written a dozen ways and the

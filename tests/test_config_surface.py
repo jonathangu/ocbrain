@@ -51,7 +51,7 @@ def test_describe_config_attributes_every_value_to_its_layer(tmp_path: Path, mon
     """A layered config is only usable if you can see which layer won."""
     config_path = tmp_path / "ocbrain.config.json"
     config_path.write_text(
-        json.dumps({"curator": {"egress_policies": ["hosted_ok", "local_only"]}}),
+        json.dumps({"curator": {"egress_policies": ["hosted_ok", "approval_required"]}}),
         encoding="utf-8",
     )
     monkeypatch.setenv("OCBRAIN_CONFIG", str(config_path))
@@ -63,7 +63,7 @@ def test_describe_config_attributes_every_value_to_its_layer(tmp_path: Path, mon
     assert report["config_path_exists"] is True
 
     assert curator["egress_policies"]["source"] == "file"
-    assert curator["egress_policies"]["value"] == ["hosted_ok", "local_only"]
+    assert curator["egress_policies"]["value"] == ["hosted_ok", "approval_required"]
     assert curator["egress_policies"]["default"] == ["hosted_ok"]
 
     assert curator["max_beliefs"]["source"] == "env"

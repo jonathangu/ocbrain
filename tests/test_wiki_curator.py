@@ -395,17 +395,19 @@ def test_hosted_prompt_excludes_local_and_confidential_objects(
 
 
 def test_selection_policy_floor_cannot_be_configured_away() -> None:
-    """An operator may widen what their curator reads, but not past the floor."""
+    """Hosted curation never treats a local-only label as operator consent."""
     from ocbrain.curator import resolve_selection_policy
 
     egress, visibility = resolve_selection_policy(
-        egress_policies=["hosted_ok", "local_only", "prohibited"],
+        egress_policies=["hosted_ok", "prohibited"],
         visibilities=["internal", "confidential", "secret"],
     )
     assert "prohibited" not in egress
-    assert "local_only" in egress
     assert "secret" not in visibility
     assert "confidential" in visibility
+
+    with pytest.raises(ValueError, match="local_only.*hosted curator"):
+        resolve_selection_policy(egress_policies=["hosted_ok", "local_only"])
 
     # Shipped default stays narrow.
     assert resolve_selection_policy() == (("hosted_ok",), ("internal",))
@@ -416,8 +418,8 @@ def test_selection_policy_floor_cannot_be_configured_away() -> None:
         resolve_selection_policy(visibilities=["secret"])
 
 
-def test_widened_policy_admits_local_only_but_never_prohibited(tmp_path: Path) -> None:
-    """The case that matters: a brain whose evidence is all local_only."""
+def test_local_only_policy_is_rejected_before_evidence_selection(tmp_path: Path) -> None:
+    """Local-only evidence must be reclassified before any hosted selection."""
     conn = connect(tmp_path / "core.sqlite")
     init_core_v1(conn)
     cases = (
@@ -443,23 +445,19 @@ def test_widened_policy_admits_local_only_but_never_prohibited(tmp_path: Path) -
     }
     assert default_bodies == {"HOSTED OK INTERNAL BODY"}
 
-    widened_bodies = {
-        row["body"]
-        for row in select_evidence(
+    with pytest.raises(ValueError, match="local_only.*hosted curator"):
+        select_evidence(
             conn,
             limit=20,
             project="test",
             egress_policies=["hosted_ok", "local_only"],
             visibilities=["internal", "confidential"],
         )
-    }
-    assert widened_bodies == {"HOSTED OK INTERNAL BODY", "LOCAL ONLY INTERNAL BODY"}
-    assert "PROHIBITED CONFIDENTIAL BODY" not in widened_bodies
-    assert "SECRET LOCAL BODY" not in widened_bodies
+    assert conn.execute("SELECT COUNT(*) FROM egress_audits").fetchone()[0] == 0
 
 
 def test_curation_egress_is_audited_before_the_send(tmp_path: Path) -> None:
-    """Widening the allow-list is only defensible if every send is accountable."""
+    """Hosted-cleared evidence remains auditable before every send."""
     from ocbrain.curator import record_curation_egress
 
     conn = connect(tmp_path / "core.sqlite")
@@ -469,13 +467,13 @@ def test_curation_egress_is_audited_before_the_send(tmp_path: Path) -> None:
         body="AUDITED EVIDENCE BODY",
         kind="audit_finding",
         scope=ScopeTag(
-            "project", "project:test", visibility="internal", egress_policy="local_only"
+            "project", "project:test", visibility="internal", egress_policy="hosted_ok"
         ),
         writer="test",
     )
     conn.commit()
     rows = select_evidence(
-        conn, limit=20, project="test", egress_policies=["local_only"]
+        conn, limit=20, project="test", egress_policies=["hosted_ok"]
     )
     assert len(rows) == 1
 
@@ -485,7 +483,7 @@ def test_curation_egress_is_audited_before_the_send(tmp_path: Path) -> None:
         provider="anthropic",
         model="claude-sonnet-5",
         project="test",
-        egress_policies=("local_only",),
+        egress_policies=("hosted_ok",),
     )
     audit = conn.execute(
         "SELECT target, context_json, included_json, payload_hash FROM egress_audits WHERE id=?",
@@ -494,7 +492,7 @@ def test_curation_egress_is_audited_before_the_send(tmp_path: Path) -> None:
     assert audit["target"] == "anthropic:claude-sonnet-5"
     assert evidence_id in audit["included_json"]
     assert "wiki_curation" in audit["context_json"]
-    assert "local_only" in audit["context_json"]
+    assert "hosted_ok" in audit["context_json"]
     # The body itself is not copied into the audit, only its identity and size.
     assert "AUDITED EVIDENCE BODY" not in audit["included_json"]
     assert audit["payload_hash"]
@@ -902,12 +900,36 @@ def test_history_file_kinds_are_never_eligible(tmp_path: Path) -> None:
             conn,
             limit=50,
             project="test",
-            egress_policies=["hosted_ok", "approval_required", "local_only"],
+            egress_policies=["hosted_ok", "approval_required"],
             visibilities=["internal", "confidential"],
         )
         == []
     )
     conn.close()
+
+
+def test_cli_rejects_local_only_egress_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    curator = _curator_module()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "wiki-curator.py",
+            "--db",
+            str(tmp_path / "core.sqlite"),
+            "--project",
+            "test",
+            "--egress-policy",
+            "local_only",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        curator.main()
+    assert exc_info.value.code == 2
+    assert "invalid choice: 'local_only'" in capsys.readouterr().err
 
 
 def test_multi_project_state_digest_is_per_project(
