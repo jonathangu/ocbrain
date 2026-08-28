@@ -12,6 +12,11 @@ import json
 import plistlib
 from pathlib import Path
 
+import pytest
+
+import ocbrain.cli as cli_module
+import ocbrain.opscheck as opscheck_module
+from ocbrain.cli import main
 from ocbrain.opscheck import OPS_MANIFEST_SCHEMA, ops_check, write_ops_manifest
 
 
@@ -78,9 +83,14 @@ def test_write_manifest_discovers_only_ocbrain_jobs_and_installed_hooks(tmp_path
     manifest = _write(estate)
     assert manifest["schema_version"] == OPS_MANIFEST_SCHEMA
     assert [job["label"] for job in manifest["jobs"]] == ["test.ocbrain-promote"]
-    assert manifest["jobs"][0]["env"]["OCBRAIN_PROCMINE"] == "1"
+    assert set(manifest["jobs"][0]["env_sha256"]) == {
+        "OCBRAIN_HYGIENE_APPLY",
+        "OCBRAIN_PROCMINE",
+    }
+    assert all(len(digest) == 64 for digest in manifest["jobs"][0]["env_sha256"].values())
     assert len(manifest["hooks"]) == 1
     assert manifest["files"] and manifest["files"][0].endswith("active-core.path")
+    assert estate["manifest"].stat().st_mode & 0o777 == 0o600
 
 
 def test_a_freshly_written_manifest_verifies_clean(tmp_path: Path):
@@ -109,11 +119,44 @@ def test_an_env_key_changed_on_the_machine_is_a_finding(tmp_path: Path):
     )
 
 
+def test_env_values_never_enter_the_manifest_or_findings(tmp_path: Path):
+    estate = _estate(tmp_path)
+    expected = "-".join(("value", "that", "must", "stay", "private"))
+    actual = "-".join(("different", "private", "value"))
+    _plist(
+        estate["agents"],
+        "test.ocbrain-promote",
+        {"OCBRAIN_SETTING": expected},
+        "whatever",
+    )
+    _write(estate)
+    assert expected not in estate["manifest"].read_text(encoding="utf-8")
+
+    _plist(
+        estate["agents"],
+        "test.ocbrain-promote",
+        {"OCBRAIN_SETTING": actual},
+        "whatever",
+    )
+    serialized_result = json.dumps(_check(estate))
+    assert expected not in serialized_result
+    assert actual not in serialized_result
+    assert "differs from the manifest" in serialized_result
+
+
 def test_an_unloaded_job_is_a_finding_even_with_the_plist_present(tmp_path: Path):
     """The Aug 6-18 class: file on disk, nothing running, every DB check green."""
     estate = _estate(tmp_path)
     _write(estate)
     result = _check(estate, loaded="some.other.job")
+    assert result["healthy"] is False
+    assert any("not loaded" in f["detail"] for f in result["findings"])
+
+
+def test_loaded_job_check_matches_the_exact_label(tmp_path: Path):
+    estate = _estate(tmp_path)
+    _write(estate)
+    result = _check(estate, loaded="test.ocbrain-promote-shadow")
     assert result["healthy"] is False
     assert any("not loaded" in f["detail"] for f in result["findings"])
 
@@ -155,6 +198,15 @@ def test_a_corrupt_manifest_is_a_failure_that_names_itself(tmp_path: Path):
     assert result["findings"][0]["check"] == "manifest"
 
 
+def test_a_manifest_with_broad_permissions_is_a_finding(tmp_path: Path):
+    estate = _estate(tmp_path)
+    _write(estate)
+    estate["manifest"].chmod(0o644)
+    result = _check(estate)
+    assert result["healthy"] is False
+    assert any("expected owner-only 0600" in f["detail"] for f in result["findings"])
+
+
 def test_launchctl_unavailable_skips_loaded_checks_with_a_warning(tmp_path: Path):
     estate = _estate(tmp_path)
     _write(estate)
@@ -186,3 +238,95 @@ def test_manifest_roundtrip_is_json_stable(tmp_path: Path):
     on_disk = json.loads(estate["manifest"].read_text(encoding="utf-8"))
     assert on_disk["schema_version"] == OPS_MANIFEST_SCHEMA
     assert on_disk["jobs"][0]["label"] == "test.ocbrain-promote"
+
+
+def test_manifest_overwrite_requires_explicit_replace(tmp_path: Path):
+    estate = _estate(tmp_path)
+    _write(estate)
+    first = estate["manifest"].read_bytes()
+    with pytest.raises(FileExistsError, match="--replace-manifest"):
+        _write(estate)
+    assert estate["manifest"].read_bytes() == first
+
+    write_ops_manifest(
+        estate["manifest"],
+        launch_agents_dir=estate["agents"],
+        hooks_dirs=(estate["hooks"],),
+        repo_root=estate["repo"],
+        replace=True,
+    )
+    assert estate["manifest"].read_bytes() != first
+    assert estate["manifest"].stat().st_mode & 0o777 == 0o600
+
+
+def test_doctor_ops_is_opt_in_and_manifest_writes_are_explicit(
+    tmp_path: Path, capsys, monkeypatch
+):
+    doctor_calls: list[bool] = []
+    ops_calls: list[Path] = []
+    writes: list[tuple[Path, bool]] = []
+
+    def healthy_doctor(*_args, check_clients: bool, **_kwargs):
+        doctor_calls.append(check_clients)
+        return {"action": "doctor", "healthy": True, "status": "ok"}
+
+    def fake_ops_check(path):
+        ops_calls.append(path)
+        return {"action": "ops-check", "healthy": True, "status": "no_manifest"}
+
+    def fake_write(path, *, replace: bool):
+        writes.append((path, replace))
+        return {}
+
+    monkeypatch.setattr(cli_module, "doctor", healthy_doctor)
+    monkeypatch.setattr(opscheck_module, "ops_check", fake_ops_check)
+    monkeypatch.setattr(opscheck_module, "write_ops_manifest", fake_write)
+    db = tmp_path / "core.sqlite"
+    manifest = tmp_path / "ops.json"
+
+    assert main(["--db", str(db), "doctor"]) == 0
+    assert json.loads(capsys.readouterr().out)["healthy"] is True
+    assert doctor_calls == [False]
+    assert ops_calls == []
+    assert writes == []
+
+    assert main(["--db", str(db), "doctor", "--write-manifest"]) == 2
+    assert "require --ops" in json.loads(capsys.readouterr().out)["error"]
+    assert doctor_calls == [False]
+    assert writes == []
+
+    assert (
+        main(
+            [
+                "--db",
+                str(db),
+                "doctor",
+                "--ops",
+                "--ops-manifest",
+                str(manifest),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert doctor_calls == [False, False]
+    assert ops_calls == [manifest]
+    assert writes == []
+
+    assert (
+        main(
+            [
+                "--db",
+                str(db),
+                "doctor",
+                "--ops",
+                "--write-manifest",
+                "--replace-manifest",
+                "--ops-manifest",
+                str(manifest),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert writes == [(manifest, True)]

@@ -322,6 +322,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Manifest location (default ~/.ocbrain/ops-manifest.json)",
     )
+    doctor_parser.add_argument(
+        "--replace-manifest",
+        action="store_true",
+        help=(
+            "With --ops --write-manifest: replace an existing manifest after "
+            "reviewing the intended wiring change. Without this flag, bootstrap "
+            "refuses to erase an existing drift baseline."
+        ),
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
     runtime = commands.add_parser("runtime-check", help="Probe all three client integrations")
     runtime.add_argument("--timeout", type=float, default=12.0)
@@ -960,18 +969,56 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    ops = bool(getattr(args, "ops", False))
+    write_manifest = bool(getattr(args, "write_manifest", False))
+    replace_manifest = bool(getattr(args, "replace_manifest", False))
+    ops_manifest = getattr(args, "ops_manifest", None)
+    if not ops and (write_manifest or replace_manifest or ops_manifest is not None):
+        output(
+            args,
+            {
+                "action": "doctor",
+                "status": "failed",
+                "healthy": False,
+                "error": "--write-manifest, --replace-manifest, and --ops-manifest require --ops",
+            },
+        )
+        return 2
+    if replace_manifest and not write_manifest:
+        output(
+            args,
+            {
+                "action": "doctor",
+                "status": "failed",
+                "healthy": False,
+                "error": "--replace-manifest requires --write-manifest",
+            },
+        )
+        return 2
     result = doctor(
         args.db,
         timeout_seconds=args.timeout,
         launcher=args.launcher,
         check_clients=False,
     )
-    if getattr(args, "ops", False):
+    if ops:
         from ocbrain.opscheck import ops_check, write_ops_manifest
 
-        if getattr(args, "write_manifest", False):
-            write_ops_manifest(args.ops_manifest)
-        result["ops"] = ops_check(args.ops_manifest)
+        if write_manifest:
+            try:
+                write_ops_manifest(ops_manifest, replace=replace_manifest)
+            except OSError as exc:
+                result["ops"] = {
+                    "action": "ops-manifest-write",
+                    "status": "failed",
+                    "healthy": False,
+                    "error": str(exc),
+                }
+                result["healthy"] = False
+                result["status"] = "failed"
+                output(args, result)
+                return 2
+        result["ops"] = ops_check(ops_manifest)
         result["healthy"] = bool(result["healthy"]) and bool(result["ops"]["healthy"])
         result["status"] = "ok" if result["healthy"] else "failed"
     output(args, result)

@@ -24,9 +24,11 @@ hand-copied hooks, untracked pointer files. The database checks stayed green
 through all of them, because the database was fine; the *wiring* was not.
 
 `~/.ocbrain/ops-manifest.json` records what this machine is supposed to have:
-which launchd jobs, with which environment, which hooks copied from which repo
-examples, which control files present. It is machine-local and untracked, like
-everything else under `~/.ocbrain/`.
+which launchd jobs, salted hashes of their environment values, which hooks
+copied from which repo examples, and which control files are present. Raw
+environment values never enter the manifest or doctor output. The file is
+machine-local, atomically written with owner-only permissions, and untracked,
+like everything else under `~/.ocbrain/`.
 
 ```bash
 # Deployment day (or after any deliberate wiring change): snapshot intent.
@@ -34,10 +36,15 @@ ocbrain doctor --ops --write-manifest
 
 # Any other day: report every drift.
 ocbrain doctor --ops
+
+# After a deliberate wiring change: explicitly replace the reviewed baseline.
+ocbrain doctor --ops --write-manifest --replace-manifest
 ```
 
 Drift is bidirectional: a job that lost an env key is a finding, and so is an
 env key added on the machine that the manifest never heard of — an
 unmanifested flag is a decision nobody recorded. An absent manifest is a
 warning with instructions, never a failure; a fresh install has nothing to
-assert yet.
+assert yet. `--write-manifest` refuses to overwrite an existing baseline unless
+`--replace-manifest` is also present, so an accidental re-bootstrap cannot make
+real drift disappear.

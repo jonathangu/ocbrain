@@ -14,8 +14,10 @@ which no test suite sees and no doctor checked.
 The fix is not more checks hardcoded to one machine's job names. It is a
 **manifest**: a machine-local JSON file (`~/.ocbrain/ops-manifest.json`,
 untracked, like everything else under `~/.ocbrain/`) that records what this
-machine is *supposed* to have -- which launchd jobs, with which environment,
-which hooks copied from which repo examples, which control files present.
+machine is *supposed* to have -- which launchd jobs, with salted hashes of
+their environment values, which hooks copied from which repo examples, which
+control files present. Raw environment values never enter the manifest or
+findings.
 ``ocbrain doctor --ops --write-manifest`` bootstraps it from the current state
 (deployment day is the one day the current state is the intended state), and
 ``ocbrain doctor --ops`` thereafter reports every drift: a job unloaded, an
@@ -25,9 +27,13 @@ gone. Intent lives on the machine; the checker lives here.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import plistlib
+import secrets
 import subprocess
+import tempfile
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +59,51 @@ def _expand(value: str | Path) -> Path:
     return Path(value).expanduser()
 
 
+def _display_path(path: Path) -> str:
+    """Keep local diagnostics useful without printing the operator's home path."""
+    try:
+        relative = path.relative_to(Path.home())
+    except ValueError:
+        return str(path)
+    return "~" if not relative.parts else f"~/{relative}"
+
+
+def _env_digest(*, salt: str, label: str, key: str, value: str) -> str:
+    payload = "\0".join((salt, label, key, value)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_private_json(path: Path, payload: dict[str, Any], *, replace: bool) -> None:
+    """Publish an owner-only manifest atomically, refusing overwrite by default."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if replace:
+            os.replace(temporary, path)
+        else:
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"ops manifest already exists at {_display_path(path)}; "
+                    "pass --replace-manifest only after reviewing the intended wiring change"
+                ) from exc
+            temporary.unlink()
+        os.chmod(path, 0o600, follow_symlinks=False)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
 def _read_plist(path: Path) -> dict[str, Any] | None:
     try:
         with path.open("rb") as handle:
@@ -73,6 +124,10 @@ def _default_launchctl() -> str | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _loaded_job_labels(output: str) -> set[str]:
+    return {parts[-1] for line in output.splitlines() if (parts := line.split())}
+
+
 def _mentions_ocbrain(plist: dict[str, Any]) -> bool:
     label = str(plist.get("Label") or "")
     args = " ".join(str(part) for part in plist.get("ProgramArguments") or [])
@@ -85,6 +140,7 @@ def write_ops_manifest(
     launch_agents_dir: Path | str | None = None,
     hooks_dirs: tuple[Path, ...] | None = None,
     repo_root: Path | str | None = None,
+    replace: bool = False,
 ) -> dict[str, Any]:
     """Snapshot the current wiring as the intended wiring.
 
@@ -92,12 +148,15 @@ def write_ops_manifest(
     mentions ocbrain, every installed hook that matches an example shipped in
     ``examples/harness/``, and the untracked control files that exist today.
     Nothing machine-specific is hardcoded here -- the operator's job names come
-    from the operator's plists.
+    from the operator's plists. Environment values are salted and hashed so a
+    manifest or doctor report cannot become a credential-disclosure path. An
+    existing manifest is replaced only when the caller explicitly opts in.
     """
     target = _expand(manifest_path or DEFAULT_MANIFEST_PATH)
     agents_dir = _expand(launch_agents_dir or DEFAULT_LAUNCH_AGENTS_DIR)
     hook_dirs = tuple(_expand(d) for d in (hooks_dirs or DEFAULT_HOOKS_DIRS))
     root = _expand(repo_root) if repo_root is not None else Path(__file__).resolve().parents[2]
+    env_hash_salt = secrets.token_hex(16)
 
     jobs: list[dict[str, Any]] = []
     if agents_dir.is_dir():
@@ -106,11 +165,20 @@ def write_ops_manifest(
             if not plist or not _mentions_ocbrain(plist):
                 continue
             env = plist.get("EnvironmentVariables")
+            label = str(plist.get("Label") or plist_path.stem)
             jobs.append(
                 {
-                    "label": str(plist.get("Label") or plist_path.stem),
+                    "label": label,
                     "plist": str(plist_path),
-                    "env": {str(k): str(v) for k, v in env.items()}
+                    "env_sha256": {
+                        str(key): _env_digest(
+                            salt=env_hash_salt,
+                            label=label,
+                            key=str(key),
+                            value=str(value),
+                        )
+                        for key, value in env.items()
+                    }
                     if isinstance(env, dict)
                     else {},
                 }
@@ -131,12 +199,12 @@ def write_ops_manifest(
         "schema_version": OPS_MANIFEST_SCHEMA,
         "written_at": _now_iso(),
         "repo_root": str(root),
+        "env_hash_salt": env_hash_salt,
         "jobs": jobs,
         "hooks": hooks,
         "files": files,
     }
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _atomic_private_json(target, manifest, replace=replace)
     return manifest
 
 
@@ -165,10 +233,10 @@ def ops_check(
             "action": "ops-check",
             "status": "no_manifest",
             "healthy": True,
-            "manifest": str(target),
+            "manifest": _display_path(target),
             "findings": [],
             "warnings": [
-                f"no ops manifest at {target}; run "
+                f"no ops manifest at {_display_path(target)}; run "
                 "`ocbrain doctor --ops --write-manifest` once the machine is "
                 "wired the way you intend"
             ],
@@ -176,15 +244,31 @@ def ops_check(
 
     try:
         manifest = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return {
             "action": "ops-check",
             "status": "failed",
             "healthy": False,
-            "manifest": str(target),
+            "manifest": _display_path(target),
             "findings": [{"check": "manifest", "detail": f"unreadable manifest: {exc}"}],
             "warnings": [],
         }
+    if not isinstance(manifest, dict):
+        return {
+            "action": "ops-check",
+            "status": "failed",
+            "healthy": False,
+            "manifest": _display_path(target),
+            "findings": [{"check": "manifest", "detail": "manifest root is not an object"}],
+            "warnings": [],
+        }
+    try:
+        mode = target.stat().st_mode & 0o777
+    except OSError as exc:
+        finding("manifest", f"manifest permissions could not be read: {exc}")
+    else:
+        if mode & 0o077:
+            finding("manifest", f"manifest permissions are {mode:04o}, expected owner-only 0600")
     if manifest.get("schema_version") != OPS_MANIFEST_SCHEMA:
         finding(
             "manifest",
@@ -192,7 +276,12 @@ def ops_check(
         )
 
     loaded_jobs: str | None = None
-    jobs = manifest.get("jobs") or []
+    jobs_value = manifest.get("jobs") or []
+    if not isinstance(jobs_value, list) or not all(isinstance(job, dict) for job in jobs_value):
+        finding("manifest", "jobs must be a list of objects")
+        jobs: list[dict[str, Any]] = []
+    else:
+        jobs = jobs_value
     if jobs:
         loaded_jobs = (run_launchctl or _default_launchctl)()
         if loaded_jobs is None:
@@ -201,11 +290,11 @@ def ops_check(
         label = str(job.get("label") or "")
         plist_path = _expand(str(job.get("plist") or ""))
         if not plist_path.is_file():
-            finding("job", f"{label}: plist missing at {plist_path}")
+            finding("job", f"{label}: plist missing at {_display_path(plist_path)}")
             continue
         plist = _read_plist(plist_path)
         if plist is None:
-            finding("job", f"{label}: plist at {plist_path} does not parse")
+            finding("job", f"{label}: plist at {_display_path(plist_path)} does not parse")
             continue
         actual_env = {
             str(k): str(v)
@@ -215,62 +304,94 @@ def ops_check(
                 else {}
             ).items()
         }
-        for key, expected in (job.get("env") or {}).items():
+        expected_env = job.get("env_sha256") or {}
+        if "env" in job:
+            finding(
+                "manifest",
+                f"{label}: plaintext env mapping is unsupported; rewrite the manifest",
+            )
+        if not isinstance(expected_env, dict):
+            finding("manifest", f"{label}: env_sha256 must be an object")
+            expected_env = {}
+        env_hash_salt = manifest.get("env_hash_salt")
+        if expected_env and not isinstance(env_hash_salt, str):
+            finding("manifest", f"{label}: env hash salt is missing")
+            expected_env = {}
+        for key, expected in expected_env.items():
             if key not in actual_env:
-                finding("job_env", f"{label}: env {key} missing (expected {expected!r})")
-            elif actual_env[key] != str(expected):
-                finding(
-                    "job_env",
-                    f"{label}: env {key} is {actual_env[key]!r}, manifest says {expected!r}",
-                )
+                finding("job_env", f"{label}: env {key} missing")
+            elif _env_digest(
+                salt=env_hash_salt,
+                label=label,
+                key=str(key),
+                value=actual_env[key],
+            ) != str(expected):
+                finding("job_env", f"{label}: env {key} differs from the manifest")
         for key in actual_env:
-            if key not in (job.get("env") or {}):
+            if key not in expected_env:
                 finding(
                     "job_env",
                     f"{label}: env {key} set on the machine but absent from the "
                     "manifest -- re-run --write-manifest if intended",
                 )
-        if loaded_jobs is not None and label and label not in loaded_jobs:
+        if loaded_jobs is not None and label and label not in _loaded_job_labels(loaded_jobs):
             finding("job", f"{label}: not loaded (launchctl list does not show it)")
 
-    for hook in manifest.get("hooks") or []:
+    hooks_value = manifest.get("hooks") or []
+    if not isinstance(hooks_value, list) or not all(
+        isinstance(hook, dict) for hook in hooks_value
+    ):
+        finding("manifest", "hooks must be a list of objects")
+        hooks: list[dict[str, Any]] = []
+    else:
+        hooks = hooks_value
+    for hook in hooks:
         installed = _expand(str(hook.get("installed") or ""))
         source = _expand(str(hook.get("source") or ""))
         if not installed.is_file():
-            finding("hook", f"hook missing at {installed}")
+            finding("hook", f"hook missing at {_display_path(installed)}")
             continue
         if not source.is_file():
-            finding("hook", f"hook source missing at {source} (repo moved?)")
+            finding("hook", f"hook source missing at {_display_path(source)} (repo moved?)")
             continue
         if installed.read_bytes() != source.read_bytes():
             finding(
                 "hook",
-                f"{installed} drifted from {source} -- re-copy it or re-run "
+                f"{_display_path(installed)} drifted from {_display_path(source)} -- "
+                "re-copy it or re-run "
                 "--write-manifest if the drift is intended",
             )
         elif not installed.stat().st_mode & 0o100:
-            finding("hook", f"{installed} is not executable")
+            finding("hook", f"{_display_path(installed)} is not executable")
 
-    for entry in manifest.get("files") or []:
+    files_value = manifest.get("files") or []
+    if not isinstance(files_value, list) or not all(
+        isinstance(entry, str) for entry in files_value
+    ):
+        finding("manifest", "files must be a list of paths")
+        files: list[str] = []
+    else:
+        files = files_value
+    for entry in files:
         path = _expand(str(entry))
         if not path.is_file():
-            finding("file", f"expected file missing: {path}")
+            finding("file", f"expected file missing: {_display_path(path)}")
             continue
         if path.name == "active-core.path":
             pointer = path.read_text(encoding="utf-8").strip()
             if pointer and not _expand(pointer).exists():
-                finding("file", f"{path} points at {pointer}, which does not exist")
+                finding("file", f"{_display_path(path)} points at a target that does not exist")
 
     healthy = not findings
     return {
         "action": "ops-check",
         "status": "ok" if healthy else "failed",
         "healthy": healthy,
-        "manifest": str(target),
+        "manifest": _display_path(target),
         "checked": {
             "jobs": len(jobs),
-            "hooks": len(manifest.get("hooks") or []),
-            "files": len(manifest.get("files") or []),
+            "hooks": len(hooks),
+            "files": len(files),
         },
         "findings": findings,
         "warnings": warnings,
