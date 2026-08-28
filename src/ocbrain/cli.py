@@ -298,6 +298,30 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = commands.add_parser("doctor", help="Check the core and stdio MCP")
     doctor_parser.add_argument("--timeout", type=float, default=8.0)
     doctor_parser.add_argument("--launcher", type=Path)
+    doctor_parser.add_argument(
+        "--ops",
+        action="store_true",
+        help=(
+            "Also verify the machine against its ops manifest: launchd jobs "
+            "loaded with the intended env, hooks byte-identical to their repo "
+            "sources, control files present. The DB can be healthy while the "
+            "wiring around it is not; this is the check that notices."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--write-manifest",
+        action="store_true",
+        help=(
+            "With --ops: snapshot the current wiring as the intended wiring "
+            "before checking. Run once on deployment day, and again whenever "
+            "a wiring change is deliberate."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--ops-manifest",
+        type=Path,
+        help="Manifest location (default ~/.ocbrain/ops-manifest.json)",
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
     runtime = commands.add_parser("runtime-check", help="Probe all three client integrations")
     runtime.add_argument("--timeout", type=float, default=12.0)
@@ -942,6 +966,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         launcher=args.launcher,
         check_clients=False,
     )
+    if getattr(args, "ops", False):
+        from ocbrain.opscheck import ops_check, write_ops_manifest
+
+        if getattr(args, "write_manifest", False):
+            write_ops_manifest(args.ops_manifest)
+        result["ops"] = ops_check(args.ops_manifest)
+        result["healthy"] = bool(result["healthy"]) and bool(result["ops"]["healthy"])
+        result["status"] = "ok" if result["healthy"] else "failed"
     output(args, result)
     return 0 if result["healthy"] else 1
 
