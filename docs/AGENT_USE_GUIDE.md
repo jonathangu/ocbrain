@@ -124,6 +124,31 @@ reference. This emits evidence; it does not directly promote a belief.
 Append an `ocbrain.closeout.v1` receipt. Required fields are status and summary;
 use a stable task reference. Blocked status also requires what is awaited.
 
+Two write-time gates, both enforced in the server rather than asked for here:
+
+- **`context.session` must be the runtime's own session id** — a UUID, or a bare
+  32/40-character hex id — or be omitted entirely, in which case the server fills
+  the column from its own connection id and says so in `session_id_source`. A
+  slug, a date, a task name or a file path is refused with an error naming
+  `$CLAUDE_CODE_SESSION_ID` and `$OCBRAIN_SESSION_ID`. Never invent one: of the
+  597 hand-written session ids in this core, zero join a transcript, and that
+  join is the only thing that makes a closeout's tool-call trace minable.
+  `context.runtime` names the *client*, grouped into one of `claude-code`,
+  `codex`, `cursor`, `hermes`, `mcp`, `cli`, `unknown`; the environment
+  ("analytics ClickHouse", "launchd", "zone-a") goes in `runtime_detail`.
+- **`unresolved` is required unless the receipt is a clean success** — status
+  `completed` with no verifier reporting `failed`. State what did not work and is
+  still not working. A `completed` carrying a failed verifier is allowed (a
+  read-only audit whose verdict is FAIL is a successful audit), but it owes the
+  sentence, because `brain.ledger` reads this to stop the next session repeating
+  the attempt. It comes back on every `failed_attempts` row and as the entry's
+  `latest_unresolved`, and it is what the briefing's FAILED line prints.
+
+`brain.context` and `brain.feedback` resolve `context.session` the same way, but
+never refuse: a read receipt with a hand-written session label is written with
+the server's own connection id in the column and the claim kept beside it. Only
+`brain.closeout` refuses, because it is a write you chose to make and can retry.
+
 Link:
 
 - retrieval IDs that actually informed the work;

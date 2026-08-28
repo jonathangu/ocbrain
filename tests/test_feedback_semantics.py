@@ -446,11 +446,15 @@ def test_the_v1_instructions_state_the_refusal_and_the_recorded_outcome() -> Non
     assert "no_coverage" in text
 
 
-def test_the_legacy_instructions_claim_neither_refusal_nor_no_coverage() -> None:
-    """A legacy core does neither, so it must not be described as doing either."""
+def test_the_legacy_instructions_claim_neither_feedback_refusal_nor_no_coverage() -> None:
+    """A legacy core's feedback path does neither, so claim neither for it.
+
+    ``brain.closeout`` now rejects malformed session identity on both cores; do
+    not let that accurate shared instruction weaken this v1-only feedback gate.
+    """
     text = instructions_text(core_v1=False)
     assert "no_coverage" not in text
-    assert "refuses" not in text
+    assert "brain.feedback refuses" not in text
     # It still has to say the useful part: do not file, do not re-poll.
     assert "do not file brain.feedback for it" in text
     assert "do not re-poll the same query" in text

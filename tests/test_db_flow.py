@@ -137,6 +137,9 @@ _CANONICAL_RETRIEVAL_COLUMNS = {
     "provenance_json",
     # The folded task reference a retrieval and its closeout chain on.
     "task_ref_norm",
+    # On whose word `session_id` was filled -- the same column task_closeouts
+    # carries, because both write paths resolve identity the same way.
+    "session_id_source",
 }
 
 # The exact live legacy retrieval_uses shape: the original 7 columns plus the

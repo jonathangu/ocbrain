@@ -191,6 +191,13 @@ _PUBLIC_VERSION_ASSIGN_RE = re.compile(
     r'''["'](?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+){2,})["']'''
 )
 
+# A shell mutation harness commonly passes a pytest node as one quoted
+# ``$VARIABLE::test_name`` argument. The long identifier is executable source,
+# not a literal; keep the exception as narrow as the Python NAME-token rule.
+_SHELL_PYTEST_NODE_RE = re.compile(
+    r'''(?P<quote>["'])\$[A-Z][A-Z0-9_]*::(?P<node>test_[a-z0-9_]+)(?P=quote)'''
+)
+
 
 # --- findings ------------------------------------------------------------- #
 
@@ -391,6 +398,15 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
     return kept
 
 
+def filter_shell_pytest_node_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop only quoted ``$VAR::test_<identifier>`` shell node selectors."""
+
+    if not rel.endswith(".sh") or not spans:
+        return spans
+    nodes = {match.group("node") for match in _SHELL_PYTEST_NODE_RE.finditer(line)}
+    return [span for span in spans if span not in nodes]
+
+
 def filter_public_version_spans(rel: str, line: str, spans: list[str]) -> list[str]:
     """Drop an explicitly assigned, human-readable Python version slug."""
 
@@ -572,6 +588,7 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                 spans = filter_public_sha256_spans(content, spans)
                 spans = filter_public_url_spans(content, spans)
                 spans = filter_python_identifier_spans(rel, content, spans)
+                spans = filter_shell_pytest_node_spans(rel, content, spans)
                 spans = filter_public_version_spans(rel, content, spans)
                 if spans:
                     result.findings.append(

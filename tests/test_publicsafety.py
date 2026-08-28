@@ -360,6 +360,27 @@ def test_quoted_python_entropy_still_fails(repo: Path) -> None:
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
+def test_shell_pytest_node_identifier_is_not_an_entropy_finding(repo: Path) -> None:
+    rng = _commit_added_line(
+        repo,
+        "mutation-proof.sh",
+        '"$T::test_the_long_public_identifier_names_the_behavior_under_test"',
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_shell_pytest_node_exception_does_not_hide_other_entropy(repo: Path) -> None:
+    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    rng = _commit_added_line(
+        repo,
+        "mutation-proof.sh",
+        f'"$T::test_the_long_public_identifier_names_the_behavior" "{suspicious}"',
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
 def test_explicit_human_readable_python_version_is_not_entropy(repo: Path) -> None:
     rng = _commit_added_line(
         repo,

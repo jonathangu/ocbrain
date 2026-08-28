@@ -1,11 +1,12 @@
 """ocbrain configuration surface.
 
-Five sections, one per thing that actually reads configuration: ``retrieval``
+Six sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
-closeout gate), and ``supersede`` (how much authority a runtime supersession
-carries). There were seventeen; thirteen configured subsystems that were
-deleted or were never read at all.
+closeout slop gate), ``closeout`` (the write-time closeout identity and failure
+gates), and ``supersede`` (how much authority a runtime supersession carries).
+There were seventeen; thirteen configured subsystems that were deleted or were
+never read at all.
 
 The public entry point is :func:`load_config`, which layers, in order:
 
@@ -238,6 +239,36 @@ class DeslopConfig:
 
 
 @dataclass(frozen=True)
+class CloseoutConfig:
+    """Write-time discipline for the closeout receipt.
+
+    ``session_id_policy`` decides what happens to a ``context.session`` that is
+    not the runtime's own id. ``enforce`` (the default) refuses it and names the
+    shape and the env var to read it from; ``quarantine`` keeps the claim in the
+    receipt and out of the identity column; ``off`` restores the pre-2026-08-28
+    behaviour of storing whatever arrived. The gate is always satisfiable --
+    omitting the field is legal and the server fills it from its own connection
+    id -- so no client is ever unable to file a closeout.
+
+    ``require_unresolved`` requires a closeout that is not a clean success to
+    name what did not work. One `failed` closeout in 1,239 over six weeks is not
+    a credible failure rate, and ``brain.ledger``'s whole purpose is surfacing
+    the attempts that did not work.
+
+    ``runtime_aliases`` maps a folded runtime spelling to one of
+    ``closeout.RUNTIME_FAMILIES``, for install-specific labels the shipped rules
+    cannot know -- a Hermes runtime hash, an operator's own ``OCBRAIN_CLIENT``
+    string. Ships EMPTY, like ``scopes.aliases``, because a real fleet's profile
+    names are operator data and this repo is public. An entry whose target is
+    not a known family is ignored rather than fabricating an eighth family.
+    """
+
+    session_id_policy: str = "enforce"
+    require_unresolved: bool = True
+    runtime_aliases: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SupersedeConfig:
     """How much authority one runtime ``brain.supersede`` call carries.
 
@@ -282,6 +313,7 @@ class OcbrainConfig:
     scopes: ScopesConfig = field(default_factory=ScopesConfig)
     curator: CuratorConfig = field(default_factory=CuratorConfig)
     deslop: DeslopConfig = field(default_factory=DeslopConfig)
+    closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
 
 

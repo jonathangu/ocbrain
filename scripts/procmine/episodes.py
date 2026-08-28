@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from ocbrain.closeout import runtime_family
 from procmine.runtimes import canonical_runtime
 
 BRAIN_DB = Path(os.path.expanduser("~/.ocbrain/ocbrain.sqlite"))
@@ -56,26 +57,62 @@ GRADE_ORDER = [
 ]
 GRADE_RANK = {name: index for index, name in enumerate(GRADE_ORDER)}
 
+# This taxonomy's name for each family ``ocbrain.closeout.runtime_family``
+# returns. Two names differ and the rest are identical: `mcp-direct` and `mcp`
+# are the same answer, and so are `host-batch` and `cli`. Declared rather than
+# assumed, because it is what lets the two mappers be compared instead of merely
+# looked at.
+# Values of `task_closeouts.session_id_source` that mean the server, not the
+# model, put the value in the column. `harness_attested` is read from the MCP
+# child's own environment and `server_connection` is minted by the server; the
+# other two (`agent_reported`, `none`) are the model's word or nothing.
+_SERVER_OBSERVED_SOURCES = frozenset({"harness_attested", "server_connection"})
+
+_SHARED_FAMILY: dict[str, str] = {
+    "claude-code": "claude-code",
+    "codex": "codex",
+    "cursor": "cursor",
+    "hermes": "hermes",
+    "mcp": "mcp-direct",
+    "cli": "host-batch",
+}
+
+# What is left after the shipped families moved to the shared folder: the
+# install- and environment-specific tokens, which are this file's actual job.
+# A closeout's `runtime` is free text from a fleet whose profile names live on
+# one operator's machine, and those cannot go in a public repository's write
+# path. `re.search` is the intended semantics *here* -- `hermes-runtimes` is a
+# path fragment and an install-specific profile-hash prefix -- but it is no longer
+# applied to any family token, because a substring match on "cli" reads
+# "ClickHouse" as a CLI. That trap is why the shared folder matches segments.
 _RUNTIME_RULES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"codex", re.I), "codex"),
-    (re.compile(r"hermes", re.I), "hermes"),
-    (re.compile(r"cursor", re.I), "cursor"),
-    (re.compile(r"claude", re.I), "claude-code"),
-    (re.compile(r"telegram|kanban|gateway", re.I), "hermes"),
-    (re.compile(r"^mcp$|ocbrain-runtime-call", re.I), "mcp-direct"),
+    (re.compile(r"telegram|kanban|gateway|hermeswork", re.I), "hermes"),
     (re.compile(r"gpt-5\.6-sol", re.I), "hermes"),
     (re.compile(r"^f15a38ee|hermes-runtimes", re.I), "hermes"),
-    (re.compile(r"asa[12]|trino|dagster|gcloud|cron|launchd", re.I), "host-batch"),
+    (re.compile(r"asa[12]|trino|gcloud", re.I), "host-batch"),
     (re.compile(r"local|mac|darwin|desktop|workspace|worktree", re.I), "unattributed-local"),
 ]
 
 
 def normalize_runtime(raw: str | None) -> str:
+    """Fold one free-text runtime spelling into a mining family.
+
+    Asks ``ocbrain.closeout.runtime_family`` first -- the same folder the
+    closeout write path uses -- and falls through to the install-specific rules
+    above only when it abstains. Three normalisers for one question is how two
+    of them drift; this one is now a superset of the shipped one rather than a
+    rival to it, so the two can differ by abstention but never by contradiction.
+    ``tests/test_closeout_discipline.py`` asserts exactly that over the live
+    runtime census.
+    """
     if not raw:
         return "unknown"
     text = raw.strip()
     if not text:
         return "unknown"
+    shared = runtime_family(text)
+    if shared != "unknown":
+        return _SHARED_FAMILY[shared]
     for pattern, family in _RUNTIME_RULES:
         if pattern.search(text):
             return family
@@ -205,10 +242,14 @@ def load_episodes(db_path: Path | None = None) -> list[Episode]:
         columns = {row[1] for row in conn.execute("pragma table_info(task_closeouts)")}
         hint_column = "client_session_hint" if "client_session_hint" in columns else "NULL"
         runtime_key_column = "client_runtime_key" if "client_runtime_key" in columns else "NULL"
+        # Written by ocbrain.closeout from 2026-08-28: who filled `session_id`.
+        # Authoritative where present, and NULL on every earlier row, which is
+        # why the hint heuristic below is kept rather than replaced.
+        source_column = "session_id_source" if "session_id_source" in columns else "NULL"
         rows = conn.execute(
             "select id, closed_at, task_ref, status, summary, runtime, session_id, "
             "context_json, artifact_refs_json, verifier_refs_json, provenance_json, "
-            f"{hint_column}, {runtime_key_column} "
+            f"{hint_column}, {runtime_key_column}, {source_column} "
             "from task_closeouts order by closed_at"
         ).fetchall()
     finally:
@@ -218,7 +259,7 @@ def load_episodes(db_path: Path | None = None) -> list[Episode]:
     for (
         closeout_id, closed_at, task_ref, status, summary, runtime_raw, session_id,
         context_json, artifact_json, verifier_json, provenance_json,
-        session_hint, runtime_key,
+        session_hint, runtime_key, stored_session_source,
     ) in rows:
         verifier_refs = _json_list(verifier_json)
         artifact_refs = _json_list(artifact_json)
@@ -240,7 +281,17 @@ def load_episodes(db_path: Path | None = None) -> list[Episode]:
         # the model-supplied value is kept beside it, not overwritten.
         reported_session = session_id or provenance.get("session_id") or context.get("session")
         effective_session = session_hint or reported_session
-        session_source = "server_observed" if session_hint else "model_reported"
+        # Where the write path recorded who filled the column, believe it. A
+        # `conn:<32hex>` id is minted by the server and carries no hint, so the
+        # hint heuristic alone called every one of those `model_reported` --
+        # precisely backwards. The heuristic stays as the fallback for the rows
+        # written before the column existed, where it is all there is.
+        session_source = (
+            "server_observed"
+            if stored_session_source in _SERVER_OBSERVED_SOURCES
+            or (stored_session_source is None and session_hint)
+            else "model_reported"
+        )
         effective_runtime = runtime_raw or provenance.get("runtime") or context.get("runtime")
         episodes.append(
             Episode(

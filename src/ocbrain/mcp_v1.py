@@ -1409,6 +1409,8 @@ def closeout_v1(
     outcomes: list[dict[str, Any]],
     awaiting: str | None,
     actor: str,
+    unresolved: str | None = None,
+    runtime_detail: str | None = None,
     parent_closeout_id: str | None = None,
     provenance: Provenance | None = None,
 ) -> dict[str, Any]:
@@ -1442,6 +1444,8 @@ def closeout_v1(
         actions=actions,
         outcomes=outcomes,
         awaiting=awaiting,
+        unresolved=unresolved,
+        runtime_detail=runtime_detail,
         actor=actor,
         parent_closeout_id=parent_closeout_id,
         provenance=provenance,

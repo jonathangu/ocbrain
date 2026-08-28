@@ -672,6 +672,14 @@ def build_ledger(
                     if isinstance(ref, dict) and ref.get("uri")
                 ],
                 "awaiting": receipt.get("awaiting"),
+                # What the caller said did not work. `awaiting` is who unblocks
+                # me; this is what is still broken, and it is the only field the
+                # write-time gate charges a non-clean closeout for. A required
+                # field no reader serves is a toll, not a gate -- so it is read
+                # here, on the object whose description promises to read it.
+                # NULL on every row written before 2026-08-28: the table is
+                # append-only under a trigger and is never backfilled.
+                "unresolved": receipt.get("unresolved"),
             }
         )
 
@@ -728,6 +736,10 @@ def _ledger_entry(norm: str, chain: list[dict[str, Any]]) -> dict[str, Any]:
         "last_closed_at": latest["closed_at"],
         "latest_status": latest["status"],
         "latest_summary": latest["summary"],
+        # The summary says what the session did; this says what is still not
+        # working. `None` on pre-gate rows, and every consumer degrades to the
+        # summary rather than printing an empty failure.
+        "latest_unresolved": latest["unresolved"],
         "latest_closeout_id": latest["id"],
         "failed_attempt_count": len(failed_attempts),
         "failed_attempts": [
@@ -737,6 +749,7 @@ def _ledger_entry(norm: str, chain: list[dict[str, Any]]) -> dict[str, Any]:
                 "status": row["status"],
                 "summary": row["summary"],
                 "awaiting": row["awaiting"],
+                "unresolved": row["unresolved"],
             }
             for row in failed_attempts
         ],
@@ -978,7 +991,14 @@ def _ledger_line(entry: dict[str, Any]) -> str:
         # iteration to avoid the task; "TASK-2 failed: the trainer import is
         # circular" tells it what not to try again, which is the difference
         # between skipping work and not repeating it.
-        line += f": {_clip(entry['latest_summary'], MAX_SUMMARY_CHARS)}"
+        #
+        # `unresolved` first, because that is the sentence about what is still
+        # broken; the summary is what the session did, which is a weaker answer
+        # to the same question. Falls back to the summary for every row written
+        # before the field existed -- which is all 1,238 of them in the live
+        # core, and nothing there may lose its line.
+        because = entry["latest_unresolved"] or entry["latest_summary"]
+        line += f": {_clip(because, MAX_SUMMARY_CHARS)}"
     elif entry["verifiers"]:
         line += f" verifier: {entry['verifiers'][0].get('uri')}"
     return _clip(line, MAX_LINE_CHARS)

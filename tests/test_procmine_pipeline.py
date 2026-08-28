@@ -171,6 +171,12 @@ def test_a_corrupt_segment_falls_back_to_parsing(tmp_path, fake_sources):
 # --- episodes artifact -----------------------------------------------------
 
 
+# Runtime-shaped, so ``record_closeout`` accepts it, and deliberately matching
+# no trace in these fixtures: the tests that use it are about the mint gates,
+# not the session join.
+_UNJOINED_SESSION = "99999999-8888-7777-6666-555555555555"
+
+
 def _core_with_closeout(tmp_path, session_id: str, task_ref: str = "mine-me") -> Path:
     path = tmp_path / "core.sqlite"
     conn = connect(path)
@@ -299,7 +305,7 @@ def _flaky_traces(
 
 
 def test_mint_reports_before_it_writes(tmp_path):
-    brain = _core_with_closeout(tmp_path, "unused-session")
+    brain = _core_with_closeout(tmp_path, _UNJOINED_SESSION)
     result = mint_mod.mint_gotchas(_flaky_traces(), brain_db=brain)
 
     assert result["applied_mode"] == "report_only"
@@ -312,7 +318,7 @@ def test_mint_reports_before_it_writes(tmp_path):
 
 def test_mint_converges_on_one_belief_id_across_runs(tmp_path):
     """Recompute and replace. A re-mint must not add a second row."""
-    brain = _core_with_closeout(tmp_path, "unused-session")
+    brain = _core_with_closeout(tmp_path, _UNJOINED_SESSION)
     traces = _flaky_traces()
 
     first = mint_mod.mint_gotchas(traces, brain_db=brain, apply=True)
@@ -347,7 +353,7 @@ def test_mint_converges_on_one_belief_id_across_runs(tmp_path):
 
 
 def test_mint_is_capped_at_twelve_per_run(tmp_path):
-    brain = _core_with_closeout(tmp_path, "unused-session")
+    brain = _core_with_closeout(tmp_path, _UNJOINED_SESSION)
     traces: list[dict] = []
     for index in range(20):
         traces.extend(
@@ -364,7 +370,7 @@ def test_mint_is_capped_at_twelve_per_run(tmp_path):
 
 
 def test_mint_refuses_a_step_below_either_threshold(tmp_path):
-    brain = _core_with_closeout(tmp_path, "unused-session")
+    brain = _core_with_closeout(tmp_path, _UNJOINED_SESSION)
     # Loud but reliable: plenty of calls, hardly any failures.
     reliable = [
         {
@@ -455,7 +461,7 @@ def test_gotcha_scope_folds_through_the_alias_table(monkeypatch):
 
 
 def test_a_gotcha_with_no_joined_episode_falls_back_to_the_workspace_scope(tmp_path):
-    brain = _core_with_closeout(tmp_path, "unused-session")
+    brain = _core_with_closeout(tmp_path, _UNJOINED_SESSION)
     candidates = mint_mod.build_candidates(_flaky_traces(), brain_db=brain)
     assert candidates[0]["scope"].scope_id == mint_mod.FALLBACK_SCOPE_ID
     assert candidates[0]["attributes"]["source_quality"] == mint_mod.LABEL_FREE_QUALITY

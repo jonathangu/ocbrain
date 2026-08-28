@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS retrieval_uses (
   client_session_hint TEXT,
   client_runtime_key TEXT,
   provenance_json TEXT,
-  task_ref_norm TEXT
+  task_ref_norm TEXT,
+  session_id_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_retrieval_uses_knowledge_outcome_served
   ON retrieval_uses(knowledge_id, outcome, served_at);
@@ -450,7 +451,10 @@ CREATE TABLE IF NOT EXISTS task_closeouts (
   client_session_hint TEXT,
   client_runtime_key TEXT,
   parent_closeout_id TEXT,
-  task_ref_norm TEXT
+  task_ref_norm TEXT,
+  session_id_source TEXT,
+  runtime_family TEXT,
+  unresolved TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_task_closeouts_chain
   ON task_closeouts(task_ref_norm, closed_at);
@@ -672,6 +676,22 @@ _V6_TASK_CLOSEOUT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("parent_closeout_id", "TEXT"),
     ("task_ref_norm", "TEXT"),
 )
+# Closeout identity and failure discipline. Nullable and never backfilled, for
+# the same reason `task_ref_norm` is not: `task_closeouts` carries an UPDATE
+# trigger and is append-only, so a historical row can never be rewritten in
+# place. `ocbrain.closeout.runtime_family` is a pure function precisely so the
+# 160 historical runtime spellings stay analysable on read.
+_V7_TASK_CLOSEOUT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("session_id_source", "TEXT"),
+    ("runtime_family", "TEXT"),
+    ("unresolved", "TEXT"),
+)
+# The same column on the read receipt. Both writers resolve identity the same
+# way, so both tables have to be able to say on whose word the value arrived --
+# a fix landing on one of a pair is how the pair drifts.
+_V7_RETRIEVAL_USE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("session_id_source", "TEXT"),
+)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
@@ -739,6 +759,10 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         _ensure_column(conn, "retrieval_uses", column, decl)
     for column, decl in _V6_TASK_CLOSEOUT_COLUMNS:
         _ensure_column(conn, "task_closeouts", column, decl)
+    for column, decl in _V7_TASK_CLOSEOUT_COLUMNS:
+        _ensure_column(conn, "task_closeouts", column, decl)
+    for column, decl in _V7_RETRIEVAL_USE_COLUMNS:
+        _ensure_column(conn, "retrieval_uses", column, decl)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_closeouts_chain "
         "ON task_closeouts(task_ref_norm, closed_at)"
@@ -1700,9 +1724,20 @@ def log_retrieval_use(
     server-observed ``provenance`` beside the model-supplied ``runtime`` and
     ``session_id``; this path never canonicalized the runtime at all, so the
     two write paths finally agree on what a caller identity is.
+
+    ``session_id`` goes through the same resolver as a closeout's, under the
+    ``quarantine`` policy rather than ``enforce``. A retrieval receipt is a side
+    effect of a *read*: refusing it because the session label is a slug would
+    break retrieval in order to fix a join. So the junk is kept out of the
+    column and never out of the row.
     """
+    # Imported here, not at module scope: ``ocbrain.closeout`` imports
+    # ``now_iso`` from this module, so a top-level import would be a cycle.
+    from ocbrain.closeout import resolve_session_identity
+
     created_at = now_iso()
     observed = provenance or EMPTY_PROVENANCE
+    identity = resolve_session_identity(session_id, observed, policy="quarantine")
     observed_payload = observed.to_dict()
     served_ids_json = json.dumps(list(served_ids or []), sort_keys=True, separators=(",", ":"))
     sequence = conn.execute("SELECT COUNT(*) FROM retrieval_uses").fetchone()[0]
@@ -1725,9 +1760,9 @@ def log_retrieval_use(
           id, knowledge_id, served_to_runtime, task_ref, outcome, note,
           query_text, served_ids_json, session_id, feedback_source, feedback_at,
           served_at, server_connection_id, client_session_hint,
-          client_runtime_key, provenance_json
+          client_runtime_key, provenance_json, session_id_source
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             retrieval_id,
@@ -1738,16 +1773,23 @@ def log_retrieval_use(
             note,
             query_text,
             served_ids_json,
-            session_id,
+            # Resolved, not claimed. `stable_id` above still hashes the claim,
+            # so no existing receipt id moves.
+            identity["session_id"],
             feedback_source,
             created_at if feedback_source else None,
             created_at,
             observed.server_connection_id,
             observed.client_session_hint,
             observed.client_runtime_key,
-            json.dumps(observed_payload, sort_keys=True, separators=(",", ":"))
-            if observed_payload
-            else None,
+            # The claim rides along with what the server saw, so a resolver
+            # that replaced a value never destroys the one it replaced.
+            json.dumps(
+                {**observed_payload, "session_identity": identity},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            identity["session_id_source"],
         ),
     )
     return retrieval_id

@@ -388,8 +388,11 @@ result classing.
    joins out of 1,105.~~ **Landed for new rows.** The server no longer asks the
    model who it is: at `initialize` it mints a `server_connection_id` and reads
    the MCP child's own environment, and `task_closeouts` /`retrieval_uses` carry
-   `client_session_hint` beside the model-supplied `session_id`
-   (`src/ocbrain/provenance.py`). On Claude Code that hint is byte-identical to
+   `client_session_hint` beside `session_id`
+   (`src/ocbrain/provenance.py`). Since 2026-08-28 that second column is no
+   longer whatever the model typed: `ocbrain.closeout.resolve_session_identity`
+   fills it from the most trustworthy witness available and records which in
+   `session_id_source`, with the model's claim kept beside it. On Claude Code that hint is byte-identical to
    the transcript filename `claude_code.py:47` keys on, so the identity tier
    joins directly. Three caveats the design keeps visible rather than papering
    over: the hint is harness-attested and never server-verified; its stability

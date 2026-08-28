@@ -635,6 +635,129 @@ term should go, or `confidence` should be re-derived from evidence count,
 evidence recency, and verifier status, is an operator decision. Disable it by
 setting the config key `retrieval.confidence_prior_enabled` to `false`, and read
 `ranking.confidence_prior_enabled` on any packet to see which way it ran.
+## Section G — write-time closeout gates
+
+Not selftest metrics: these are constants in `src/ocbrain/closeout.py` that
+decide whether a `brain.closeout` call is accepted. They are documented here
+because this file is where a constant's provenance lives, and a gate that
+refuses a client's work has to justify its number at least as hard as a gate
+that colours a row amber.
+
+All three are configurable under the `closeout` config section, so an operator
+who disagrees changes one line rather than forking the write path.
+
+### `RUNTIME_SESSION_SHAPES` — `{runtime_uuid, runtime_hex}`
+
+Which shapes of `context.session` reach `task_closeouts.session_id`. A UUID
+(8-4-4-4-12 hex, which is what Claude Code and Codex mint) or a bare 32/40-char
+hex id. Everything else is refused under the default policy.
+
+**Measured** against one read-only backup of the live core taken 2026-08-28
+12:30:51 PDT, 1,239 closeouts from 2026-07-15: 211 (17.0%) runtime-shaped, 431
+absent, and 597 hand-written — `example_cleanup_audit`, `2026-07-22`,
+`2026-07-21 release checklist`, `/srv/example/receipt`. **All 94
+closeouts that join a Claude Code transcript are UUIDs; zero of the 597
+hand-written ids join one.** So the boundary is not a strictness dial: admitting
+exactly the machine-minted shapes keeps 94 of 94 joinable rows and costs none.
+
+Every number in this section comes from that one backup. The live core gained
+three rows during the afternoon this was written; a section assembled from
+several reads of a moving table would be arithmetically inconsistent with
+itself, which is why it is measured from a fixed copy and the copy is dated.
+
+`runtime_hex` is admitted on the same reasoning rather than on observation —
+zero live `session_id` values carry it, but a 32/40-char hex id is machine-minted
+and high-cardinality, and refusing a real runtime's real id would make the gate
+unsatisfiable for that client. **Judgement**, and the weaker half of this entry.
+
+Prose alone had six weeks to fix this: the UUID rate went 15.1% in July to 19.6%
+in August. That is why the shape is enforced in the server rather than asked for
+in a docstring.
+
+### `closeout.session_id_policy` — default `enforce`
+
+`enforce` refuses a non-runtime-shaped id; `quarantine` keeps the claim in the
+receipt and out of the identity column; `off` restores pre-2026-08-28 behaviour.
+
+**Judgement.** The case for `enforce`: the gate is always satisfiable, because
+omitting `context.session` is legal and the server then fills the column from its
+own connection id, so no client can be unable to file a closeout. The error is
+also the only channel that has ever reached an agent, and it names
+`$CLAUDE_CODE_SESSION_ID` and `$OCBRAIN_SESSION_ID` — a quarantine fixes the
+column's type but can never produce a joinable id, because nothing tells the
+agent to go and find one.
+
+**The cost, measured:** replaying all 1,239 backed-up closeouts through the
+shipped defaults refuses **747 (60.3%)** — 597 for the session shape, 150 more
+for a missing `unresolved` (282 trip that gate, 132 of them already refused for
+their session id). Every one is satisfiable on retry and both refusals are
+reported together so one retry clears both, but a cron job that does not retry
+loses that receipt. An operator who would rather keep every receipt sets
+`{"closeout": {"session_id_policy": "quarantine"}}`.
+
+### `SERVER_CONNECTION_SESSION_PREFIX` — `conn:`
+
+**Convention.** A server connection id names a *connection*, not a conversation,
+and joins no transcript. The prefix makes that structural rather than something
+a later miner has to remember: a `conn:` value can never be mistaken for a
+transcript filename by a string comparison.
+
+### `CLEAN_SUCCESS_STATUSES` — `{completed}`
+
+A closeout owes an `unresolved` unless it is `completed` **and** no verifier it
+filed reports `failed`.
+
+**Measured**, same backup: 282 of 1,239 (22.8%) trip this — 187 by status, and
+**95 more that claim `completed` while carrying a failed verifier**. Gating on
+status alone would miss all 95, which is why the verifier evidence is a second,
+independent trigger. Live status distribution was completed 1,052 / partial 148 /
+blocked 38 / **failed 1**; one failure in six weeks of agent work is not a
+failure rate, it is a reporting gap, and `brain.ledger`'s only job is surfacing
+the attempts that did not work.
+
+Deliberately **not** a status override. Of the twelve closeouts whose verifiers
+all failed, seven are read-only audits where the FAIL verdict is the deliverable
+("Read-only re-review found remaining blockers; verdict FAIL"). Deriving `failed`
+from the evidence would relabel successful work. The caller keeps the verdict and
+owes a sentence.
+
+### `RUNTIME_FAMILY_RULES` — seven families
+
+**Measured from the listing**, not invented: every token is a substring of a
+spelling in the live `SELECT runtime, COUNT(*)` output. That column held **160
+distinct spellings across 1,239 rows** — five of "local mac", four of "codex
+desktop", and `local macOS + analytics ClickHouse` (13 rows) with an
+environment welded onto the client name. Nothing could be grouped by it.
+
+The token list is **not** exhaustive of the corpus and does not claim to be. One
+exact spelling is carried beside it in `RUNTIME_FAMILY_EXACT` —
+`ocbrain-runtime-call`, which this repository itself emits — because its token
+`ocbrain` also appears in `local-agent-mode-ocbrain`, a Claude Code client key on
+66 rows. Everything else install-specific belongs in `closeout.runtime_aliases`
+or in `scripts/procmine`, which is a mining taxonomy for one operator's history
+and is allowed to know a Hermes profile hash.
+
+Matching is on whole hyphen-delimited **segments**. A substring match put those
+13 ClickHouse rows in the `cli` family, because "ClickHouse" contains "cli" —
+a normaliser that guesses is worse than a column nobody can group.
+
+`unknown` is a real member and covers 438 of 1,239 rows: `local`, `desktop`,
+`macOS` name the machine, not the client, and inventing one for them would be
+guessing. `closeout.runtime_aliases` is where an install's own labels go; it
+ships empty for the same reason `scopes.aliases` does. The environment detail
+those spellings were carrying now has `runtime_detail`.
+
+The function is pure and history-independent, because `task_closeouts` is
+append-only under a trigger and the 160 historical spellings can never be
+rewritten in place. Applied to them at read time, server-observed key first, it
+yields codex 426, unknown 438, hermes 123, mcp 95, claude-code 84, cursor 57,
+cli 16 — 1,239 rows, every one placed.
+
+`scripts/procmine/episodes.normalize_runtime` asks this function first and adds
+only install-specific rules on top, so the repo has one folder and one superset
+of it rather than two rivals. Over the 3,287 closeout and retrieval rows both
+have ever seen, that reconciliation moves 8 rows (the spelling `cli`, from
+`unknown` to `host-batch`) and regresses none.
 
 ---
 
