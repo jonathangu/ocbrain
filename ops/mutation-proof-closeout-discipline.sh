@@ -10,8 +10,8 @@
 #       OTHER version's .pyc and reverse the verdict both ways -- so every
 #       __pycache__ is removed before every run and PYTHONDONTWRITEBYTECODE=1
 #       is set for all of them;
-#   (b) the expected result of a probe is never printed before the probe
-#       returns -- this script reports what happened, it does not assert it.
+#   (b) every probe is scored only after both runs complete. The sole passing
+#       outcome is exactly mutated=FAILS/restored=PASSES.
 #
 # Usage: ops/mutation-proof-closeout-discipline.sh
 set -uo pipefail
@@ -23,16 +23,44 @@ PY="${OCBRAIN_PYTHON:-$ROOT/../../../.venv/bin/python}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$ROOT/src"
 
+MUTATION_FAILURES=0
+ACTIVE_FILE=""
+ACTIVE_BACKUP=""
+ACTIVE_OUTPUT="${TMPDIR:-/tmp}/ocbrain-mutproof.$$.out"
+
+restore_active() {
+  if [ -n "$ACTIVE_FILE" ] && [ -n "$ACTIVE_BACKUP" ] && [ -f "$ACTIVE_BACKUP" ]; then
+    cp "$ACTIVE_BACKUP" "$ACTIVE_FILE"
+    rm -f "$ACTIVE_BACKUP"
+  fi
+  ACTIVE_FILE=""
+  ACTIVE_BACKUP=""
+}
+
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  restore_active
+  rm -f "$ACTIVE_OUTPUT"
+  exit "$rc"
+}
+
+install_cleanup_traps() {
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
 clear_bytecode() {
   find "$ROOT/src" "$ROOT/tests" "$ROOT/scripts" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null
 }
 
 run_test() {
   clear_bytecode
-  "$PY" -m pytest -q -p no:cacheprovider "$1" >/tmp/mutproof.$$ 2>&1
+  "$PY" -m pytest -q -p no:cacheprovider "$1" >"$ACTIVE_OUTPUT" 2>&1
   local rc=$?
-  tail -3 /tmp/mutproof.$$ | tr '\n' ' '
-  rm -f /tmp/mutproof.$$
+  tail -3 "$ACTIVE_OUTPUT" | tr '\n' ' '
+  rm -f "$ACTIVE_OUTPUT"
   return $rc
 }
 
@@ -42,6 +70,8 @@ mutate() {
   local backup
   backup="$(mktemp)"
   cp "$file" "$backup"
+  ACTIVE_FILE="$file"
+  ACTIVE_BACKUP="$backup"
   "$PY" - "$file" "$from" "$to" <<'EOF'
 import pathlib, sys
 path, old, new = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -53,30 +83,49 @@ path.write_text(text.replace(old, new))
 EOF
   if [ $? -ne 0 ]; then
     printf '%-58s ANCHOR MISSING\n' "$label"
-    cp "$backup" "$file"; rm -f "$backup"; return 1
+    restore_active
+    MUTATION_FAILURES=$((MUTATION_FAILURES + 1))
+    return 0
   fi
   local out
   out="$(run_test "$test")"
   local mutated_rc=$?
-  cp "$backup" "$file"; rm -f "$backup"
+  restore_active
+  local restored_out
+  restored_out="$(run_test "$test")"
+  local restored_rc=$?
   # pytest exits 4 when a named test id does not resolve and 5 when it
   # collected nothing at all. Either way a renamed test would otherwise read as
   # `mutated=FAILS`, which is this harness scoring a missing instrument as a
   # passing proof -- the exact failure it exists to catch elsewhere. Verified by
   # pointing one entry at a name that does not exist and seeing this line.
-  if [ $mutated_rc -eq 4 ] || [ $mutated_rc -eq 5 ]; then
+  if [ "$mutated_rc" -eq 4 ] || [ "$mutated_rc" -eq 5 ] || \
+     [ "$restored_rc" -eq 4 ] || [ "$restored_rc" -eq 5 ]; then
     printf '%-58s TEST NOT FOUND (%s)\n' "$label" "$test"
-    return 1
   fi
-  local restored_out
-  restored_out="$(run_test "$test")"
-  local restored_rc=$?
   printf '%-58s mutated=%s restored=%s\n' "$label" \
     "$([ $mutated_rc -ne 0 ] && echo FAILS || echo PASSES)" \
     "$([ $restored_rc -eq 0 ] && echo PASSES || echo FAILS)"
   printf '    mutated : %s\n    restored: %s\n' "$out" "$restored_out"
+  if [ "$mutated_rc" -eq 0 ] || [ "$mutated_rc" -eq 4 ] || \
+     [ "$mutated_rc" -eq 5 ] || [ "$restored_rc" -ne 0 ]; then
+    MUTATION_FAILURES=$((MUTATION_FAILURES + 1))
+  fi
+  return 0
 }
 
+mutation_proof_result() {
+  if [ "$MUTATION_FAILURES" -ne 0 ]; then
+    printf '\nMUTATION PROOF FAILED: %s probe(s) violated mutated=FAILS/restored=PASSES\n' \
+      "$MUTATION_FAILURES"
+    return 1
+  fi
+  printf '\nMUTATION PROOF PASSED: every probe observed mutated=FAILS/restored=PASSES\n'
+  return 0
+}
+
+main() {
+install_cleanup_traps
 C=src/ocbrain/closeout.py
 T=tests/test_closeout_discipline.py
 
@@ -161,14 +210,14 @@ echo "== migration =="
 mutate src/ocbrain/core_v1.py \
   '    ("task_closeouts", "session_id_source", "TEXT"),' \
   '' \
-  "$T::test_an_existing_core_gains_the_columns_before_the_first_closeout_lands" \
+  "$T::test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write" \
   "session_id_source column not migrated"
 
 mutate src/ocbrain/db.py \
   '    for column, decl in _V7_TASK_CLOSEOUT_COLUMNS:
         _ensure_column(conn, "task_closeouts", column, decl)' \
   '    pass' \
-  "$T::test_the_legacy_initializer_also_migrates_an_existing_database" \
+  "$T::test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write" \
   "legacy db.py migration skipped"
 
 echo
@@ -304,12 +353,19 @@ mutate "$D" \
 mutate "$V" \
   '    ("retrieval_uses", "session_id_source", "TEXT"),' \
   '' \
-  "$T::test_an_existing_core_gains_the_retrieval_column_before_the_first_read" \
+  "$T::test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write" \
   "retrieval column not migrated on an existing core"
 
 mutate "$D" \
   '    for column, decl in _V7_RETRIEVAL_USE_COLUMNS:
         _ensure_column(conn, "retrieval_uses", column, decl)' \
   '    pass' \
-  "$T::test_the_legacy_initializer_also_adds_the_retrieval_column" \
+  "$T::test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write" \
   "legacy db.py retrieval migration skipped"
+
+mutation_proof_result
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

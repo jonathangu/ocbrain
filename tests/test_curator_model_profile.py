@@ -165,8 +165,8 @@ def test_the_critic_is_off_unless_a_provider_is_named() -> None:
 
 def test_high_impact_is_doctrine_and_pins_and_nothing_else() -> None:
     doctrine = {"scope": {"scope_id": "global:doctrine"}, "pinned": False}
-    pinned = {"scope": {"scope_id": "project:coframe"}, "pinned": True}
-    ordinary = {"scope": {"scope_id": "project:coframe"}, "pinned": False}
+    pinned = {"scope": {"scope_id": "project:fixture"}, "pinned": True}
+    ordinary = {"scope": {"scope_id": "project:fixture"}, "pinned": False}
     assert high_impact_change(doctrine) is True
     assert high_impact_change(pinned) is True
     assert high_impact_change(ordinary) is False

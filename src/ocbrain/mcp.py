@@ -569,14 +569,22 @@ def handle_request(
             response = error_response(request_id, -32601, f"unknown method: {method}")
             return None if is_notification else response
         response = {"jsonrpc": "2.0", "id": request_id, "result": result}
-    except KeyError as exc:
-        response = error_response(request_id, -32602, f"missing argument: {exc.args[0]}")
-    except PermissionError as exc:
-        response = error_response(request_id, -32001, str(exc))
-    except ValueError as exc:
-        response = error_response(request_id, -32602, str(exc))
     except Exception as exc:  # noqa: BLE001 - MCP errors must be serialized.
-        response = error_response(request_id, -32000, str(exc))
+        # A tool may have issued several statements before its final statement
+        # fails (closeout writes its receipt before its evidence row). Leaving
+        # that transaction pending lets a later successful request commit work
+        # whose caller was told it failed. Every serialized request error first
+        # clears the connection's transaction boundary.
+        with contextlib.suppress(sqlite3.Error):
+            conn.rollback()
+        if isinstance(exc, KeyError):
+            response = error_response(request_id, -32602, f"missing argument: {exc.args[0]}")
+        elif isinstance(exc, PermissionError):
+            response = error_response(request_id, -32001, str(exc))
+        elif isinstance(exc, ValueError):
+            response = error_response(request_id, -32602, str(exc))
+        else:
+            response = error_response(request_id, -32000, str(exc))
     if is_notification:
         return None
     return response

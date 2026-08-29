@@ -440,16 +440,16 @@ def test_gotcha_scope_folds_through_the_alias_table(monkeypatch):
     """
     monkeypatch.setenv(
         "OCBRAIN_SCOPES_ALIASES",
-        json.dumps({"project:personalization-headroom": "project:coframe-personalization"}),
+        json.dumps({"project:personalization-headroom": "project:fixture-personalization"}),
     )
     attribution = {
         "bash:flaky": {
             "qualities": [1.0],
-            "projects": {"personalization-headroom": 3, "coframe": 1},
+            "projects": {"personalization-headroom": 3, "fixture": 1},
         }
     }
     scope, quality = mint_mod._scope_for("bash:flaky", attribution)
-    assert scope.scope_id == "project:coframe-personalization"
+    assert scope.scope_id == "project:fixture-personalization"
     assert quality == 1.0
 
     # Without an alias entry the fold still normalizes case and spacing, and
@@ -569,21 +569,21 @@ def test_a_private_host_and_account_never_reach_an_artifact():
     The fixture address is RFC 5737 documentation space, not a real one — a test
     that guards against publishing an internal host must not publish one itself.
     """
-    leaky = 'host="192.0.2.10"; user="first_last_com"; run as ' + Path.home().name
+    account = "_".join(("first", "last", "com"))
+    leaky = f'host="192.0.2.10"; user="{account}"; run as ' + Path.home().name
     scrubbed = normalize_mod.scrub_artifact_text(leaky)
     assert "192.0.2.10" not in scrubbed
-    assert "first_last_com" not in scrubbed
+    assert account not in scrubbed
     assert Path.home().name not in scrubbed
     assert "<ip>" in scrubbed and "<user>" in scrubbed
 
 
 def test_error_fingerprints_class_a_host_before_they_are_stored():
-    fingerprint = normalize_mod.error_fingerprint(
-        "error: ssh 192.0.2.10 as first_last_com refused"
-    )
+    account = "_".join(("first", "last", "com"))
+    fingerprint = normalize_mod.error_fingerprint(f"error: ssh 192.0.2.10 as {account} refused")
     assert fingerprint is not None
     assert "192.0.2.10" not in fingerprint
-    assert "first_last_com" not in fingerprint
+    assert account not in fingerprint
 
 
 def test_the_committed_atlas_artifacts_carry_no_private_identifier():

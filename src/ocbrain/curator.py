@@ -6,8 +6,9 @@ Raw transcripts are never eligible -- they are excluded by kind.
 
 Which egress policies qualify is configurable, because the default that clients
 write is ``local_only`` and a brain full of it would otherwise have nothing to
-curate. ``prohibited`` egress and ``secret`` visibility are refused in code
-regardless of configuration, and every applied run records an egress audit.
+curate. ``prohibited`` egress plus ``confidential`` and ``secret`` visibility
+are refused in code regardless of configuration, and every applied run records
+an egress audit.
 
 Every claim the model returns is verified locally before it can become a belief:
 the key, title, body, category, lifecycle, and confidence are range-checked, and
@@ -370,11 +371,12 @@ def load_env_value(path: Path | None, name: str) -> str | None:
     return None
 
 
-# Never eligible for curation, whatever the operator configures. `prohibited` and
-# `secret` are the floor. `local_only` is rejected explicitly below so a label
-# that means "this must not leave" can never become hosted consent by allow-list.
+# Never eligible for curation, whatever the operator configures. `prohibited`,
+# `confidential`, and `secret` are the floor. `local_only` is rejected explicitly
+# below so a label that means "this must not leave" can never become hosted
+# consent by allow-list.
 FORBIDDEN_EGRESS_POLICIES = frozenset({"prohibited"})
-FORBIDDEN_VISIBILITIES = frozenset({"secret"})
+FORBIDDEN_VISIBILITIES = frozenset({"confidential", "secret"})
 
 
 def resolve_selection_policy(
@@ -410,10 +412,26 @@ def resolve_selection_policy(
     )
     if not resolved_egress or not resolved_visibility:
         raise ValueError(
-            "curator selection policy admits nothing; prohibited egress and secret "
-            "visibility are never eligible"
+            "curator selection policy admits nothing; prohibited egress and "
+            "confidential/secret visibility are never eligible"
         )
     return resolved_egress, resolved_visibility
+
+
+def confidential_or_prohibited_eligible(
+    *,
+    egress_policies: Iterable[str],
+    visibilities: Iterable[str],
+    included: Iterable[dict[str, Any]],
+) -> bool:
+    """Derive the CLI safety summary from effective policy and partition rows."""
+    if "prohibited" in set(egress_policies) or "confidential" in set(visibilities):
+        return True
+    return any(
+        str(row.get("egress_policy") or "") == "prohibited"
+        or str(row.get("visibility") or "") == "confidential"
+        for row in included
+    )
 
 
 def select_evidence(
@@ -432,8 +450,8 @@ def select_evidence(
     sends nothing it was not explicitly given. ``approval_required`` may be
     admitted explicitly; ``local_only`` must first be reclassified and is never
     accepted as a hosted allow-list override. ``prohibited`` egress and
-    ``secret`` visibility are refused in code regardless. Raw transcripts stay
-    ineligible by kind either way.
+    ``confidential``/``secret`` visibility are refused in code regardless. Raw
+    transcripts stay ineligible by kind either way.
 
     The project gate matches by canonical spelling, not by exact string. Clients
     name their own scope, so one project arrives written a dozen ways and the

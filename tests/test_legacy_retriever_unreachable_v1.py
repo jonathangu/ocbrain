@@ -1,8 +1,8 @@
 """The legacy blend retriever must stay unreachable from a v1 core.
 
 The repo carries two independently tuned rankers. ``core_v1`` serves the live
-path (FTS5 bm25 + a dense sidecar fused with weighted RRF and a multiplicative
-scope/confidence/quality/recency/feedback prior). ``retrieve.py`` is the retired
+path (FTS5 bm25 + a dense sidecar fused with weighted RRF and multiplicative
+scope, confidence, quality, recency, and feedback terms). ``retrieve.py`` is the retired
 legacy ranker: a flat ``relevance * scope_weight * confidence * pinned *
 catalog_stub`` product with a repo-FTS fallback. Both are still imported by
 ``mcp.py``, ``cli.py`` and ``shared_context.py``, each behind an ``is_core_v1``
@@ -51,7 +51,7 @@ _WORKTREE_RETRIEVE = (Path(__file__).resolve().parents[1] / "src/ocbrain/retriev
 # bare interpreter ``ocbrain`` resolves through the editable install rather than
 # this tree, so a tracer keyed on this tree's path would match no frame and
 # report a clean zero for the wrong reason.
-# ``test_the_tracer_is_keyed_to_the_module_under_test`` pins the two together.
+# The tracer-key regression test below pins the two together.
 _RETRIEVE_SOURCE = str(Path(importlib.import_module(LEGACY_MODULE).__file__).resolve())
 
 # Every call site of the legacy ranker in the package, per module, keyed by path

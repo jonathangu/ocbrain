@@ -985,7 +985,7 @@ def test_lossy_supersession_excludes_agent_corrections(core):
         target="belief_agent_old",
         op="supersede",
         days_ago=2,
-        writer="hermes:squirtlecoframe",
+        writer="hermes:fixture",
         successor="belief_agent_new",
     )
     conn.commit()

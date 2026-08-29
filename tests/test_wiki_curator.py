@@ -412,7 +412,7 @@ def test_selection_policy_floor_cannot_be_configured_away() -> None:
     )
     assert "prohibited" not in egress
     assert "secret" not in visibility
-    assert "confidential" in visibility
+    assert "confidential" not in visibility
 
     with pytest.raises(ValueError, match="local_only.*hosted curator"):
         resolve_selection_policy(egress_policies=["hosted_ok", "local_only"])
@@ -424,6 +424,8 @@ def test_selection_policy_floor_cannot_be_configured_away() -> None:
         resolve_selection_policy(egress_policies=["prohibited"])
     with pytest.raises(ValueError, match="admits nothing"):
         resolve_selection_policy(visibilities=["secret"])
+    with pytest.raises(ValueError, match="admits nothing"):
+        resolve_selection_policy(visibilities=["confidential"])
 
 
 def test_selection_policy_materializes_one_shot_iterables_once() -> None:
@@ -447,7 +449,7 @@ def test_selection_policy_materializes_one_shot_iterables_once() -> None:
         egress_policies=egress,
         visibilities=visibility,
         allow_hosted_egress=True,
-    ) == (("approval_required", "hosted_ok"), ("confidential", "internal"))
+    ) == (("approval_required", "hosted_ok"), ("internal",))
     assert egress.iterations == visibility.iterations == 1
 
     one_shot_local = (policy for policy in ("hosted_ok", "local_only"))
@@ -456,6 +458,26 @@ def test_selection_policy_materializes_one_shot_iterables_once() -> None:
             egress_policies=one_shot_local,
             allow_hosted_egress=True,
         )
+
+
+def test_cli_unsafe_eligibility_summary_is_derived_from_policy_and_partition() -> None:
+    from ocbrain.curator import confidential_or_prohibited_eligible
+
+    assert not confidential_or_prohibited_eligible(
+        egress_policies=("hosted_ok",),
+        visibilities=("internal",),
+        included=[{"egress_policy": "hosted_ok", "visibility": "internal"}],
+    )
+    assert confidential_or_prohibited_eligible(
+        egress_policies=("hosted_ok",),
+        visibilities=("internal", "confidential"),
+        included=[],
+    )
+    assert confidential_or_prohibited_eligible(
+        egress_policies=("hosted_ok",),
+        visibilities=("internal",),
+        included=[{"egress_policy": "prohibited", "visibility": "internal"}],
+    )
 
 
 def test_local_only_policy_is_rejected_before_evidence_selection(tmp_path: Path) -> None:

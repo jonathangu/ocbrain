@@ -18,6 +18,18 @@ FAKE_DENY = "acme-private-marker-xyz"
 FAKE_SECRET = "sk-" + "A1b2C3d4E5f6G7h8J9k0"
 
 
+def _user_path(*parts: str) -> str:
+    return "/".join(("", "Users", "example", *parts))
+
+
+def _ipv4(*octets: str) -> str:
+    return ".".join(octets)
+
+
+def _oslogin_user() -> str:
+    return "_".join(("alice", "example", "com"))
+
+
 def _git(root: Path, *args: str) -> str:
     return subprocess.run(
         ["git", "-C", str(root), *args],
@@ -54,12 +66,12 @@ def test_count_denylist_hits_case_insensitive() -> None:
 
 
 def test_private_path_flags_non_allowlisted_segment() -> None:
-    text = "path /Users/bob/code/secret-employer-repo/main.py here"
+    text = f"path {_user_path('code', 'secret-employer-repo', 'main.py')} here"
     assert ps.private_path_segments(text, {"ocbrain"}) == ["secret-employer-repo"]
 
 
 def test_private_path_allowlists_this_repo() -> None:
-    text = "see /Users/example/.openclaw/workspace/ocbrain/src/x.py"
+    text = f"see {_user_path('.openclaw', 'workspace', 'ocbrain', 'src', 'x.py')}"
     assert ps.private_path_segments(text, ps.WORKSPACE_ALLOWLIST) == []
 
 
@@ -80,6 +92,7 @@ def test_source_distribution_explicitly_excludes_runtime_private_roots() -> None
     assert ps.content_scan_excluded("src/ocbrain/publicsafety.py")
     assert ps.builtin_scan_excluded("scripts/procmine/normalize.py")
     assert not ps.content_scan_excluded("scripts/procmine/normalize.py")
+    assert not ps.content_scan_excluded("tests/test_publicsafety.py")
 
 
 # --- clean tree passes ---------------------------------------------------- #
@@ -156,7 +169,8 @@ def test_catches_planted_secret_in_diff_range(repo: Path) -> None:
 
 def test_catches_private_path_in_tracked_file(repo: Path) -> None:
     (repo / "doc.md").write_text(
-        "build at /Users/bob/code/other-private-repo/build.sh\n", encoding="utf-8"
+        f"build at {_user_path('code', 'other-private-repo', 'build.sh')}\n",
+        encoding="utf-8",
     )
     _git(repo, "add", "doc.md")
     _git(repo, "commit", "-q", "-m", "leak path")
@@ -165,17 +179,26 @@ def test_catches_private_path_in_tracked_file(repo: Path) -> None:
     assert any(f.rule == "private_path" for f in result.findings)
 
 
-def test_test_dir_excluded_from_content_scans(repo: Path) -> None:
-    # Adversarial fixtures under tests/ are grandfathered (secret/deny/path).
+def test_test_dir_is_scanned_for_every_content_violation(repo: Path) -> None:
+    """Generated test fixtures get no blanket privacy or credential bypass."""
     _write_denylist(repo, [FAKE_DENY])
     (repo / "tests").mkdir()
+    fake_secret = "sk-" + "".join(("A1b2", "C3d4", "E5f6", "G7h8", "J9k0"))
+    entropy_token = "".join(("AbCdEfGh", "IjKlMnOp", "QrStUvWx", "Yz012345", "6789AbCd"))
+    private_path = "/".join(("", "Users", "example", "code", "synthetic-private", "x.py"))
+    private_host = ".".join(("10", "21", "31", "41"))
     (repo / "tests" / "fixture.py").write_text(
-        f'S = "{FAKE_SECRET}"  # {FAKE_DENY} /Users/x/code/foo/y\n', encoding="utf-8"
+        f'S = "{fake_secret}"; VALUE = "{entropy_token}" '
+        f"# {FAKE_DENY} {private_path} host={private_host}\n",
+        encoding="utf-8",
     )
+    base = _git(repo, "rev-parse", "HEAD").strip()
     _git(repo, "add", "tests/fixture.py")
     _git(repo, "commit", "-q", "-m", "fixture")
-    result = ps.scan(repo)
-    assert result.ok, result.report()
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    result = ps.scan(repo, diff_range=f"{base}..{head}")
+    rules = {finding.rule for finding in result.findings}
+    assert {"denylist", "private_path", "infra_identifier", "secret_leak", "high_entropy"} <= rules
 
 
 # --- assigned_secret precision (ruling 1a) -------------------------------- #
@@ -239,8 +262,8 @@ def test_plist_skips_entropy_and_private_path(repo: Path) -> None:
     (repo / "ops").mkdir()
     plist = (
         "<plist><array>\n"
-        "  <string>/Users/bob/other-private/service-env/run-wrapper.sh</string>\n"
-        "  <string>/Users/bob/code/employer-secret-repo/logs/out.log</string>\n"
+        f"  <string>{_user_path('other-private', 'service-env', 'run-wrapper.sh')}</string>\n"
+        f"  <string>{_user_path('code', 'employer-secret-repo', 'logs', 'out.log')}</string>\n"
         "</array></plist>\n"
     )
     base = _git(repo, "rev-parse", "HEAD").strip()
@@ -273,15 +296,16 @@ def test_plist_still_subject_to_placement_and_denylist(repo: Path) -> None:
 
 def test_plist_still_subject_to_infrastructure_identifier_scan(repo: Path) -> None:
     (repo / "ops").mkdir()
+    private_host = _ipv4("10", "11", "12", "13")
     (repo / "ops" / "svc.plist").write_text(
-        '<plist><string>host="10.11.12.13"</string></plist>\n', encoding="utf-8"
+        f'<plist><string>host="{private_host}"</string></plist>\n', encoding="utf-8"
     )
     _git(repo, "add", "ops/svc.plist")
     _git(repo, "commit", "-q", "-m", "plist with private host")
     result = ps.scan(repo)
     findings = [f for f in result.findings if f.rule == "infra_identifier"]
     assert len(findings) == 1, result.report()
-    assert "10.11.12.13" not in result.report()
+    assert private_host not in result.report()
 
 
 def test_entropy_pathcheck_excluded_unit() -> None:
@@ -301,7 +325,7 @@ def test_explicit_public_git_commit_is_not_an_entropy_finding(repo: Path) -> Non
 
 
 def test_unlabeled_full_hex_value_remains_an_entropy_finding(repo: Path) -> None:
-    suspicious_value = "a790972f0f844d81067ed45c28b524220a10c019"
+    suspicious_value = "".join(("a790972f", "0f844d81", "067ed45c", "28b52422", "0a10c019"))
     rng = _commit_added_line(repo, "payload.py", f'VALUE = "{suspicious_value}"')
     result = ps.scan(repo, diff_range=rng)
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
@@ -332,7 +356,7 @@ def test_public_repo_url_is_not_an_entropy_finding(repo: Path) -> None:
 
 
 def test_public_repo_url_query_token_remains_an_entropy_finding(repo: Path) -> None:
-    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    suspicious = "".join(("AbCdEfGh", "IjKlMnOp", "QrStUvWx", "Yz012345", "6789AbCdEf"))
     rng = _commit_added_line(
         repo,
         "SECURITY.md",
@@ -353,29 +377,46 @@ def test_python_identifier_is_not_an_entropy_finding(repo: Path) -> None:
     assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
+def test_multiline_python_declaration_is_not_an_entropy_finding(repo: Path) -> None:
+    name = "test_" + "_".join(
+        ("a", "long", "declaration", "identifier", "is", "structure", "not", "a", "secret")
+    )
+    rng = _commit_added_line(
+        repo,
+        "test_long_name.py",
+        f"def {name}(",
+    )
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
 def test_quoted_python_entropy_still_fails(repo: Path) -> None:
-    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    suspicious = "".join(("AbCdEfGh", "IjKlMnOp", "QrStUvWx", "Yz012345", "6789AbCdEf"))
     rng = _commit_added_line(repo, "settings.py", f'VALUE = "{suspicious}"')
     result = ps.scan(repo, diff_range=rng)
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
 def test_shell_pytest_node_identifier_is_not_an_entropy_finding(repo: Path) -> None:
+    node = "test_" + "_".join(
+        ("the", "long", "public", "identifier", "names", "the", "behavior", "under", "test")
+    )
     rng = _commit_added_line(
         repo,
         "mutation-proof.sh",
-        '"$T::test_the_long_public_identifier_names_the_behavior_under_test"',
+        f'"$T::{node}"',
     )
     result = ps.scan(repo, diff_range=rng)
     assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
 def test_shell_pytest_node_exception_does_not_hide_other_entropy(repo: Path) -> None:
-    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    suspicious = "".join(("AbCdEfGh", "IjKlMnOp", "QrStUvWx", "Yz012345", "6789AbCdEf"))
+    node = "test_" + "_".join(("the", "long", "public", "identifier", "names", "behavior"))
     rng = _commit_added_line(
         repo,
         "mutation-proof.sh",
-        f'"$T::test_the_long_public_identifier_names_the_behavior" "{suspicious}"',
+        f'"$T::{node}" "{suspicious}"',
     )
     result = ps.scan(repo, diff_range=rng)
     assert any(f.rule == "high_entropy" for f in result.findings), result.report()
@@ -392,7 +433,7 @@ def test_explicit_human_readable_python_version_is_not_entropy(repo: Path) -> No
 
 
 def test_version_exception_does_not_hide_random_or_unscoped_entropy(repo: Path) -> None:
-    suspicious = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEf"
+    suspicious = "".join(("AbCdEfGh", "IjKlMnOp", "QrStUvWx", "Yz012345", "6789AbCdEf"))
     for line in (
         f'prompt_version = "{suspicious}"',
         'VALUE = "dataset-rubric-v3-human-calibration-anchors"',
@@ -403,6 +444,15 @@ def test_version_exception_does_not_hide_random_or_unscoped_entropy(repo: Path) 
         rng = _commit_added_line(repo, "versioned.py", line)
         result = ps.scan(repo, diff_range=rng)
         assert any(f.rule == "high_entropy" for f in result.findings), result.report()
+
+
+def test_sql_ddl_identifier_is_not_an_entropy_finding(repo: Path) -> None:
+    identifier = "idx_" + "_".join(
+        ("retrieval", "uses", "knowledge", "outcome", "served")
+    )
+    rng = _commit_added_line(repo, "schema.sql", f"CREATE INDEX {identifier}")
+    result = ps.scan(repo, diff_range=rng)
+    assert not any(f.rule == "high_entropy" for f in result.findings), result.report()
 
 
 def test_diff_range_ignores_removed_lines(repo: Path) -> None:
@@ -425,7 +475,10 @@ def test_diff_range_ignores_removed_lines(repo: Path) -> None:
 
 def test_private_path_flags_developer_and_documents_containers():
     hits = ps.private_path_segments(
-        "see /Users/bob/Developer/secret-repo/src/x.py and /Users/bob/Documents/private-notes/a.md",
+        "see "
+        + _user_path("Developer", "secret-repo", "src", "x.py")
+        + " and "
+        + _user_path("Documents", "private-notes", "a.md"),
         ps.WORKSPACE_ALLOWLIST,
     )
     assert hits == ["secret-repo", "private-notes"]
@@ -434,7 +487,7 @@ def test_private_path_flags_developer_and_documents_containers():
 def test_private_path_still_allowlists_this_repo_under_developer():
     assert (
         ps.private_path_segments(
-            "/Users/example/Developer/ocbrain/src/x.py", ps.WORKSPACE_ALLOWLIST
+            _user_path("Developer", "ocbrain", "src", "x.py"), ps.WORKSPACE_ALLOWLIST
         )
         == []
     )
@@ -443,14 +496,15 @@ def test_private_path_still_allowlists_this_repo_under_developer():
 def test_private_path_flags_a_home_dotdir():
     """An absolute home dot-dir path always reveals a username; `~/…` does not."""
     hits = ps.private_path_segments(
-        "wrote /Users/bob/.privatebrain/logs/run.log", ps.WORKSPACE_ALLOWLIST
+        f"wrote {_user_path('.privatebrain', 'logs', 'run.log')}", ps.WORKSPACE_ALLOWLIST
     )
     assert hits == [".privatebrain"]
     assert ps.private_path_segments("wrote ~/.privatebrain/logs/run.log", set()) == []
 
 
 def test_infra_identifiers_flag_a_routable_ipv4_but_not_documentation_ranges():
-    assert ps.infrastructure_identifier_kinds('host="10.11.12.13"', None) == [
+    private_host = _ipv4("10", "11", "12", "13")
+    assert ps.infrastructure_identifier_kinds(f'host="{private_host}"', None) == [
         "routable IPv4 literal"
     ]
     for exempt in ("127.0.0.1", "0.0.0.0", "192.0.2.7", "198.51.100.9", "203.0.113.4"):
@@ -460,7 +514,7 @@ def test_infra_identifiers_flag_a_routable_ipv4_but_not_documentation_ranges():
 
 
 def test_infra_identifiers_flag_the_oslogin_spelling_but_not_snake_case_code():
-    assert ps.infrastructure_identifier_kinds('user="alice_example_com"', None) == [
+    assert ps.infrastructure_identifier_kinds(f'user="{_oslogin_user()}"', None) == [
         "OS Login account spelling"
     ]
     # The live tree's proven false-positive shapes must stay silent.
@@ -482,11 +536,40 @@ def test_local_account_pattern_guards_against_generic_and_short_names():
 def test_infra_findings_withhold_the_matched_value(repo):
     """CI logs on a public repo are public; a finding must not re-leak its match."""
     (repo / "docs").mkdir()
-    (repo / "docs" / "note.md").write_text('the box is at host="10.11.12.13"\n', encoding="utf-8")
+    private_host = _ipv4("10", "11", "12", "13")
+    (repo / "docs" / "note.md").write_text(
+        f'the box is at host="{private_host}"\n', encoding="utf-8"
+    )
     _git(repo, "add", "docs/note.md")
     _git(repo, "commit", "-qm", "add note")
     result = ps.scan(repo)
     findings = [f for f in result.findings if f.rule == "infra_identifier"]
     assert len(findings) == 1
-    assert "10.11.12.13" not in findings[0].detail
+    assert private_host not in findings[0].detail
     assert "routable IPv4 literal" in findings[0].detail
+
+
+def test_private_path_findings_withhold_the_matched_segment(repo):
+    """A private-path failure must not reprint the identifier into CI logs."""
+    segment = "synthetic" + "-private-segment"
+    path = "/".join(("", "Users", "example", "code", segment, "note.md"))
+    (repo / "note.md").write_text(f"built at {path}\n", encoding="utf-8")
+    _git(repo, "add", "note.md")
+    _git(repo, "commit", "-qm", "add private path")
+    result = ps.scan(repo)
+    findings = [finding for finding in result.findings if finding.rule == "private_path"]
+    assert len(findings) == 1, result.report()
+    assert segment not in findings[0].detail
+    assert segment not in result.report()
+    assert "value withheld" in findings[0].detail
+
+
+def test_ci_public_safety_uses_a_validated_real_diff_range() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    assert "fetch-depth: 0" in workflow
+    assert "--diff-range" in workflow
+    assert "git cat-file -e" in workflow
+    assert 'base_commit="${{ github.event.before }}"' in workflow
+    assert 'base_commit="${{ github.event.pull_request.base.sha }}"' in workflow

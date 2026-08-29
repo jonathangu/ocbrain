@@ -27,10 +27,10 @@ Checks
 The secret/entropy scanners (c) run only on added diff lines because, as the
 real tree proves, they false-positive on ordinary source (``api_key = env``)
 and on documentation hashes. Placement/denylist/private-path (a,b,d) run
-tree-wide. Test fixtures, lockfiles, the denylist file, and this module's own
-source are excluded from *content* scans because they necessarily contain
-adversarial-looking or definitional patterns; every other tracked file -- all
-product source, docs, ops, scripts -- is scanned.
+tree-wide. Test fixtures are scanned like product files; adversarial values in
+tests must be generated rather than committed verbatim. Only lockfiles, the
+local denylist file, and narrowly identified definitional scanner sources have
+content exemptions.
 """
 
 from __future__ import annotations
@@ -158,6 +158,14 @@ def infrastructure_identifier_kinds(
 # quoted literal the source pattern structurally could not.
 _QUOTED_SECRET_ASSIGN_RE = re.compile(
     r"""(?i)(api[_-]?key|secret|token|password|credential)\s*[:=]\s*["'][^"']{8,}["']"""
+)
+_PYTHON_DECLARATION_RE = re.compile(
+    r"^\s*(?:async\s+)?(?:def|class)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_SQL_DECLARATION_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER|TABLE|VIEW)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
 )
 
 # A full public Git object id is reproducibility metadata, not a credential,
@@ -325,7 +333,7 @@ def is_forbidden_tracked_path(rel: str) -> bool:
 
 
 def content_scan_excluded(rel: str) -> bool:
-    return rel in _CONTENT_SKIP_EXACT or rel.startswith("tests/") or rel.endswith(".lock")
+    return rel in _CONTENT_SKIP_EXACT or rel.endswith(".lock")
 
 
 def builtin_scan_excluded(rel: str) -> bool:
@@ -381,14 +389,19 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
 
     if not rel.endswith(".py") or not spans:
         return spans
+    declared = _PYTHON_DECLARATION_RE.match(line)
+    names = {declared.group("name")} if declared is not None else set()
     try:
-        names = {
+        names.update(
             token.string
             for token in tokenize.generate_tokens(io.StringIO(line.lstrip()).readline)
             if token.type == tokenize.NAME
-        }
+        )
     except (IndentationError, tokenize.TokenError):
-        return spans
+        # A multiline `def name(` is incomplete by itself and cannot be
+        # tokenized, but its declaration identifier is still structurally
+        # unambiguous. Quoted values never enter `names` through this fallback.
+        pass
     kept: list[str] = []
     for span in spans:
         parts = [part for part in re.split(r"=+", span) if part]
@@ -396,6 +409,18 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
             continue
         kept.append(span)
     return kept
+
+
+def filter_sql_identifier_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop only the object identifier in a SQL DDL declaration."""
+
+    if not rel.endswith(".sql") or not spans:
+        return spans
+    declaration = _SQL_DECLARATION_RE.match(line)
+    if declaration is None:
+        return spans
+    name = declaration.group("name")
+    return [span for span in spans if span != name]
 
 
 def filter_shell_pytest_node_spans(rel: str, line: str, spans: list[str]) -> list[str]:
@@ -543,12 +568,13 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
             # (d) private /Users/ path -- tree-wide, except plists (see
             # entropy_pathcheck_excluded: wrapper/log paths are legitimate).
             if not entropy_pathcheck_excluded(rel):
-                for seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
+                for _seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
                     result.findings.append(
                         Finding(
                             "private_path",
                             rel,
-                            f"absolute /Users/ path reveals non-allowlisted segment '{seg}'",
+                            "absolute /Users/ path reveals a non-allowlisted segment "
+                            "(value withheld from this report)",
                             line=i,
                         )
                     )
@@ -588,6 +614,7 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                 spans = filter_public_sha256_spans(content, spans)
                 spans = filter_public_url_spans(content, spans)
                 spans = filter_python_identifier_spans(rel, content, spans)
+                spans = filter_sql_identifier_spans(rel, content, spans)
                 spans = filter_shell_pytest_node_spans(rel, content, spans)
                 spans = filter_public_version_spans(rel, content, spans)
                 if spans:

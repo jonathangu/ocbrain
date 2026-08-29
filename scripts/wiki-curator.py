@@ -40,6 +40,7 @@ from ocbrain.curator import (
     PROVIDER_DEFAULTS,
     WIKI_STATE_SCHEMA,
     apply_claims,
+    confidential_or_prohibited_eligible,
     input_digest,
     load_env_value,
     now_iso,
@@ -268,8 +269,8 @@ def main() -> int:
             raise ValueError("database is not an OCBrain v1 core")
         # The operator's standing declaration of what their curator may read,
         # from config (OCBRAIN_CURATOR_EGRESS_POLICIES / the config file), with a
-        # CLI override. `local_only`, `prohibited`, and `secret` are refused in
-        # code either way.
+        # CLI override. `local_only`, `prohibited`, `confidential`, and `secret`
+        # are refused in code either way.
         curator_cfg = load_config().curator
         egress_policies = args.egress_policy or curator_cfg.egress_policies
         resolved_egress, resolved_visibility = resolve_selection_policy(
@@ -338,7 +339,13 @@ def main() -> int:
                 "input_digest": digest,
                 "prior_digest_matches": prior_digests.get(project) == digest,
                 "raw_transcripts_eligible": False,
-                "confidential_or_prohibited_eligible": False,
+                "confidential_or_prohibited_eligible": (
+                    confidential_or_prohibited_eligible(
+                        egress_policies=resolved_egress,
+                        visibilities=resolved_visibility,
+                        included=evidence,
+                    )
+                ),
                 "hosted_egress_acknowledged": bool(args.allow_hosted_egress),
                 "egress_policies": list(resolved_egress),
                 "visibilities": list(resolved_visibility),

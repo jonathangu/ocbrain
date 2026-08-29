@@ -18,9 +18,11 @@ until its assertion holds is an assertion about the census.
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
-import re
+import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -40,12 +42,10 @@ from ocbrain.closeout import (
     runtime_family,
 )
 from ocbrain.core_v1 import (
-    CORE_V1_SCHEMA,
     init_core_v1,
-    migrate_core_v1_columns,
+    is_core_v1,
     record_core_v1_retrieval,
 )
-from ocbrain.db import SCHEMA as LEGACY_SCHEMA
 from ocbrain.db import connect, init_db, log_retrieval_use
 from ocbrain.provenance import Provenance
 from ocbrain.scope import ScopeContext
@@ -138,73 +138,85 @@ def _core(tmp_path):
     return conn
 
 
-def _create_legacy_table(
-    conn: sqlite3.Connection,
-    schema: str,
-    table: str,
-    omitted_columns: set[str],
-) -> None:
-    """Create the pre-gate table directly, without reverse-migrating new DDL.
+_PRE_PR59_FIXTURES = Path(__file__).parent / "fixtures" / "pre_pr59_11c69f6"
+_PRE_PR59_FIXTURE_SHA256 = {
+    "strict-v1.sql": "b0524c49f1240c048c59d947f6878975ba5c89ed58c869ea7e4b176135eb9ea1",  # SHA-256
+    "v0.sql": "3951998b422a0eb9e3ac62124d97eac3de0c19078c2127d7e146ce92b3e56f79",  # SHA-256
+}
 
-    SQLite has to rewrite and reparse a table's stored SQL for ``DROP COLUMN``.
-    That is not a valid way to model an older append-only table with dependent
-    indexes/triggers. This fixture instead starts from the repository's canonical
-    table definition and omits only the columns that did not exist before the
-    closeout-discipline migration.
-    """
-    match = re.search(
-        rf"CREATE TABLE IF NOT EXISTS {re.escape(table)}\s*\(.*?^\);",
-        schema,
-        flags=re.MULTILINE | re.DOTALL,
-    )
-    assert match is not None, table
-    lines = [
-        line
-        for line in match.group(0).splitlines()
-        if not any(re.match(rf"\s*{re.escape(column)}\s+", line) for column in omitted_columns)
+
+def _materialize_pre_pr59_fixture(tmp_path: Path, name: str) -> Path:
+    """Load an immutable SQL dump emitted by the real 11c69f6 initializer."""
+    sql_path = _PRE_PR59_FIXTURES / name
+    assert sql_path.is_file(), f"missing pinned base fixture: {sql_path}"
+    assert hashlib.sha256(sql_path.read_bytes()).hexdigest() == _PRE_PR59_FIXTURE_SHA256[name]
+    db_path = tmp_path / name.replace(".sql", ".sqlite")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(sql_path.read_text(encoding="utf-8"))
+    finally:
+        conn.close()
+    return db_path
+
+
+def _mcp_bootstrap_round_trip(db_path: Path) -> list[dict]:
+    """Open the fixture through the shipped CLI/MCP bootstrap boundary."""
+    requests = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "ocbrain-runtime-call", "version": "1"}
+            },
+        },
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.context",
+                "arguments": {
+                    "query": "pinned pre-PR59 bootstrap fixture",
+                    "limit": 1,
+                    "context": {"project": "fixture", "task": "fixture-read"},
+                },
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "brain.closeout",
+                "arguments": {
+                    "task_ref": "fixture-write",
+                    "status": "completed",
+                    "summary": "Pinned schema bootstrap round trip completed.",
+                    "decision_impact": "none",
+                    "context": {"project": "fixture", "task": "fixture-write"},
+                },
+            },
+        },
     ]
-    for index in range(len(lines) - 2, 0, -1):
-        stripped = lines[index].strip()
-        if not stripped or stripped.startswith("--"):
-            continue
-        lines[index] = lines[index].rstrip().removesuffix(",")
-        break
-    conn.execute("\n".join(lines))
-
-
-def _init_pre_closeout_discipline_schema(
-    conn: sqlite3.Connection, schema: str, *, core_v1: bool
-) -> None:
-    """Build the two real pre-migration tables plus their dependencies."""
-    _create_legacy_table(conn, schema, "retrieval_uses", {"session_id_source"})
-    _create_legacy_table(
-        conn,
-        schema,
-        "task_closeouts",
-        {"session_id_source", "runtime_family", "unresolved"},
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(root / "src")
+    completed = subprocess.run(
+        [sys.executable, "-m", "ocbrain.cli", "--db", str(db_path), "mcp"],
+        input="".join(json.dumps(request) + "\n" for request in requests),
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
     )
-    retrieval_index = (
-        "CREATE INDEX idx_retrieval_uses_outcome_served "
-        "ON retrieval_uses(outcome, served_at);"
-        if core_v1
-        else "CREATE INDEX idx_retrieval_uses_knowledge_outcome_served "
-        "ON retrieval_uses(knowledge_id, outcome, served_at);"
-    )
-    conn.executescript(
-        f"""
-        {retrieval_index}
-        CREATE INDEX idx_task_closeouts_chain
-          ON task_closeouts(task_ref_norm, closed_at);
-        CREATE TRIGGER task_closeouts_no_update
-        BEFORE UPDATE ON task_closeouts BEGIN
-          SELECT RAISE(ABORT, 'task_closeouts is append-only');
-        END;
-        CREATE TRIGGER task_closeouts_no_delete
-        BEFORE DELETE ON task_closeouts BEGIN
-          SELECT RAISE(ABORT, 'task_closeouts is append-only');
-        END;
-        """
-    )
+    assert completed.returncode == 0, completed.stderr
+    assert not completed.stderr, completed.stderr
+    responses = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+    assert [response.get("id") for response in responses] == [1, 2, 3, 4]
+    assert all("error" not in response for response in responses), responses
+    return responses
 
 
 def _close(conn, **kwargs):
@@ -447,7 +459,8 @@ def test_a_normaliser_matching_substrings_invents_data():
     # Path- and profile-separated spellings still resolve, which is what the
     # wider separator set buys.
     assert runtime_family("hermes@example-profile") == "hermes"
-    assert runtime_family("~/.local/share/hermes-runtimes/example-profile") == "hermes"
+    profile_path = "/".join(("~", ".local", "share", "hermes-runtimes", "example-profile"))
+    assert runtime_family(profile_path) == "hermes"
     assert runtime_family("hermes:example-worker") == "hermes"
 
 
@@ -646,54 +659,57 @@ def test_every_non_completion_status_owes_an_explanation(tmp_path):
     assert receipt["awaiting"] != receipt["unresolved"]
 
 
-def test_an_existing_core_gains_the_columns_before_the_first_closeout_lands(tmp_path):
-    """The live core is 208 MB and predates all three columns.
+@pytest.mark.parametrize(
+    ("fixture_name", "strict_v1"),
+    (("strict-v1.sql", True), ("v0.sql", False)),
+)
+def test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write(
+    tmp_path: Path, fixture_name: str, strict_v1: bool
+) -> None:
+    """Actual 11c69f6 stores choose their dialect and survive their first I/O."""
+    path = _materialize_pre_pr59_fixture(tmp_path, fixture_name)
+    before = connect(path)
+    assert is_core_v1(before) is strict_v1
+    if strict_v1:
+        assert before.execute(
+            "SELECT value FROM schema_meta WHERE key='core_schema'"
+        ).fetchone()[0] == "ocbrain.core.v1"
+    else:
+        assert not before.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+        ).fetchone()
+    assert "session_id_source" not in {
+        row[1] for row in before.execute("PRAGMA table_info(retrieval_uses)")
+    }
+    assert not {
+        "session_id_source",
+        "runtime_family",
+        "unresolved",
+    } & {row[1] for row in before.execute("PRAGMA table_info(task_closeouts)")}
+    before.close()
 
-    ``CREATE TABLE IF NOT EXISTS`` means a fresh core gets them from the schema
-    and proves nothing about an existing one. The write path names all three, so
-    without the additive migration the first ``brain.closeout`` after deploy
-    fails on an unknown column -- and a fresh-core test cannot see that.
-    """
-    path = tmp_path / "legacy-core.sqlite"
-    conn = connect(path)
-    _init_pre_closeout_discipline_schema(conn, CORE_V1_SCHEMA, core_v1=True)
-    conn.commit()
-    present = {row[1] for row in conn.execute("PRAGMA table_info(task_closeouts)")}
-    assert not present & {"session_id_source", "runtime_family", "unresolved"}
-    with pytest.raises(sqlite3.OperationalError):
-        _close(conn, task_ref="before-migration")
+    responses = _mcp_bootstrap_round_trip(path)
+    tool_names = {tool["name"] for tool in responses[1]["result"]["tools"]}
+    assert ("brain.supersede" in tool_names) is strict_v1
+    context_payload = json.loads(responses[2]["result"]["content"][0]["text"])
+    closeout_payload = json.loads(responses[3]["result"]["content"][0]["text"])
+    assert context_payload["retrieval_use_status"] == "recorded"
+    assert closeout_payload["status"] == "completed"
 
-    assert migrate_core_v1_columns(conn)
-    conn.commit()
-    receipt = _close(conn, task_ref="after-migration")
-    conn.commit()
-    row = conn.execute(
-        "SELECT session_id_source, runtime_family, unresolved FROM task_closeouts "
-        "WHERE id=?",
-        (receipt["id"],),
+    migrated = connect(path)
+    assert is_core_v1(migrated) is strict_v1
+    retrieval = migrated.execute(
+        "SELECT session_id_source FROM retrieval_uses ORDER BY served_at DESC LIMIT 1"
     ).fetchone()
-    assert row["session_id_source"] == "none"
-    assert row["runtime_family"] == "unknown"
-    assert row["unresolved"] is None
-
-
-def test_the_legacy_initializer_also_migrates_an_existing_database(tmp_path):
-    """``db.init_db`` carries its own copy of the schema and its own migration
-    list. Both have to add the columns, or a legacy store is broken by a deploy
-    the v1 core survived."""
-    conn = connect(tmp_path / "legacy.sqlite")
-    _init_pre_closeout_discipline_schema(conn, LEGACY_SCHEMA, core_v1=False)
-    conn.commit()
-    with pytest.raises(sqlite3.OperationalError):
-        _close(conn, task_ref="before-migration")
-
-    init_db(conn)
-    conn.commit()
-    receipt = _close(conn, task_ref="after-migration")
-    conn.commit()
-    assert conn.execute(
-        "SELECT runtime_family FROM task_closeouts WHERE id=?", (receipt["id"],)
-    ).fetchone()["runtime_family"] == "unknown"
+    closeout = migrated.execute(
+        "SELECT session_id_source, runtime_family, unresolved "
+        "FROM task_closeouts WHERE task_ref='fixture-write'"
+    ).fetchone()
+    assert retrieval["session_id_source"] == "server_connection"
+    assert closeout["session_id_source"] == "server_connection"
+    assert closeout["runtime_family"] == closeout_payload["provenance"]["runtime_family"]
+    assert closeout["unresolved"] is None
+    migrated.close()
 
 
 def test_a_misspelled_policy_falls_back_instead_of_taking_the_write_path_down(
@@ -887,7 +903,7 @@ def test_is_runtime_session_id_admits_exactly_the_two_machine_shapes():
     """
     admitted = {
         "018f27db-3a4c-7b19-92ef-123456789abc": True,
-        "0123456789abcdef0123456789abcdef01234567": True,
+        "0123456789abcdef" * 2 + "01234567": True,
         "ab" * 16: True,
         "example_cleanup_audit": False,
         "2026-07-22": False,
@@ -1013,7 +1029,8 @@ def test_the_mining_taxonomy_no_longer_matches_family_tokens_as_substrings():
     # than riding on a substring of the family name: 3 live rows.
     assert normalize_runtime("HermesWork") == "hermes"
     assert normalize_runtime("telegram") == "hermes"
-    assert normalize_runtime("~/.local/share/hermes-runtimes/example-profile") == "hermes"
+    profile_path = "/".join(("~", ".local", "share", "hermes-runtimes", "example-profile"))
+    assert normalize_runtime(profile_path) == "hermes"
     # 13 live rows. procmine still places them, by "local" -- never by "cli".
     assert normalize_runtime("local macOS + analytics ClickHouse") == (
         "unattributed-local"
@@ -1204,37 +1221,3 @@ def test_a_junk_harness_hint_never_wins_the_retrieval_column_either(tmp_path):
     ).fetchone()
     assert row["session_id"] == f"{SERVER_CONNECTION_SESSION_PREFIX}{'ef' * 16}"
     assert row["session_id_source"] == "server_connection"
-
-
-def test_an_existing_core_gains_the_retrieval_column_before_the_first_read(tmp_path):
-    """Same argument as the closeout columns: the live core predates it."""
-    path = tmp_path / "legacy-core.sqlite"
-    conn = connect(path)
-    _init_pre_closeout_discipline_schema(conn, CORE_V1_SCHEMA, core_v1=True)
-    conn.commit()
-    with pytest.raises(sqlite3.OperationalError):
-        _v1_retrieval(conn, None)
-
-    assert migrate_core_v1_columns(conn)
-    conn.commit()
-    rid = _v1_retrieval(conn, None)
-    conn.commit()
-    assert conn.execute(
-        "SELECT session_id_source FROM retrieval_uses WHERE id=?", (rid,)
-    ).fetchone()["session_id_source"] == "none"
-
-
-def test_the_legacy_initializer_also_adds_the_retrieval_column(tmp_path):
-    conn = connect(tmp_path / "legacy.sqlite")
-    _init_pre_closeout_discipline_schema(conn, LEGACY_SCHEMA, core_v1=False)
-    conn.commit()
-    with pytest.raises(sqlite3.OperationalError):
-        log_retrieval_use(conn, None, runtime="mcp", task_ref="t", outcome="served")
-
-    init_db(conn)
-    conn.commit()
-    rid = log_retrieval_use(conn, None, runtime="mcp", task_ref="t", outcome="served")
-    conn.commit()
-    assert conn.execute(
-        "SELECT session_id_source FROM retrieval_uses WHERE id=?", (rid,)
-    ).fetchone()["session_id_source"] == "none"

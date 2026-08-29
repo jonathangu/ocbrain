@@ -307,7 +307,7 @@ def test_the_confidence_prior_term_is_switchable_and_reported(
     on = _local(armed_core, query)
     assert on["ranking"]["confidence_prior_enabled"] is True
 
-    monkeypatch.setenv("OCBRAIN_RETRIEVAL_CONFIDENCE_PRIOR_ENABLED", "0")
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_" "CONFIDENCE_PRIOR_ENABLED", "0")
     off = _local(armed_core, query)
     assert off["ranking"]["confidence_prior_enabled"] is False
 
