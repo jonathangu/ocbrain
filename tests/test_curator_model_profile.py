@@ -11,6 +11,7 @@ the one configuration that would make it useless while looking configured.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -112,17 +113,28 @@ def _retired_id_findings(files: dict[str, str]) -> list[str]:
 
 def _repo_text_files() -> dict[str, str]:
     root = Path(__file__).parents[1]
-    skip = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".ruff_cache"}
     files = {}
-    for path in root.rglob("*"):
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "-z"], cwd=root
+    ).decode("utf-8").split("\0")
+    for relative in tracked:
+        if not relative:
+            continue
+        path = root / relative
         if not path.is_file() or path.suffix not in SCANNED_SUFFIXES:
             continue
-        if skip & set(path.relative_to(root).parts):
-            continue
-        # Read as text with replacement rather than shelling out to grep: a NUL
-        # byte silently turns BSD grep into a tool that reports nothing.
-        files[str(path.relative_to(root))] = path.read_text(encoding="utf-8", errors="replace")
+        files[relative] = path.read_text(encoding="utf-8", errors="replace")
     return files
+
+
+def test_retired_model_repo_scan_is_bounded_to_tracked_files() -> None:
+    root = Path(__file__).parents[1]
+    tracked = set(
+        subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
+        .decode("utf-8")
+        .split("\0")
+    )
+    assert set(_repo_text_files()) <= tracked
 
 
 def test_the_retired_model_scan_can_report_dirty() -> None:
