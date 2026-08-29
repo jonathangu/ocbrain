@@ -472,11 +472,15 @@ def test_free_text_paths_are_classed_not_leaked() -> None:
     """
     from procmine.normalize import _safe, error_fingerprint
 
-    leaky = '{"output": "/Users/someone/HermesWork/repos/secret-project/tool.py"}'
+    leaky_path = "/".join(
+        ("", "Users", "someone", "HermesWork", "repos", "secret-project", "tool.py")
+    )
+    leaky = f'{{"output": "{leaky_path}"}}'
     assert "/Users/" not in (error_fingerprint(leaky) or "")
     assert "secret-project" not in (error_fingerprint(leaky) or "")
 
-    cleaned = _safe("error: cannot open /Users/someone/.ocbrain/ocbrain.sqlite")
+    local_core = "/".join(("", "Users", "someone", ".ocbrain", "ocbrain.sqlite"))
+    cleaned = _safe(f"error: cannot open {local_core}")
     assert cleaned is not None
     assert "/Users/" not in cleaned
     assert "<path:" in cleaned

@@ -638,3 +638,57 @@ def test_mcp_non_lock_error_not_retried(monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         mcp._call_tool_with_lock_retry(_FakeConn(), {"name": "brain.ingest"})
     assert calls["n"] == 1  # not retried
+
+
+def test_request_exception_rolls_back_failed_closeout_before_next_commit(tmp_path, monkeypatch):
+    """A serialized MCP error must not leave its partial writes pending."""
+    from ocbrain import mcp_v1
+    from ocbrain.core_v1 import init_core_v1
+
+    db_path = tmp_path / "core.sqlite"
+    conn = connect(db_path)
+    init_core_v1(conn)
+    observer = connect(db_path)
+    real_record_evidence = mcp_v1.record_core_v1_evidence
+    failed_once = False
+
+    def fail_after_receipt(*args, **kwargs):
+        nonlocal failed_once
+        if kwargs.get("kind") == "task_closeout_summary" and not failed_once:
+            failed_once = True
+            raise RuntimeError("fault after closeout receipt insert")
+        return real_record_evidence(*args, **kwargs)
+
+    monkeypatch.setattr(mcp_v1, "record_core_v1_evidence", fail_after_receipt)
+
+    def closeout(task_ref: str):
+        return handle_request(
+            conn,
+            {
+                "jsonrpc": "2.0",
+                "id": task_ref,
+                "method": "tools/call",
+                "params": {
+                    "name": "brain.closeout",
+                    "arguments": {
+                        "task_ref": task_ref,
+                        "status": "completed",
+                        "summary": f"{task_ref} closeout completed.",
+                        "decision_impact": "none",
+                        "context": {"project": "test", "task": task_ref},
+                    },
+                },
+            },
+        )
+
+    failed = closeout("FIRST-FAILED")
+    assert failed["error"]["code"] == -32000
+    assert conn.execute("SELECT COUNT(*) FROM task_closeouts").fetchone()[0] == 0
+    assert observer.execute("SELECT COUNT(*) FROM task_closeouts").fetchone()[0] == 0
+
+    succeeded = closeout("SECOND-SUCCEEDS")
+    assert "result" in succeeded
+    assert [
+        row["task_ref"]
+        for row in observer.execute("SELECT task_ref FROM task_closeouts ORDER BY task_ref")
+    ] == ["SECOND-SUCCEEDS"]

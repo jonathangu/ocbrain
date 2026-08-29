@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -31,4 +33,21 @@ jobs:
       - name: Compile
         run: python -m compileall -q src tests
       - name: Public-safety scan
-        run: ocbrain public-safety-check --root "$GITHUB_WORKSPACE"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            base_commit="${{ github.event.pull_request.base.sha }}"
+            head_commit="${{ github.event.pull_request.head.sha }}"
+          else
+            base_commit="${{ github.event.before }}"
+            head_commit="$GITHUB_SHA"
+          fi
+          if [[ -z "$base_commit" || "$base_commit" =~ ^0+$ || -z "$head_commit" ]]; then
+            echo "public-safety: a real base/head diff range is required in CI" >&2
+            exit 1
+          fi
+          git cat-file -e "${base_commit}^{commit}"
+          git cat-file -e "${head_commit}^{commit}"
+          ocbrain public-safety-check --root "$GITHUB_WORKSPACE" \
+            --diff-range "${base_commit}..${head_commit}"

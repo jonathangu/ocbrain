@@ -757,6 +757,67 @@ def test_cli_dry_run_is_the_default_and_writes_nothing(tmp_path, capsys, monkeyp
     assert get_core_v1_belief(conn, "belief_drop")["status"] == "current"
 
 
+def test_cli_local_compaction_supports_active_local_only_policy(
+    tmp_path, capsys, monkeypatch
+):
+    from ocbrain.cli import main
+
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "KIMI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    conn = _core(tmp_path)
+    local_scope = ScopeTag(
+        "project",
+        "project:test",
+        visibility="internal",
+        egress_policy="local_only",
+        provenance="test",
+    )
+    body = "the nightly job publishes a receipt and then exits"
+    _seed(conn, belief_id="belief_keep", body=body, confidence=0.9, scope=local_scope)
+    _seed(conn, belief_id="belief_drop", body=body, confidence=0.7, scope=local_scope)
+    conn.close()
+    _sidecar(tmp_path, {"belief_keep": NEAR_A, "belief_drop": NEAR_A})
+    db = tmp_path / "core.sqlite"
+    config_path = tmp_path / "ocbrain.config.json"
+    config_path.write_text(
+        json.dumps({"curator": {"egress_policies": ["local_only"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(config_path))
+
+    assert main(["--db", str(db), "compact"]) == 0
+    report = capsys.readouterr().out
+    assert "DRY RUN. Nothing was written." in report
+    assert "belief_keep" in report and "belief_drop" in report
+
+
+def test_hosted_compaction_rejects_local_only_selection_policy(tmp_path):
+    conn = _core(tmp_path)
+    _seed(
+        conn,
+        belief_id="belief_a",
+        body="the first phrasing of a durable fact",
+        scope=PROJECT_SCOPE,
+    )
+    _seed(
+        conn,
+        belief_id="belief_b",
+        body="a second and quite different phrasing",
+        scope=PROJECT_SCOPE,
+    )
+    _sidecar(tmp_path, {"belief_a": NEAR_A, "belief_b": NEAR_B})
+
+    def explode(members, beliefs):  # pragma: no cover - must never run
+        raise AssertionError("local_only policy reached a hosted adjudicator")
+
+    with pytest.raises(ValueError, match="local_only.*hosted curator"):
+        plan_compaction(
+            conn,
+            adjudicator=explode,
+            egress_policies=(policy for policy in ("hosted_ok", "local_only")),
+        )
+
+
 def test_cli_requires_explicit_authority_before_building_a_hosted_adjudicator(
     tmp_path, monkeypatch
 ):

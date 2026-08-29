@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from ocbrain.core_v1 import is_core_v1
 from ocbrain.db import now_iso
 from ocbrain.events import canonical_json, sha256_text
 from ocbrain.ids import stable_id
@@ -34,7 +35,19 @@ def build_context(
     same transaction as its retrieval-use receipt.  A descriptor is useful only
     after :func:`issue_source_handles` succeeds; callers must remove descriptors
     if that write is unavailable.
+
+    Refuses a v1 core.  The call below is the retired legacy blend ranker, and
+    a v1 core would be ranked by it silently — ``current_beliefs`` is a table
+    name both schemas share, so nothing else would fail.  The v1 route is
+    :func:`ocbrain.mcp_v1.build_context_v1`.  Keeping the guard in the frame
+    that makes the legacy call, rather than only in the one caller that
+    currently sits below one, is what stops a second caller reopening the mix.
     """
+    if is_core_v1(conn):
+        raise ValueError(
+            "build_context is the legacy v0 packet builder and must not run on a "
+            "v1 core; use ocbrain.mcp_v1.build_context_v1"
+        )
     resolved = context or ScopeContext()
     raw = retrieve(
         conn,

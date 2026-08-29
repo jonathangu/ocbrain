@@ -1,11 +1,12 @@
 """ocbrain configuration surface.
 
-Five sections, one per thing that actually reads configuration: ``retrieval``
+Six sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
-closeout gate), and ``supersede`` (how much authority a runtime supersession
-carries). There were seventeen; thirteen configured subsystems that were
-deleted or were never read at all.
+closeout slop gate), ``closeout`` (the write-time closeout identity and failure
+gates), and ``supersede`` (how much authority a runtime supersession carries).
+There were seventeen; thirteen configured subsystems that were deleted or were
+never read at all.
 
 The public entry point is :func:`load_config`, which layers, in order:
 
@@ -45,6 +46,22 @@ USER_CONFIG_PATH = Path("~/.ocbrain/ocbrain.config.json").expanduser()
 LEGACY_CONFIG_PATH = Path("data/ocbrain.config.json")
 
 
+class ConfigError(RuntimeError):
+    """The operator config file exists but cannot be used.
+
+    Deliberately ``RuntimeError`` and not ``ValueError``: ``json.JSONDecodeError``
+    *is* a ``ValueError``, and the curator's per-claim guard catches
+    ``ValueError`` to mean "this target was previously tombstoned". A malformed
+    config riding that channel once reported every claim in a run as blocked --
+    a silent supersession outage whose log said nothing about the file that
+    caused it. A config problem must name itself, once, loudly.
+
+    Note the asymmetry this preserves: a *retired key* in the file is tolerated
+    by design (see the module docstring); a file that is not JSON is a different
+    class of problem and is never tolerated.
+    """
+
+
 def default_config_path() -> Path:
     """Resolve the config path: ``$OCBRAIN_CONFIG``, then user, then legacy."""
     if override := os.environ.get("OCBRAIN_CONFIG"):
@@ -80,6 +97,17 @@ class RetrievalConfig:
     min_lexical_query_term_matches: int = 2
     min_redundant_lexical_strength_ratio: float = 0.50
     require_dense_support: bool = True
+    # Whether `ranking_prior` keeps its `0.85 + 0.15 * confidence` term.
+    #
+    # `confidence` is authored, not measured: 345 of the 347 serving beliefs on
+    # the reference corpus carry one, all in [0.65, 1.0], and 116 of them are
+    # the same round 0.85. Joined to recorded feedback it points the wrong way
+    # -- packets judged irrelevant or harmful held items averaging 0.8707,
+    # packets judged used or helpful averaged 0.7263 -- so the term rewards the
+    # rows readers liked least. Whether that means the term should go or the
+    # number should be re-derived is an operator decision, so this ships True:
+    # the default reproduces every packet built to date.
+    confidence_prior_enabled: bool = True
     # Retrieval feedback shifts a belief's score by ``1 + boost``. The boost is
     # ``avg_signal * weight``, damped by observation count and clamped to
     # +/-``feedback_clamp``. Set ``feedback_weight`` to 0 to ignore feedback.
@@ -119,9 +147,8 @@ class CuratorConfig:
     #
     # `egress_policies` is the operator's standing declaration of intent. It
     # ships as `hosted_ok` only, so a fresh install sends nothing it was not
-    # explicitly given. An operator running a brain whose evidence is all
-    # `local_only` -- the default for anything written through a client -- can add
-    # that policy here to let their own curator read their own notes.
+    # explicitly given. `local_only` is rejected: using that material with this
+    # hosted curator requires an explicit reclassification before selection.
     #
     # Two things are NOT configurable and are enforced in code regardless:
     # `prohibited` egress and `secret` visibility are never eligible. Those are
@@ -148,6 +175,57 @@ class CuratorConfig:
     # to curate every project with any eligible evidence at all.
     min_evidence_per_project: int = 3
 
+    # What a new-key claim gets when the duplicate gate cannot see the corpus --
+    # no sidecar, no local embedder, a model digest that moved. `pend` records
+    # the claim as an undecided proposal instead of minting it; `admit` mints it,
+    # which is the behaviour that let one fact reach the corpus five times under
+    # five keys. Fail-closed by default: a gate that disappears when its
+    # instrument is down is the gate this repo keeps finding, and pending loses
+    # nothing -- the claim is in the ledger, and an identical re-derivation on
+    # the next cycle writes nothing at all.
+    duplicate_gate_fallback: str = "pend"
+
+    # How many candidate bodies one duplicate-gate call may embed on demand --
+    # the beliefs written since the last sidecar build, whose stored vectors no
+    # longer match. Past this, the extra candidates are reported as `uncovered`,
+    # the gate reports itself unavailable, and `duplicate_gate_fallback` decides.
+    # So on the `pend` default this is an availability cliff: a cycle that
+    # touches more than this many beliefs pends the rest of its claims rather
+    # than compiling them. Raise it (each extra candidate is one local embedding
+    # call) if your cycles are larger than this; do not lower it expecting a
+    # cheaper gate, because what gets cheaper is the gate refusing to answer.
+    document_embed_budget: int = 32
+
+    # Whether a claim's TTL comes from its volatility class (a host name expires
+    # in days, a measurement in weeks, doctrine not at all) or from the single
+    # `current_ttl_days` number that lifecycle used to buy. Applies to newly
+    # compiled claims only; existing beliefs are re-dated by the explicit
+    # `wiki-volatility --apply` maintenance command, never by a background sweep.
+    volatility_ttl: bool = True
+    volatile_ttl_days: int = 14
+    measured_ttl_days: int = 45
+
+    # An operator's declared reason for an egress allow-list that admits every
+    # policy the corpus contains. Empty means undeclared, and the selftest
+    # reports the allow-list as vacuous -- a gate no input can fail is a
+    # transmission log, not a control. Set it to say why that is intended here;
+    # the text is recorded with the metric, not just the fact that it was set.
+    egress_allowlist_ack: str = ""
+
+    # Per-cadence model profile. Empty means "same as `provider`/`model`", so an
+    # install that sets neither runs exactly one model, as it does today.
+    nightly_provider: str = ""
+    nightly_model: str = ""
+
+    # An independent critic of a DIFFERENT provider family, consulted only for
+    # high-impact changes: a supersession of a pinned belief or of anything in a
+    # `global:*` scope. Correlated error is the failure this addresses -- one
+    # model grading its own family's output agrees with itself -- so a critic
+    # configured to the curator's own provider is refused rather than run.
+    # Empty `critic_provider` disables it, which is the default.
+    critic_provider: str = ""
+    critic_model: str = ""
+
 
 @dataclass(frozen=True)
 class DeslopConfig:
@@ -158,6 +236,36 @@ class DeslopConfig:
     # the receipt as `slop_findings` so the writer sees them either way; turn
     # this on once you trust the rules against your own corpus.
     reject_closeout_slop: bool = False
+
+
+@dataclass(frozen=True)
+class CloseoutConfig:
+    """Write-time discipline for the closeout receipt.
+
+    ``session_id_policy`` decides what happens to a ``context.session`` that is
+    not the runtime's own id. ``enforce`` (the default) refuses it and names the
+    shape and the env var to read it from; ``quarantine`` keeps the claim in the
+    receipt and out of the identity column; ``off`` restores the pre-2026-08-28
+    behaviour of storing whatever arrived. The gate is always satisfiable --
+    omitting the field is legal and the server fills it from its own connection
+    id -- so no client is ever unable to file a closeout.
+
+    ``require_unresolved`` requires a closeout that is not a clean success to
+    name what did not work. One `failed` closeout in 1,239 over six weeks is not
+    a credible failure rate, and ``brain.ledger``'s whole purpose is surfacing
+    the attempts that did not work.
+
+    ``runtime_aliases`` maps a folded runtime spelling to one of
+    ``closeout.RUNTIME_FAMILIES``, for install-specific labels the shipped rules
+    cannot know -- a Hermes runtime hash, an operator's own ``OCBRAIN_CLIENT``
+    string. Ships EMPTY, like ``scopes.aliases``, because a real fleet's profile
+    names are operator data and this repo is public. An entry whose target is
+    not a known family is ignored rather than fabricating an eighth family.
+    """
+
+    session_id_policy: str = "enforce"
+    require_unresolved: bool = True
+    runtime_aliases: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -205,6 +313,7 @@ class OcbrainConfig:
     scopes: ScopesConfig = field(default_factory=ScopesConfig)
     curator: CuratorConfig = field(default_factory=CuratorConfig)
     deslop: DeslopConfig = field(default_factory=DeslopConfig)
+    closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
 
 
@@ -257,7 +366,9 @@ def load_config(
     """Load config from defaults + optional JSON file + env overrides.
 
     ``path`` defaults to :func:`default_config_path`. A missing file is fine
-    (defaults win). ``env`` defaults to ``os.environ``.
+    (defaults win). ``env`` defaults to ``os.environ``. A file that exists but
+    is not valid JSON raises :class:`ConfigError` -- defaults apply only when
+    the file is absent, never as a silent stand-in for one an operator wrote.
     """
     if env is not None:
         # Temporarily consult the provided mapping for env overrides.
@@ -272,13 +383,75 @@ def load_config(
     return _load_config_from_environ(path)
 
 
+def _read_config_file(config_path: Path) -> dict[str, Any]:
+    """Parse the operator config, refusing loudly what cannot be parsed.
+
+    Without this, every subsystem that lazily consults the config met a broken
+    file in its own place, in its own exception shape, hours apart -- and the
+    one inside the curator's per-claim loop surfaced as "every claim blocked".
+    Name the file and the position once, here, for all of them.
+    """
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"config file {config_path} is unreadable: {exc}") from exc
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"config file {config_path} is not valid JSON "
+            f"(line {exc.lineno}, column {exc.colno}: {exc.msg}); fix or remove "
+            "it -- defaults apply only when the file is absent"
+        ) from exc
+    return loaded if isinstance(loaded, dict) else {}
+
+
+# One parse per config state per process. ``load_config`` sits inside per-claim
+# and per-row paths (the supersede router consults it for every curated claim),
+# and an uncached read is both a real cost and the mechanism that let a file
+# edited mid-run change the answer between two claims of the same cycle. The key
+# mirrors ``scope._scopes_cache_key``: a stat of the resolved file plus every
+# environment variable that can change the layered result.
+_CONFIG_CACHE: tuple[Any, OcbrainConfig] | None = None
+
+
+def _env_override_names() -> tuple[str, ...]:
+    names: list[str] = []
+    defaults = OcbrainConfig()
+    for f in fields(defaults):
+        section = getattr(defaults, f.name)
+        if not is_dataclass(section):
+            continue
+        for sf in fields(section):
+            names.append(f"OCBRAIN_{f.name.upper()}_{sf.name.upper()}")
+    return tuple(names)
+
+
+_ENV_OVERRIDE_NAMES = _env_override_names()
+
+
+def _config_cache_key(config_path: Path) -> Any:
+    stamp: tuple[str, int, int] | tuple[str] = (str(config_path),)
+    try:
+        info = config_path.stat()
+        stamp = (str(config_path), info.st_mtime_ns, info.st_size)
+    except OSError:
+        pass  # absent file: the path alone identifies the (defaults-only) state
+    env_state = tuple(
+        (name, os.environ[name]) for name in _ENV_OVERRIDE_NAMES if name in os.environ
+    )
+    return (stamp, os.environ.get("OCBRAIN_CONFIG"), env_state)
+
+
 def _load_config_from_environ(path: Path | str | None) -> OcbrainConfig:
+    global _CONFIG_CACHE
     config_path = Path(path).expanduser() if path is not None else default_config_path()
+    key = _config_cache_key(config_path)
+    if _CONFIG_CACHE is not None and _CONFIG_CACHE[0] == key:
+        return _CONFIG_CACHE[1]
     file_data: dict[str, Any] = {}
     if config_path.exists():
-        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            file_data = loaded
+        file_data = _read_config_file(config_path)
 
     cfg = OcbrainConfig()
     section_changes: dict[str, Any] = {}
@@ -293,7 +466,9 @@ def _load_config_from_environ(path: Path | str | None) -> OcbrainConfig:
         overrides.update(_env_overrides(f.name, section))
         if overrides:
             section_changes[f.name] = _apply_section_overrides(section, overrides)
-    return replace(cfg, **section_changes) if section_changes else cfg
+    resolved = replace(cfg, **section_changes) if section_changes else cfg
+    _CONFIG_CACHE = (key, resolved)
+    return resolved
 
 
 def describe_config(path: Path | str | None = None) -> dict[str, Any]:
@@ -307,9 +482,7 @@ def describe_config(path: Path | str | None = None) -> dict[str, Any]:
     config_path = Path(path).expanduser() if path is not None else default_config_path()
     file_data: dict[str, Any] = {}
     if config_path.exists():
-        loaded = json.loads(config_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
-            file_data = loaded
+        file_data = _read_config_file(config_path)
     effective = load_config(config_path)
     defaults = OcbrainConfig()
 

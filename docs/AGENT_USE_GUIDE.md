@@ -103,6 +103,14 @@ Use the packet's `retrieval_use_id` and one honest outcome:
 - `ignored` — deliberately not used;
 - `harmful` — would have caused a worse decision.
 
+Every one of these judges *served items*, so on a v1 core a retrieval that
+returned nothing is refused with an error rather than recorded. The server
+writes that case itself, as `no_coverage`, when it writes the receipt;
+`no_coverage` is not a value a caller can file. A legacy v0 core neither records
+nor refuses it — its `outcome` CHECK has no such value and its receipts do not
+carry an item count on every path — so there the same rule holds as an
+instruction only, and the server says so in its own instruction block.
+
 Feedback is not a durable correction. Admin-only `brain.correct` records a
 later semantic constraint.
 
@@ -115,6 +123,31 @@ reference. This emits evidence; it does not directly promote a belief.
 
 Append an `ocbrain.closeout.v1` receipt. Required fields are status and summary;
 use a stable task reference. Blocked status also requires what is awaited.
+
+Two write-time gates, both enforced in the server rather than asked for here:
+
+- **`context.session` must be the runtime's own session id** — a UUID, or a bare
+  32/40-character hex id — or be omitted entirely, in which case the server fills
+  the column from its own connection id and says so in `session_id_source`. A
+  slug, a date, a task name or a file path is refused with an error naming
+  `$CLAUDE_CODE_SESSION_ID` and `$OCBRAIN_SESSION_ID`. Never invent one: of the
+  597 hand-written session ids in this core, zero join a transcript, and that
+  join is the only thing that makes a closeout's tool-call trace minable.
+  `context.runtime` names the *client*, grouped into one of `claude-code`,
+  `codex`, `cursor`, `hermes`, `mcp`, `cli`, `unknown`; the environment
+  ("analytics ClickHouse", "launchd", "zone-a") goes in `runtime_detail`.
+- **`unresolved` is required unless the receipt is a clean success** — status
+  `completed` with no verifier reporting `failed`. State what did not work and is
+  still not working. A `completed` carrying a failed verifier is allowed (a
+  read-only audit whose verdict is FAIL is a successful audit), but it owes the
+  sentence, because `brain.ledger` reads this to stop the next session repeating
+  the attempt. It comes back on every `failed_attempts` row and as the entry's
+  `latest_unresolved`, and it is what the briefing's FAILED line prints.
+
+`brain.context` and `brain.feedback` resolve `context.session` the same way, but
+never refuse: a read receipt with a hand-written session label is written with
+the server's own connection id in the column and the claim kept beside it. Only
+`brain.closeout` refuses, because it is a write you chose to make and can retry.
 
 Link:
 
@@ -188,7 +221,9 @@ evidence and is what a reviewer reads.
 In one transaction the old belief stops serving and leaves the search index, its
 era is closed with `valid_until`, the replacement is compiled and served in the
 **same scope**, and the old id is left pointing forward. Nothing is deleted: the
-retired belief keeps its body, its evidence, and its feedback history.
+retired belief keeps its body, its evidence, and its feedback history — and the
+replacement now *ranks on* that history, walking the era pointers back through
+every generation, so a fact does not lose its record each time it is recompiled.
 
 Three things the tool does deliberately, so you are not surprised by them:
 

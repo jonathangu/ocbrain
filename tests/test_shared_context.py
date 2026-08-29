@@ -250,7 +250,10 @@ def test_closeout_is_append_only_and_marks_decision_impact(tmp_path):
                             ),
                         }
                     ],
-                    "context": {"runtime": "codex", "session": "session-1"},
+                    "context": {
+                        "runtime": "codex",
+                        "session": "4b749047-ed58-473e-8115-231c1e23a9e4",
+                    },
                 },
             },
         },

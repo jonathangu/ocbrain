@@ -125,6 +125,18 @@ Acceptance requires evidence from the core database:
 An honestly empty context packet is not a full source-expansion acceptance. Seed
 or migrate at least one scoped, serving belief with source evidence first.
 
+An acceptance run will hit the write-time identity gate, so know it before you
+debug it. `brain.closeout` **refuses** a `context.session` that is not the
+runtime's own id — a UUID, or a bare 32/40-character hex id — and the error names
+`$CLAUDE_CODE_SESSION_ID` and `$OCBRAIN_SESSION_ID`. Omitting the field entirely
+is legal and is the right answer for a client that multiplexes sessions over one
+MCP child: the server then records its own connection id under a `conn:` prefix
+and says so in `session_id_source`. A closeout that is not `completed`-with-no-
+failed-verifier must also carry `unresolved`. Both refusals are reported
+together, so one retry clears both. `brain.context` and `brain.feedback` never
+refuse; they quarantine instead. See `docs/THRESHOLDS.md` §E for the numbers and
+`closeout.session_id_policy` for the operator switch.
+
 ## Closeout chains
 
 A second closeout on the same task is a continuation, not a duplicate. Two

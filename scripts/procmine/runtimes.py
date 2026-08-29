@@ -11,15 +11,25 @@ provenance carry 129 distinct ``served_to_runtime`` spellings and ~170 distinct
 closeout ``runtime`` values, and any analysis over them has to fold those
 together somehow. That is a mining concern, so the folder lives here.
 
-Two folders, answering two different questions, deliberately kept apart:
+Three folders now exist, answering three different questions. They are kept
+apart on purpose, and the boundaries are asserted rather than described --
+``tests/test_closeout_discipline.py`` compares all three over the live runtime
+census and fails if any two contradict each other:
 
-* :func:`canonical_runtime` -- collapse spellings of the *same* client to one
-  slug, and keep an unrecognized runtime legible rather than bucketing it.
-  Returns ``None`` for "not reported", which is different from "reported but
-  unrecognized".
+* :func:`ocbrain.closeout.runtime_family` -- the write path's folder, and the
+  only one a served column depends on. Segment-matched, pure, and confined to
+  the client families a public repository can know; an install's own labels go
+  in ``closeout.runtime_aliases``.
 * :func:`procmine.episodes.normalize_runtime` -- assign a runtime to one of a
   fixed set of *families* for grouping, and answer ``"unknown"`` when it cannot
   place one. It must not invent a family, so it never falls through to a slug.
+  It asks the shared folder above first and adds only the install-specific
+  tokens on top, so it is a superset of it rather than a rival.
+* :func:`canonical_runtime` -- collapse spellings of the *same* client to one
+  slug, and keep an unrecognized runtime legible rather than bucketing it.
+  Returns ``None`` for "not reported", which is different from "reported but
+  unrecognized". Deliberately NOT folded into the families: a slug that is not
+  a family is this function's whole output contract.
 """
 
 from __future__ import annotations

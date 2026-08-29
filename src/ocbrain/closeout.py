@@ -18,6 +18,12 @@ CLOSEOUT_STATUSES = {"completed", "partial", "blocked", "failed", "cancelled"}
 DECISION_IMPACTS = {"none", "informed", "changed", "prevented_error", "unknown"}
 VERIFIER_STATUSES = {"passed", "failed", "unknown", "not_required"}
 
+# A closeout is a clean success only when the agent claims completion AND no
+# verifier it filed says otherwise. Everything else -- every non-completed
+# status, and a `completed` carrying a failed verifier -- has to name what did
+# not work. See ``_requires_unresolved``.
+CLEAN_SUCCESS_STATUSES = {"completed"}
+
 # Wrapper syntax clients paste in front of an otherwise-fine reference, so that
 # `ocbrain:COFASC-292` and `COFASC-292` land in the same chain. Matched
 # case-insensitively because the wrapper is punctuation, not identity.
@@ -59,6 +65,274 @@ def normalize_task_ref(task_ref: Any) -> str:
     return (stripped or collapsed)[:MAX_TASK_REF_NORM]
 
 
+# --------------------------------------------------------------------------- #
+# Session identity
+# --------------------------------------------------------------------------- #
+
+# The two shapes a runtime actually mints. Claude Code writes a hyphenated UUID
+# that is byte-identical to its transcript filename; Codex writes a UUIDv7 in the
+# same shape; a bare 32- or 40-char hex digest is the other machine-minted form
+# seen in the wild (Hermes runtime ids). Everything else in the live corpus is a
+# human typing something they thought was descriptive.
+_UUID_SESSION = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_HEX_SESSION = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40})$")
+_DATE_SESSION = re.compile(r"^\d{4}-?\d{2}-?\d{2}")
+_PATH_SESSION = re.compile(r"[/\\]|^~")
+
+# Shapes that ARE a runtime id. Membership, not a regex, so a caller can ask.
+RUNTIME_SESSION_SHAPES = frozenset({"runtime_uuid", "runtime_hex"})
+
+# Where the id in ``task_closeouts.session_id`` came from, in descending trust.
+# Recorded beside the value so nobody has to guess later which rows are joinable.
+SESSION_ID_SOURCES = frozenset(
+    {"harness_attested", "agent_reported", "server_connection", "none"}
+)
+# Server-minted fallback ids wear a prefix. A connection id is NOT a transcript
+# id and must never be mistaken for one by a later join; the prefix makes that
+# structural rather than a convention somebody has to remember.
+SERVER_CONNECTION_SESSION_PREFIX = "conn:"
+
+# What happens to a session id that is not runtime-shaped.
+#   ``enforce``     refuse the closeout, naming the shape and where to get one.
+#   ``quarantine``  keep the claim in the receipt, keep it out of the identity
+#                   column, and fall through to the server-observed id.
+#   ``off``         the pre-2026-08-28 behaviour: store whatever was sent.
+SESSION_ID_POLICIES = frozenset({"enforce", "quarantine", "off"})
+
+# Synthetic but shape-valid, so public error output teaches the contract without
+# publishing a caller's real session identifier.
+_EXAMPLE_SESSION_ID = "018f27db-3a4c-7b19-92ef-123456789abc"
+
+
+def classify_session_id(value: Any) -> str:
+    """Name the shape of a claimed session id.
+
+    Returns ``absent`` for nothing at all, one of :data:`RUNTIME_SESSION_SHAPES`
+    for a machine-minted id, and otherwise the specific way it is wrong --
+    ``filesystem_path``, ``contains_space``, ``date_like``, ``slug`` -- so the
+    refusal can say what the caller actually sent.
+
+    Measured over the 1,239 closeouts in a read-only backup of the live core
+    taken 2026-08-28 12:30 PDT: 211 ``runtime_uuid``, 431 ``absent``, 296
+    ``date_like``, 239 ``slug``, 35 ``contains_space``, 27 ``filesystem_path``.
+    Every one of the 94 closeouts that joins a Claude Code transcript is
+    ``runtime_uuid``; the other 1,145 join nothing, which is what makes this a
+    shape question rather than a taste question.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return "absent"
+    text = value.strip()
+    if _UUID_SESSION.match(text):
+        return "runtime_uuid"
+    if _HEX_SESSION.match(text):
+        return "runtime_hex"
+    if _PATH_SESSION.search(text):
+        return "filesystem_path"
+    if any(char.isspace() for char in text):
+        return "contains_space"
+    if _DATE_SESSION.match(text):
+        return "date_like"
+    return "slug"
+
+
+def is_runtime_session_id(value: Any) -> bool:
+    """Whether ``value`` is a machine-minted session id rather than a label."""
+    return classify_session_id(value) in RUNTIME_SESSION_SHAPES
+
+
+def _session_id_error(claim: str, shape: str) -> str:
+    return (
+        f"context.session must be the runtime's own session id, not {claim!r} ({shape}). "
+        f"A valid one is a UUID like {_EXAMPLE_SESSION_ID}, or a bare 32/40-character "
+        "hex id. Claude Code exports it as $CLAUDE_CODE_SESSION_ID; any other client "
+        "can export $OCBRAIN_SESSION_ID and the server will read it from its own "
+        "environment. If this runtime has no session id, omit context.session "
+        "entirely and the server records its own connection id instead. Do not "
+        "invent one: of the 597 hand-written session ids in this core, zero join "
+        "a transcript."
+    )
+
+
+def resolve_session_identity(
+    claim: Any,
+    observed: Provenance,
+    *,
+    policy: str = "enforce",
+) -> dict[str, Any]:
+    """Decide what goes in the identity column, and say where it came from.
+
+    Precedence is descending trust, which is the opposite of descending
+    convenience:
+
+    1. ``client_session_hint`` -- read by the server from its own process
+       environment, so no model can type it in.
+    2. the caller's ``context.session``, but only if it is runtime-shaped.
+    3. the server's own connection id, prefixed ``conn:``.
+    4. nothing.
+
+    A caller that supplies a non-runtime-shaped id is refused under the default
+    ``enforce`` policy. The gate is always satisfiable: omitting the field is
+    legal and lands on rule 3 or 4, so no client is ever unable to file a
+    closeout. What it is not is *silently* satisfiable -- the error is the only
+    channel that has ever reached the agent, and six weeks of prose guidance
+    moved the UUID rate from 15.1% (July) to 19.6% (August).
+
+    The caller's claim is never destroyed. It stays verbatim in
+    ``context.session`` inside the receipt, and is echoed as ``session_id_claim``
+    whenever it differs from what was stored.
+    """
+    if policy not in SESSION_ID_POLICIES:
+        raise ValueError(
+            f"session_id_policy must be one of: {', '.join(sorted(SESSION_ID_POLICIES))}"
+        )
+    claimed = claim.strip() if isinstance(claim, str) and claim.strip() else None
+    shape = classify_session_id(claimed)
+    if policy == "off":
+        return {
+            "session_id": claimed,
+            "session_id_source": "agent_reported" if claimed else "none",
+            "session_id_shape": shape,
+        }
+    if claimed is not None and shape not in RUNTIME_SESSION_SHAPES:
+        if policy == "enforce":
+            raise ValueError(_session_id_error(claimed, shape))
+        claimed = None  # quarantine: recorded below, never stored as identity
+
+    hint = observed.client_session_hint if observed else None
+    hint = hint.strip() if isinstance(hint, str) and hint.strip() else None
+    resolved: dict[str, Any] = {"session_id_shape": shape}
+    if hint is not None and is_runtime_session_id(hint):
+        resolved["session_id"] = hint
+        resolved["session_id_source"] = "harness_attested"
+    elif claimed is not None:
+        resolved["session_id"] = claimed
+        resolved["session_id_source"] = "agent_reported"
+    elif observed is not None and observed.server_connection_id:
+        resolved["session_id"] = (
+            f"{SERVER_CONNECTION_SESSION_PREFIX}{observed.server_connection_id}"
+        )
+        resolved["session_id_source"] = "server_connection"
+    else:
+        resolved["session_id"] = None
+        resolved["session_id_source"] = "none"
+    stored = resolved["session_id"]
+    original = claim.strip() if isinstance(claim, str) and claim.strip() else None
+    if original is not None and original != stored:
+        # Two runtime-shaped ids that disagree is the Claude Code subagent case:
+        # the harness hint is inherited from the parent, the model may know its
+        # own. Both are kept; the server-observed one is what the column serves.
+        resolved["session_id_claim"] = original
+        if shape in RUNTIME_SESSION_SHAPES:
+            resolved["session_id_conflict"] = True
+    return resolved
+
+
+# --------------------------------------------------------------------------- #
+# Runtime family
+# --------------------------------------------------------------------------- #
+
+# ``context.runtime`` was free text and arrived as 160 distinct spellings across
+# 1,239 live closeouts -- five of "local mac", four of "codex desktop", and
+# values like "local macOS + analytics ClickHouse" that describe an
+# environment rather than a client. Nothing can be grouped by that column.
+#
+# These are the client families a closeout can be grouped by. `unknown` is a
+# real member, not a failure: "local", "desktop" and "macOS" name the machine,
+# and inventing a client for them would be guessing.
+RUNTIME_FAMILIES = ("claude-code", "codex", "cursor", "hermes", "mcp", "cli", "unknown")
+
+# Ordered rules, matched against whole segments of the folded spelling. Order is
+# precedence and matters: "local Codex desktop and Hermes gateway" names two,
+# and a stable answer beats an accurate-sounding one. Every token here appears in
+# the live corpus listing; none was invented.
+#
+# Segments, not substrings. A substring match on "cli" classified
+# "local macOS + analytics ClickHouse" (13 live rows) as the CLI family,
+# which is how a normaliser quietly invents data.
+RUNTIME_FAMILY_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    ("claude-code", frozenset({"claude"})),
+    ("codex", frozenset({"codex"})),
+    ("cursor", frozenset({"cursor"})),
+    ("hermes", frozenset({"hermes"})),
+    ("cli", frozenset({"launchd", "cron", "cli", "dagster"})),
+    ("mcp", frozenset({"mcp"})),
+)
+# Whole folded spellings whose family is known but whose tokens cannot safely be
+# added to the rules above. `ocbrain-runtime-call` is set by
+# ``ocbrain.runtime_call`` -- this repo's own one-shot MCP path, 2 live rows --
+# and the sibling mapper in scripts/procmine has placed it since it was written.
+# It is matched exactly rather than by a token because `ocbrain` also appears in
+# `local-agent-mode-ocbrain`, the Claude Code client key on 66 live rows, and
+# folding those into `mcp` would be the invent-a-family failure the segment rule
+# exists to prevent. Anything install-specific goes in ``runtime_aliases``, not
+# here; the bar for this table is a spelling this repository itself emits.
+RUNTIME_FAMILY_EXACT: dict[str, str] = {
+    "ocbrain-runtime-call": "mcp",
+}
+
+# Everything a real spelling uses to join two words: whitespace, punctuation,
+# and the path/profile separators in values like `hermes@example` and
+# `~/hermes/example`.
+_RUNTIME_SEPARATORS = re.compile(r"[^0-9a-z]+")
+
+
+def fold_runtime_label(value: Any) -> str:
+    """Lowercase one runtime spelling and reduce every separator to ``-``."""
+    return _RUNTIME_SEPARATORS.sub("-", str(value or "").strip().lower()).strip("-")
+
+
+def runtime_family(
+    *candidates: Any, aliases: dict[str, str] | None = None
+) -> str:
+    """Map runtime spellings onto one of :data:`RUNTIME_FAMILIES`.
+
+    Candidates are tried in order and the first that resolves wins, so callers
+    pass the server-observed ``client_runtime_key`` before the model's claim:
+    what the process saw outranks what the model typed. A candidate that names
+    only an environment ("local", "macOS") resolves to nothing and falls through
+    to the next one.
+
+    ``aliases`` is the operator's table for install-specific labels, mapping a
+    folded spelling to a family. It ships empty and lives in config for the same
+    reason ``scopes.aliases`` does: a real fleet's profile names are operator
+    data, and this repo is public. Its keys are folded exactly the way a
+    candidate is, so an entry written `{"claude code desktop": ...}` reaches the
+    candidate `claude-code-desktop`; a key that could never match would be a
+    trap with a config file in front of it.
+
+    This is the one runtime folder in the repo that write paths use.
+    ``procmine.episodes.normalize_runtime`` asks it first and only falls through
+    to its own install-specific rules when this abstains, so the two can differ
+    by abstention but never by contradiction --
+    ``tests/test_closeout_discipline.py`` asserts that over the live census.
+
+    Pure and history-independent, so the same function classifies a row written
+    today and a row written in July. ``task_closeouts`` is append-only and
+    historical spellings can never be rewritten in place; this is what keeps
+    them analysable.
+    """
+    table = {
+        fold_runtime_label(k): str(v).strip() for k, v in (aliases or {}).items()
+    }
+    for candidate in candidates:
+        folded = fold_runtime_label(candidate)
+        if not folded:
+            continue
+        mapped = table.get(folded)
+        if mapped in RUNTIME_FAMILIES:
+            return mapped
+        exact = RUNTIME_FAMILY_EXACT.get(folded)
+        if exact is not None:
+            return exact
+        segments = set(folded.split("-"))
+        for family, tokens in RUNTIME_FAMILY_RULES:
+            if segments & tokens:
+                return family
+    return "unknown"
+
+
 def record_closeout(
     conn: sqlite3.Connection,
     *,
@@ -74,6 +348,8 @@ def record_closeout(
     actions: list[dict[str, Any]] | None = None,
     outcomes: list[dict[str, Any]] | None = None,
     awaiting: str | None = None,
+    unresolved: str | None = None,
+    runtime_detail: str | None = None,
     actor: str = "agent",
     parent_closeout_id: str | None = None,
     provenance: Provenance | None = None,
@@ -94,10 +370,20 @@ def record_closeout(
     refused: a closeout must never fail over a bad parent, for the same reason
     an unknown ``retrieval_use_id`` no longer voids the whole receipt. Only a
     resolved parent reaches the column, so the pointer is never dangling.
+
+    ``unresolved`` names what did not work. It is required whenever the receipt
+    is not a clean success -- see :func:`_requires_unresolved` -- because
+    ``brain.ledger``'s only job is stopping the next session repeating this
+    afternoon, and it cannot do that from a status word alone.
+
+    ``runtime_detail`` is where the environment goes: "analytics ClickHouse",
+    "launchd", "zone-a". It exists so that detail stops being crammed into
+    ``context.runtime``, which is meant to name the client and nothing else.
     """
     task_ref = _required_text(task_ref, "task_ref")
     summary = _required_text(summary, "summary")
     actor = _required_text(actor, "actor")
+    settings = _closeout_settings()
     if status not in CLOSEOUT_STATUSES:
         raise ValueError(f"status must be one of: {', '.join(sorted(CLOSEOUT_STATUSES))}")
     if decision_impact not in DECISION_IMPACTS:
@@ -114,6 +400,8 @@ def record_closeout(
     normalized_actions = [_normalize_action(value) for value in actions or []]
     normalized_outcomes = [_normalize_outcome(value) for value in outcomes or []]
     verification_status = _verification_status(verifiers)
+    unresolved_text = _optional_text(unresolved)
+    detail = _optional_text(runtime_detail)
     resolved = context or ScopeContext()
     closed_at = now_iso()
     task_ref_norm = normalize_task_ref(task_ref)
@@ -129,11 +417,43 @@ def record_closeout(
     if parent_claim and resolved_parent is None:
         chain["parent_unresolved"] = True
     observed = provenance or EMPTY_PROVENANCE
+    # Both write-time gates are evaluated before either is raised, so a caller
+    # with two problems learns both in one round trip. Telling an unattended
+    # agent about one refusal at a time costs it two retries for one closeout.
+    problems: list[str] = []
+    identity: dict[str, Any] = {}
+    try:
+        identity = resolve_session_identity(
+            resolved.session, observed, policy=settings.session_id_policy
+        )
+    except ValueError as exc:
+        problems.append(str(exc))
+    if (
+        settings.require_unresolved
+        and unresolved_text is None
+        and _requires_unresolved(status, verification_status)
+    ):
+        problems.append(_unresolved_error(status, verification_status))
+    if problems:
+        raise ValueError("\n\n".join(problems))
+    family = runtime_family(
+        observed.client_runtime_key,
+        resolved.runtime,
+        aliases=settings.runtime_aliases,
+    )
     provenance_block: dict[str, Any] = {
         "source": "agent_reported",
         "actor": actor,
+        # Verbatim, as it always was. ``runtime_family`` beside it is the
+        # groupable form; neither replaces the other.
         "runtime": resolved.runtime or "mcp",
+        "runtime_family": family,
+        "runtime_detail": detail,
+        # Unchanged meaning: what the model claimed. Every historical receipt
+        # reads this way and a silently re-pointed field is worse than a new one.
         "session_id": resolved.session,
+        # What actually went in the identity column, and on whose word.
+        "session_identity": identity,
         "reported_at": closed_at,
         # Named so nobody has to read this file to know which half is a claim.
         "server_observed": observed.to_dict(),
@@ -156,6 +476,7 @@ def record_closeout(
         "outcomes": normalized_outcomes,
         "verification_status": verification_status,
         "awaiting": awaiting.strip() if awaiting and awaiting.strip() else None,
+        "unresolved": unresolved_text,
         "task_ref_norm": task_ref_norm,
         "chain": chain,
         "context": resolved.to_dict(),
@@ -172,9 +493,10 @@ def record_closeout(
           context_json, artifact_refs_json, verifier_refs_json, provenance_json,
           receipt_json, content_hash,
           server_connection_id, client_session_hint, client_runtime_key,
-          parent_closeout_id, task_ref_norm
+          parent_closeout_id, task_ref_norm,
+          session_id_source, runtime_family, unresolved
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             closeout_id,
@@ -187,7 +509,7 @@ def record_closeout(
             base_receipt["decision"]["note"],
             base_receipt["awaiting"],
             provenance_block["runtime"],
-            provenance_block["session_id"],
+            identity["session_id"],
             canonical_json(base_receipt["context"]),
             canonical_json(artifacts),
             canonical_json(verifiers),
@@ -199,6 +521,9 @@ def record_closeout(
             observed.client_runtime_key,
             resolved_parent,
             task_ref_norm,
+            identity["session_id_source"],
+            family,
+            unresolved_text,
         ),
     )
     for retrieval_use_id in retrieval_ids:
@@ -408,6 +733,70 @@ def _json_value(value: Any, name: str) -> Any:
     return json.loads(encoded)
 
 
+def _requires_unresolved(status: str, verification_status: str) -> bool:
+    """Whether this receipt carries evidence that something did not work.
+
+    Two independent triggers, and either alone is enough:
+
+    * the agent's own status is not a completion, or
+    * a verifier the agent filed says ``failed``.
+
+    The second is what makes this more than a restatement of ``status``. On the
+    live core, 95 closeouts claim ``completed`` while carrying a failed
+    verifier -- 88 of them alongside passing ones -- and none of them has a field
+    saying which check failed or why it did not stop the claim.
+
+    Deliberately NOT a status override. Seven of the twelve closeouts whose
+    verifiers *all* failed are read-only audits where the FAIL verdict is the
+    deliverable ("Read-only re-review found remaining blockers; verdict FAIL"),
+    so deriving ``failed`` from the evidence would relabel successful work.
+    The caller keeps the verdict and owes an explanation.
+    """
+    return status not in CLEAN_SUCCESS_STATUSES or verification_status == "failed"
+
+
+def _unresolved_error(status: str, verification_status: str) -> str:
+    if verification_status == "failed" and status in CLEAN_SUCCESS_STATUSES:
+        because = (
+            f"status is {status!r} but a verifier_ref reports 'failed'"
+        )
+    else:
+        because = f"status is {status!r}, which is not a completion"
+    return (
+        f"unresolved is required: {because}. State what did not work and is still "
+        "not working, in the caller's own words -- the failing check, the thing "
+        "that was not tried, the question left open. brain.ledger reads this to "
+        "stop the next session repeating the attempt, and it cannot do that from "
+        "a status word. If nothing is outstanding, the closeout is 'completed' "
+        "with no failed verifier and this field is not asked for."
+    )
+
+
+def _closeout_settings() -> Any:
+    """Resolve the ``closeout`` config section, failing open to shipped defaults.
+
+    Mirrors ``scope._scope_settings``: this sits in front of every closeout
+    write, and a malformed config file must not be the reason an agent cannot
+    file a receipt. A misspelled ``session_id_policy`` falls back to the shipped
+    default for that field alone, rather than raising on every closeout after
+    it -- a typo in a config file must not take the write path down.
+    """
+    from dataclasses import replace
+
+    from ocbrain.config import CloseoutConfig
+
+    default = CloseoutConfig()
+    try:
+        from ocbrain.config import load_config
+
+        settings = load_config().closeout
+    except Exception:  # noqa: BLE001 - config problems must not block a closeout
+        return default
+    if settings.session_id_policy not in SESSION_ID_POLICIES:
+        return replace(settings, session_id_policy=default.session_id_policy)
+    return settings
+
+
 def _verification_status(verifiers: list[dict[str, Any]]) -> str:
     if any(value["status"] == "failed" for value in verifiers):
         return "failed"
@@ -422,6 +811,13 @@ def _affected_decision(decision_impact: str) -> int | None:
     if decision_impact == "none":
         return 0
     return None
+
+
+def _optional_text(value: Any) -> str | None:
+    """Trim to a non-empty string, or ``None``. Blank is not a statement."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
 
 
 def _required_text(value: Any, name: str) -> str:

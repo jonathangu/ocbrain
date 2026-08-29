@@ -10,6 +10,7 @@ observed, and the relocated folder still folds the spellings it always did.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -125,9 +126,16 @@ def test_recorded_retrieval_separates_observed_identity_from_the_self_report(
         "FROM retrieval_uses WHERE id=?",
         (retrieval_id,),
     ).fetchone()
-    # What the model said, unaltered.
+    # What the model said about its runtime, unaltered: that column is still
+    # free text on purpose, and the fold happens read-side.
     assert row["served_to_runtime"] == "whatever the model felt like typing"
-    assert row["session_id"] == "a-human-slug-not-a-session"
+    # The session is not free text any more. The harness-attested id -- read by
+    # the server from the MCP child's own environment -- fills the identity
+    # column, and the model's slug is kept beside it as the claim it always was.
+    assert row["session_id"] == "3ebe3a24-6162-4af2-a4ee-4e8c1de121f7"
+    identity = json.loads(row["provenance_json"])["session_identity"]
+    assert identity["session_id_source"] == "harness_attested"
+    assert identity["session_id_claim"] == "a-human-slug-not-a-session"
     # What the server saw, in its own columns.
     assert len(row["server_connection_id"]) == 32
     assert row["client_session_hint"] == "3ebe3a24-6162-4af2-a4ee-4e8c1de121f7"

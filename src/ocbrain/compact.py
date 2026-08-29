@@ -604,9 +604,13 @@ def plan_compaction(
             "serving_after": len(beliefs),
         }
 
-    resolved_egress, resolved_visibility = resolve_selection_policy(
-        egress_policies=egress_policies, visibilities=visibilities
-    )
+    if adjudicator is None:
+        resolved_egress: tuple[str, ...] = ()
+        resolved_visibility: tuple[str, ...] = ()
+    else:
+        resolved_egress, resolved_visibility = resolve_selection_policy(
+            egress_policies=egress_policies, visibilities=visibilities
+        )
     clusters = find_clusters(beliefs, vectors, cosine_floor=cosine_floor)
     stages = {
         "clusters_found": len(clusters),
@@ -649,6 +653,12 @@ def plan_compaction(
             )
             continue
         stages["escalated"] += 1
+        if adjudicator is None:
+            stages["not_adjudicated"] += 1
+            excluded.append(
+                report | {"reason": "no adjudicator configured; the tail was not decided"}
+            )
+            continue
         ineligible = sorted(
             {
                 belief_id
@@ -667,12 +677,6 @@ def plan_compaction(
                     "reason": "not eligible for hosted egress: "
                     + ", ".join(ineligible)
                 }
-            )
-            continue
-        if adjudicator is None:
-            stages["not_adjudicated"] += 1
-            excluded.append(
-                report | {"reason": "no adjudicator configured; the tail was not decided"}
             )
             continue
         outcome = adjudicator(members, beliefs)

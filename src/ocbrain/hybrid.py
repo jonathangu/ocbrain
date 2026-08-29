@@ -329,6 +329,64 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
         conn.close()
 
 
+def _verify_sidecar(
+    conn: sqlite3.Connection,
+    sidecar: sqlite3.Connection,
+    *,
+    require_corpus_fresh: bool,
+) -> tuple[dict[str, str], str, int, str] | str:
+    """Check one sidecar's identity, or return the typed reason it is unusable.
+
+    Extracted so the two readers of this sidecar cannot drift apart on which
+    guards they run: every reason string, and the order they are evaluated in,
+    is shared. ``require_corpus_fresh`` is the single difference between them.
+    ``semantic_neighbors`` answers "what is this corpus's nearest belief" and a
+    whole-corpus fingerprint mismatch makes that unanswerable; the duplicate
+    gate asks about named candidates and verifies each one's vector by its own
+    ``content_hash``, so a corpus that has moved elsewhere does not disqualify
+    the rows it did not move.
+    """
+    meta = {str(row[0]): str(row[1]) for row in sidecar.execute("SELECT key, value FROM meta")}
+    if meta.get("schema_version") != VECTOR_SCHEMA_VERSION:
+        return "vector_schema_mismatch"
+    if require_corpus_fresh:
+        corpus_rows = list(
+            conn.execute(
+                "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
+                "last_compiled_at FROM current_beliefs "
+                "WHERE serve=1 AND status='current' ORDER BY belief_id"
+            )
+        )
+        if meta.get("corpus_sha256") != _corpus_fingerprint(
+            corpus_rows
+        ) or meta.get("corpus_rows") != str(len(corpus_rows)):
+            return "vector_sidecar_stale"
+    model = meta.get("model") or DEFAULT_EMBED_MODEL
+    configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
+    if model != configured_model:
+        return "vector_model_config_mismatch"
+    try:
+        dimensions = int(meta.get("dimensions") or 0)
+        configured_dimensions = int(
+            os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
+        )
+    except ValueError:
+        return "vector_dimension_metadata_invalid"
+    if dimensions <= 0 or dimensions != configured_dimensions:
+        return "vector_dimension_config_mismatch"
+    if meta.get("query_instruction_sha256") != _sha256(DEFAULT_QUERY_INSTRUCTION):
+        return "vector_query_instruction_mismatch"
+    endpoint = os.environ.get("OCBRAIN_OLLAMA_URL") or DEFAULT_OLLAMA_URL
+    _require_loopback(endpoint)
+    installed = _ollama_model_metadata(endpoint, model)
+    installed_digest = installed.get("digest", "")
+    if not installed_digest or installed_digest == "unknown":
+        return "vector_model_identity_unavailable"
+    if meta.get("model_digest") != installed_digest:
+        return "vector_model_digest_mismatch"
+    return meta, model, dimensions, endpoint
+
+
 def semantic_neighbors(
     conn: sqlite3.Connection,
     query: str,
@@ -346,43 +404,10 @@ def semantic_neighbors(
     sidecar = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     sidecar.row_factory = sqlite3.Row
     try:
-        meta = {str(row[0]): str(row[1]) for row in sidecar.execute("SELECT key, value FROM meta")}
-        if meta.get("schema_version") != VECTOR_SCHEMA_VERSION:
-            return [], "vector_schema_mismatch"
-        corpus_rows = list(
-            conn.execute(
-                "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
-                "last_compiled_at FROM current_beliefs "
-                "WHERE serve=1 AND status='current' ORDER BY belief_id"
-            )
-        )
-        if meta.get("corpus_sha256") != _corpus_fingerprint(
-            corpus_rows
-        ) or meta.get("corpus_rows") != str(len(corpus_rows)):
-            return [], "vector_sidecar_stale"
-        model = meta.get("model") or DEFAULT_EMBED_MODEL
-        configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-        if model != configured_model:
-            return [], "vector_model_config_mismatch"
-        try:
-            dimensions = int(meta.get("dimensions") or 0)
-            configured_dimensions = int(
-                os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
-            )
-        except ValueError:
-            return [], "vector_dimension_metadata_invalid"
-        if dimensions <= 0 or dimensions != configured_dimensions:
-            return [], "vector_dimension_config_mismatch"
-        if meta.get("query_instruction_sha256") != _sha256(DEFAULT_QUERY_INSTRUCTION):
-            return [], "vector_query_instruction_mismatch"
-        endpoint = os.environ.get("OCBRAIN_OLLAMA_URL") or DEFAULT_OLLAMA_URL
-        _require_loopback(endpoint)
-        installed = _ollama_model_metadata(endpoint, model)
-        installed_digest = installed.get("digest", "")
-        if not installed_digest or installed_digest == "unknown":
-            return [], "vector_model_identity_unavailable"
-        if meta.get("model_digest") != installed_digest:
-            return [], "vector_model_digest_mismatch"
+        verified = _verify_sidecar(conn, sidecar, require_corpus_fresh=True)
+        if isinstance(verified, str):
+            return [], verified
+        _meta, model, dimensions, endpoint = verified
         query_vectors = embed_texts(
             [query],
             model=model,
@@ -416,6 +441,138 @@ def semantic_neighbors(
         ], None
     except (OSError, sqlite3.Error, LocalEmbeddingUnavailable, ValueError) as exc:
         return [], f"local_embedding_unavailable:{type(exc).__name__}"
+    finally:
+        sidecar.close()
+
+
+# How many candidate bodies one duplicate-gate call may embed on demand. The
+# candidates that need it are exactly the beliefs written since the last sidecar
+# build, which on this install is a single curation cycle's output.
+DEFAULT_DOCUMENT_EMBED_BUDGET = 32
+
+
+def document_neighbors(
+    conn: sqlite3.Connection,
+    text: str,
+    *,
+    candidate_ids: Iterable[str],
+    limit: int = 5,
+    embed_budget: int = DEFAULT_DOCUMENT_EMBED_BUDGET,
+    cache: dict[str, list[float]] | None = None,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, int]]:
+    """Document-to-document cosine against named candidates, with stated coverage.
+
+    Two things separate this from :func:`semantic_neighbors`, and both exist
+    because a *write-time* duplicate gate has to answer for what it could not
+    compare.
+
+    It embeds ``text`` on the **document** side, with no query instruction, so
+    the score is on the same scale the sidecar's own rows are on and on the same
+    scale ``compact.find_clusters`` calibrated its floor on. A query-side score
+    is not comparable to either.
+
+    And it verifies each candidate's vector by that candidate's own
+    ``content_hash`` rather than by the whole-corpus fingerprint. On this install
+    the sidecar is rebuilt at the end of the hourly maintenance pass, so the
+    first belief a curation cycle writes invalidates the corpus fingerprint and
+    every later claim in the same cycle would read ``vector_sidecar_stale`` --
+    the gate would switch itself off for the rest of the run, silently, at
+    exactly the point in a cycle where restatements pile up. A candidate whose
+    body still hashes to its stored vector is comparable regardless. Whatever is
+    left over is embedded on demand up to ``embed_budget``, and anything past
+    that is reported as ``uncovered`` rather than skipped quietly: the caller
+    decides what an incomplete comparison means.
+    """
+    wanted = [str(value) for value in dict.fromkeys(candidate_ids)]
+    coverage = {"candidates": len(wanted), "reused": 0, "embedded": 0, "uncovered": 0}
+    if not wanted:
+        return [], None, coverage
+    core_path = connection_path(conn)
+    if core_path is None:
+        return [], "core_path_unavailable", coverage
+    path = vector_db_path(core_path)
+    if not path.is_file():
+        return [], "vector_sidecar_missing", coverage
+    cache = cache if cache is not None else {}
+    sidecar = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    sidecar.row_factory = sqlite3.Row
+    try:
+        verified = _verify_sidecar(conn, sidecar, require_corpus_fresh=False)
+        if isinstance(verified, str):
+            return [], verified, coverage
+        _meta, model, dimensions, endpoint = verified
+        placeholders = ",".join("?" for _ in wanted)
+        bodies = {
+            str(row["belief_id"]): str(row["body"] or "")
+            for row in conn.execute(
+                "SELECT belief_id, body FROM current_beliefs "  # noqa: S608 - id count only
+                f"WHERE belief_id IN ({placeholders})",
+                wanted,
+            )
+        }
+        stored = {
+            str(row["belief_id"]): (str(row["content_hash"]), row["vector"])
+            for row in sidecar.execute(
+                "SELECT belief_id, content_hash, vector FROM belief_vectors "  # noqa: S608
+                f"WHERE belief_id IN ({placeholders})",
+                wanted,
+            )
+        }
+        vectors: dict[str, list[float]] = {}
+        missing: list[str] = []
+        for belief_id in wanted:
+            body = bodies.get(belief_id)
+            if body is None:
+                # Named but not serving. Nothing to compare and nothing missing.
+                coverage["candidates"] -= 1
+                continue
+            cached = cache.get(belief_id)
+            if cached is not None:
+                vectors[belief_id] = cached
+                coverage["reused"] += 1
+                continue
+            row = stored.get(belief_id)
+            if row is not None and row[0] == _sha256(body):
+                vector = _decode_vector(row[1])
+                if len(vector) != dimensions:
+                    return [], "vector_row_dimension_mismatch", coverage
+                unit = _normalize(vector)
+                vectors[belief_id] = unit
+                cache[belief_id] = unit
+                coverage["reused"] += 1
+                continue
+            missing.append(belief_id)
+        embeddable = missing[: max(embed_budget, 0)]
+        coverage["uncovered"] = len(missing) - len(embeddable)
+        pending = [_bounded_embedding_text(bodies[belief_id].strip()) for belief_id in embeddable]
+        to_embed = [_bounded_embedding_text(str(text).strip()), *pending]
+        embedded = embed_texts(
+            to_embed,
+            model=model,
+            endpoint=endpoint,
+            query=False,
+            timeout_seconds=300,
+            dimensions=dimensions,
+        )
+        if len(embedded) != len(to_embed):
+            return [], "document_embedding_count_mismatch", coverage
+        query_vector = embedded[0]
+        if len(query_vector) != dimensions:
+            return [], "vector_query_dimension_mismatch", coverage
+        for belief_id, vector in zip(embeddable, embedded[1:], strict=True):
+            vectors[belief_id] = vector
+            cache[belief_id] = vector
+            coverage["embedded"] += 1
+        scored = sorted(
+            (
+                {"belief_id": belief_id, "similarity": round(_dot(query_vector, vector), 8)}
+                for belief_id, vector in vectors.items()
+            ),
+            key=lambda item: (-float(item["similarity"]), str(item["belief_id"])),
+        )
+        return scored[: max(limit, 1)], None, coverage
+    except (OSError, sqlite3.Error, LocalEmbeddingUnavailable, ValueError) as exc:
+        return [], f"local_embedding_unavailable:{type(exc).__name__}", coverage
     finally:
         sidecar.close()
 
@@ -637,6 +794,7 @@ def _corpus_fingerprint(rows: Iterable[sqlite3.Row]) -> str:
 
 
 __all__ = [
+    "DEFAULT_DOCUMENT_EMBED_BUDGET",
     "DEFAULT_EMBED_DIMENSIONS",
     "DEFAULT_EMBED_DOCUMENT_BYTES",
     "DEFAULT_EMBED_MODEL",
@@ -644,6 +802,7 @@ __all__ = [
     "VECTOR_DOCUMENT_FORMAT",
     "LocalEmbeddingUnavailable",
     "build_vector_index",
+    "document_neighbors",
     "embed_texts",
     "semantic_neighbors",
     "vector_db_path",

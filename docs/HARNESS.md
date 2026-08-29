@@ -131,6 +131,14 @@ text, not just a count. `COFASC-292` on one real core is `verified_done` after
 14 closeouts and still reports 5 failed attempts, which is exactly the shape a
 next iteration needs: the work is done, and here is what did not work on the way.
 
+Each attempt also carries `unresolved`, and the entry carries
+`latest_unresolved`: the filer's own sentence about what is *still* not working,
+which is a different question from what the session did. The write-time gate in
+`ocbrain.closeout` charges every non-clean closeout for that sentence, so this is
+the reader that makes the charge honest — a required field nothing serves is a
+toll, not a gate. It is null on every receipt written before 2026-08-28, and both
+the ledger entry and the briefing line degrade to the summary when it is.
+
 Two grouping notes:
 
 - Grouping folds `task_ref` at read time rather than trusting the stored

@@ -90,9 +90,15 @@ def test_a_caller_that_is_not_a_connection_gets_no_id_rather_than_a_fresh_one() 
 def test_the_session_hint_cannot_come_from_the_model(tmp_path: Path) -> None:
     """The point of the hint is that no model can type it.
 
-    ``context.session`` is model-supplied and must land in ``session_id`` only.
-    If it ever reached ``client_session_hint`` the honest/attested split would
-    be decorative.
+    ``context.session`` is model-supplied and must never reach
+    ``client_session_hint``; if it did, the honest/attested split would be
+    decorative. That is what this test is for, and it is unchanged.
+
+    What did change: a model-typed slug no longer reaches the identity column
+    either. It is quarantined -- kept in ``provenance_json`` as the claim it is,
+    while the column carries the server's own connection id -- because 967 of
+    the 1,115 session ids on the live core were hand-written and none of them
+    joined a transcript.
     """
     conn = _core(tmp_path)
     retrieval_id = record_core_v1_retrieval(
@@ -107,11 +113,15 @@ def test_the_session_hint_cannot_come_from_the_model(tmp_path: Path) -> None:
     )
     conn.commit()
     row = conn.execute(
-        "SELECT session_id, client_session_hint FROM retrieval_uses WHERE id=?",
+        "SELECT session_id, session_id_source, client_session_hint, provenance_json "
+        "FROM retrieval_uses WHERE id=?",
         (retrieval_id,),
     ).fetchone()
-    assert row["session_id"] == "model-typed-this"
+    assert row["session_id"].startswith("conn:")
+    assert row["session_id_source"] == "server_connection"
     assert row["client_session_hint"] is None
+    identity = json.loads(row["provenance_json"])["session_identity"]
+    assert identity["session_id_claim"] == "model-typed-this"
 
 
 def test_closeout_records_the_observed_identity_beside_the_claimed_one(tmp_path: Path) -> None:
@@ -121,17 +131,22 @@ def test_closeout_records_the_observed_identity_beside_the_claimed_one(tmp_path:
         task_ref="t",
         status="completed",
         summary="Threaded server-observed provenance into both write paths.",
-        context=ScopeContext(project="bountiful", session="a-slug", runtime="Claude Code, sort of"),
+        context=ScopeContext(project="bountiful", runtime="Claude Code, sort of"),
         provenance=Provenance.capture(client_name="claude-code", env=dict(CLAUDE_ENV)),
     )
     conn.commit()
     row = conn.execute(
-        "SELECT runtime, session_id, server_connection_id, client_session_hint, "
+        "SELECT runtime, runtime_family, session_id, session_id_source, "
+        "server_connection_id, client_session_hint, "
         "client_runtime_key, provenance_json FROM task_closeouts WHERE id=?",
         (receipt["id"],),
     ).fetchone()
     assert row["runtime"] == "Claude Code, sort of"
-    assert row["session_id"] == "a-slug"
+    assert row["runtime_family"] == "claude-code"
+    # No session was claimed, so the harness-attested hint fills the column and
+    # says so. Before, this row would have carried whatever the model typed.
+    assert row["session_id"] == CLAUDE_ENV["CLAUDE_CODE_SESSION_ID"]
+    assert row["session_id_source"] == "harness_attested"
     assert row["client_session_hint"] == CLAUDE_ENV["CLAUDE_CODE_SESSION_ID"]
     assert row["client_runtime_key"] == CLAUDE_ENV["AI_AGENT"]
     assert len(row["server_connection_id"]) == 32

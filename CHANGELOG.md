@@ -2,6 +2,529 @@
 
 ## Unreleased
 
+- Stop a restatement becoming a new key, by fixing what the existing cascade
+  could not see rather than by adding a threshold to it. A supersession can only
+  ever replace a belief filed under the **same** key — the transaction copies the
+  predecessor's key onto its successor, and the curator's own rationale says it
+  "recompiled key `<k>`" — so a fact reworded under a new slug was uncollapsible
+  by construction. The live corpus is the proof, measured on the
+  **2026-08-28 morning snapshot (347 serving beliefs)**: **344 serving wiki facts
+  carrying 344 distinct keys**, perfect uniqueness, with **35 same-scope
+  near-duplicate clusters at cosine 0.88 covering 98 of those 347**, five of them
+  Plane-1 recency beliefs compiled on one day under five keys, two differing by a
+  single hyphen. A reader asking one question got one answer five times and read
+  it as five corroborations: `0.0166` appears in **13** serving beliefs and `65.4`
+  in **12**.
+
+  The surprise, and the reason this is not a threshold change: replaying the
+  actual mint of each cluster's second member against a copy of the live core —
+  its real key, its real body, the real local embedder — the existing cascade
+  catches **all 34** of them when the vector sidecar is freshly built. It is the
+  *availability* of that cascade that fails, and it fails almost always. The
+  hourly maintenance pass curates first and rebuilds the sidecar last, so the
+  first belief a cycle writes invalidates the whole-corpus fingerprint and every
+  later claim in that cycle reads `vector_sidecar_stale` — which
+  `conflict_neighbor` treats as "no conflict". Same replay, same 34 clusters, with
+  the sidecar in the state a cycle actually leaves it in: **23 of 34 mint a second
+  serving belief before this change, 2 after**. With a fresh sidecar, 0 before and
+  0 after; nothing regresses.
+
+  Three arms, in the order they cost anything:
+  - **The folded key**, which needs no embedding at all.
+    `plane1-recency-gate-result` and `plane-1-recency-gate-result` are one key.
+    Folding is separators-only and was checked against the corpus before it
+    shipped: on the 2026-08-28 morning snapshot, 344 exact wiki keys fold to 343,
+    collapsing exactly that pair and merging nothing else. Over the ledger's
+    history it catches 2 of 1,213 keyed proposals — small, and it is the arm that
+    cannot break. Re-measured at 2026-08-28T19:36Z: 300 wiki facts, 300 exact
+    keys, 300 folded — this arm currently collapses nothing, because the pair it
+    was built for has since been retired by an operator compaction.
+  - **Document-to-document cosine** at `NEAR_DUPLICATE_COSINE = 0.88`, verifying
+    each candidate's vector by that candidate's own `content_hash` instead of by a
+    corpus fingerprint the corpus keeps moving, and embedding on demand whatever
+    is left. Measured on a copy of the live core after one belief is written:
+    `semantic_neighbors` → `vector_sidecar_stale`, this reader → answered, **203
+    vectors reused, 1 embedded, 0 uncovered** (a 204-belief working copy; the
+    adversarial reviewer reproduced the same shape at 301/300/1/0). The floor is pinned equal to
+    `compact.DEFAULT_COSINE_FLOOR` by a test, because a claim this gate admits and
+    the compactor then proposes retiring is a gate that moved the work rather than
+    doing it. It is a different scale from the query-side
+    `CONTRADICTION_COSINE_FLOOR = 0.60`, and the two are documented as two scales.
+  - **Fail-closed** when it still cannot see. A claim the gate could not check is
+    recorded as an undecided proposal (`pended_unverified`) rather than minted,
+    and an identical re-derivation next cycle writes nothing — the pend path is a
+    producer too, and it gets the same dedup that stopped the supersede ledger
+    growing without bound. Two exemptions are **declared**, rather than the
+    fail-open list being everything nobody enumerated: no core path, and no
+    sidecar at all. An install that never opted into semantic dedup keeps
+    compiling on the two lexical arms; an install that did opt in does not get to
+    quietly lose the third because Ollama died at 03:00.
+    `curator.duplicate_gate_fallback=admit` restores the previous behaviour.
+
+  One thing this does not fix, measured rather than assumed: the 0.60 conflict arm
+  is still stale-blind, which is why 2 of the 34 replayed clusters still mint. Both
+  are cases a fresh sidecar would have caught on the query-side scale and that sit
+  below the document-side floor. Giving that arm the same resilience needs a
+  document-scale floor calibrated on more than two data points, so it is left
+  named rather than guessed at.
+
+- Make the curator's egress gate falsifiable. Read-only at **2026-08-28T19:34Z**,
+  `egress_audits` holds **347 rows** spanning 2026-08-04T22:11 to
+  2026-08-28T19:27, and `SELECT DISTINCT rejected_json` returns exactly one value
+  on all 347: the literal string `'[]'`, across **25,958 transmitted items**. (The
+  same structure at an earlier snapshot the same day read 240 rows / 25,106 items;
+  the gate has never refused anything at either.) That was structural, not lucky, and it had two causes.
+  `select_evidence` filtered on the allow-list inside its own SQL, so the audit
+  could only ever be handed rows that had already passed; and the declared
+  allow-list named `approval_required`, `hosted_ok` and `local_only` — every
+  policy an operator may declare — so no input could fail it. Selection now
+  *partitions* instead of filtering and the audit records what was refused, with
+  `declared_egress_policies` beside `present_egress_policies` so a later reader
+  can tell a gate that had nothing to reject from a gate that could not reject
+  anything. On a copy of the live core the `example` project's next audit carries
+  **3 refusals** where every previous audit carried 0 — three `confidential` +
+  `prohibited` rows that the code floor had always been dropping invisibly — and
+  the other two projects record 0 refusals beside `allowlist_vacuous: true`. The
+  policy itself is unchanged and `select_evidence` returns exactly what it always
+  did: whether `local_only` evidence may lawfully reach a hosted curator is not a
+  question this change answers.
+- Report a vacuous allow-list as a defect rather than as 240 clean audits.
+  `egress_refusable_policies` counts how many policies present in the eligible
+  evidence the *declaration* would refuse, with the code floor subtracted so an
+  everything-admitting allow-list cannot borrow credit for `prohibited`. Measured
+  0 on the live core, which alarms. `curator.egress_allowlist_ack` downgrades it
+  to `watch` and carries the operator's stated reason into the scorecard —
+  declared, not enumerated away.
+- Key a belief's TTL on how fast its subject moves, not on which of two lifecycle
+  words the model picked. `lifecycle=current` bought a flat ~90 days (158 beliefs,
+  all expiring in November, none expired) and `lifecycle=durable` bought no expiry
+  at all (185 beliefs, zero with a `valid_until`), so one serving belief still
+  stated which ClickHouse host was live "as of 2026-07-24" **35 days later**,
+  under a `valid_until` running to November, with a second belief repeating it.
+  A claim is now classified `volatile` / `measured` / `doctrine`, mechanically
+  where a body dates itself, pins a version, names a host or an access path, or
+  asserts what is running right now — 33 of the 347 serving beliefs in the
+  2026-08-28 morning snapshot, 11 of them `durable`-marked; re-run read-only at
+  2026-08-28T19:36Z on the 303 that remain, 29 (9.6%), 10 `durable`-marked. The model may declare a class, and the declaration can only
+  shorten a claim's life, never extend it, or `durable` becomes a way to opt out
+  of expiry. Existing beliefs are **not** swept: `ocbrain wiki-volatility` prints
+  the plan and needs `--apply --yes` to write, because on a copy of the live core
+  it re-dates 173 beliefs and **7 are already expired** under the new scheme.
+- Record why a supersede proposal is pending in the ledger, not only in the return
+  value. The pending queue's reasons — the confidence-margin rule, a pinned or
+  doctrine target, a rate cap — were legible to the caller and invisible to the
+  operator reading the queue a week later.
+- Give the curator per-cadence model profiles and an optional independent critic,
+  both inert by default. `wiki-curator.py --cadence {hourly,nightly}` selects the
+  profile, and `--provider` no longer carries an argparse default, which had made
+  `curator.provider` unreachable: a flag beats the cadence profile beats the
+  configured pair. `curator.nightly_provider`/`nightly_model` ship empty so both
+  cadences resolve to the one configured pair; a cadence that names its own
+  provider does not inherit the other's model id, because that posts one
+  provider's model to another provider's endpoint.
+  `curator.critic_provider` ships empty, and when set it gates only the changes
+  where being wrong costs most — a supersession of a pinned belief or of anything
+  in `global:*`. A critic configured to the curator's own provider family is
+  refused rather than run: two calls to one family is one opinion counted twice,
+  and correlated error is the whole reason for a second one. Anything other than
+  an explicit approval — a refusal, a missing credential, a provider error — routes
+  the change to the pending ledger with the critic's reason attached.
+- Test the instrument the duplicate gate rests on, and give an operator control
+  that was left standing after its rule moved somewhere to go. Both defects came
+  out of an adversarial review of the four changes above; both are the classes
+  this work exists to remove.
+
+  `document_neighbors` — the ~140-line document-side reader the whole
+  availability fix depends on — had **no test**. Every test of the gate's
+  positive path monkeypatched it out, so reverting it to exactly the blindness
+  the entry above names as the defect left all 949 tests green. Three
+  independently killed mutations now cover it: requiring a fresh whole-corpus
+  fingerprint (the query-side arm's blindness), dropping the per-candidate
+  `content_hash` check, and a default embed budget of 0. The third is checked by
+  score, not by a count: a candidate rewritten to be a near-copy must come back
+  at cosine 1.0, which it cannot do from its dead stored vector.
+
+  `--current-ttl-days` had become silently inert, and its help text stated two
+  things that were false. Measured directly:
+  `claim_ttl_days({'lifecycle':'current'}, current_ttl_days=0, volatility_ttl=True)`
+  returned 45, and `current_ttl_days=30` also returned 45; the help said "0
+  disables expiry. Durable claims never expire" while a durable body naming a
+  rotating host got 14 days. `current_ttl_days <= 0` now means no expiry under
+  either scheme, `--no-volatility-ttl` makes the lifecycle rule (and the number)
+  reachable again, both flags default to the config field instead of to an
+  argparse literal, and the run's rollup line reports which rule it compiled
+  under. A test drives the whole chain from the flag to the stored `valid_until`.
+  `ocbrain wiki-volatility` reads the same setting, because a switch honoured on
+  the compile path and ignored by the sweep is the same defect one layer down.
+
+  Three smaller things from the same review. `DEFAULT_DOCUMENT_EMBED_BUDGET = 32`
+  is an availability cliff — past it the gate reports `candidates_uncovered:N`
+  and the fail-closed default pends every remaining claim in the cycle — so it is
+  now `curator.document_embed_budget`, documented as a cliff rather than a dial in
+  `docs/THRESHOLDS.md`, and held above `--max-beliefs`. The fail-closed literal
+  that applies when the config file is unreadable is now asserted whole, so the
+  next default drifting there cannot pass. And the retired-model check no longer
+  inspects only `PROVIDER_DEFAULTS`: it scans every text file in the repo, with
+  three **declared** exemptions carrying their reasons, and has its own test that
+  it can report dirty. It found what the first fix had left standing — a
+  `gpt-5-mini` config example in `docs/V2_AUTONOMY_SPEC.md` and both retired ids
+  as test parameters.
+
+- Correct two provider defaults that had gone stale. `moonshot-v1-32k` named a
+  series that sunsets **2026-08-31**, i.e. a shipped default that stops answering
+  three days from now, and `gpt-5-mini` is a legacy tier beside the current gpt-5.6
+  line. A default is a dated fact about somebody else's catalogue; a test now
+  refuses any `moonshot-v1*` id.
+- Stop `brain.context` answering an id it does not hold. `brain.search` has
+  short-circuited on a locator-shaped query since the exact-lookup pre-pass
+  landed; `brain.context` never did, and a locator shares no lexical terms with
+  any body, so the query fell through to a dense arm that always has a nearest
+  neighbour to offer. Recorded `harmful` feedback names the case: the
+  nonexistent, exactly well-formed `belief_ffffffffffffffff` came back as an
+  unrelated fact, and it survived a vector rebuild because the shape of the
+  failure has nothing to do with the vectors. Reproduced on a `mode=ro` copy of
+  the live core: that locator returned **two** unrelated beliefs at cosine
+  0.5603 and 0.6134. A locator-shaped query is now resolved by equality against
+  the serving projection and a miss is empty. Over 100 well-formed absent belief
+  ids on a copy of the live core: **17 of 100 returned an unrelated belief
+  before, 0 of 100 after**. The same run in the other direction is the reason
+  this is a fix and not just a refusal — asking for a belief *by its own id*
+  resolved to that belief **0 of 100 times before, 99 of 100 after**, the
+  hundredth being a `goal`, which is task state and has never been retrievable
+  as knowledge. The visibility gate is the ranker's own: holding an id is not
+  authorisation, so confidential material whose scope the caller did not name
+  stays unreachable by locator. `looks_like_exact_locator` now has one
+  definition, in `core_v1`, shared with the `brain.search` pre-pass — two copies
+  is how the two surfaces came to disagree.
+- Stop serving `confidence` and `confidence_band` in the context packet. The
+  field is authored, not measured: 345 of the live core's 347 serving beliefs
+  carry one, every one inside `[0.65, 1.0]`, and 116 of them are the same round
+  0.85. Joined to recorded feedback it points the wrong way — moderate-band
+  items drew 68 `irrelevant` and 0 `harmful` of 1,061 judged (6.41%), strong-band
+  items drew 463 `irrelevant` and 23 `harmful` of 1,331 (36.51%). That per-item
+  ratio is not identified, because an outcome is recorded per *retrieval* and
+  one verdict tars every item in the packet; re-measured at the packet grain,
+  one vote each over 470 judged retrievals, the direction survives intact:
+  packets judged irrelevant or harmful held items averaging **0.8707**
+  confidence, packets judged used or helpful **0.7263**. A reader weighting on
+  that field was being steered toward the rows readers liked least. In its place
+  the packet carries `evidence_count` and `evidence_latest_at` — how many
+  evidence objects back the belief and when the newest was recorded. These are
+  not offered as better predictors of usefulness; at the packet grain they
+  barely separate the two verdict classes at all (1.06 vs 1.02 evidence objects,
+  32.0 vs 34.4 days old). They are offered because they are facts about the
+  record that a reader can go and check, which the authored score never was.
+- Put the confidence term of `ranking_prior` behind
+  `retrieval.confidence_prior_enabled`, **defaulting to on**, and report the
+  flag on every packet. Whether that term should go, or `confidence` should be
+  re-derived from evidence count, recency and verifier status, is an operator
+  decision and not one a bug fix gets to make, so the default reproduces every
+  packet built to date. Replaying the 200 most recent distinct recorded queries
+  against a copy of the live core, switching it off moved the served set on
+  **30 of 200** queries (31 items in, 31 out), reordered another 113, and changed
+  the top-1 item on 13, out of 2,236 items served either way. Provenance in
+  `docs/THRESHOLDS.md`.
+- Golden context contract: no expected value in
+  `tests/fixtures/golden_context_v1.json` changed. Served ids, `scope_mix`,
+  `eligible_count` and `source_handle_count` are byte-identical on all eleven
+  cases. `serialized_bytes` moved on all eleven — 1947→1977 and 1891→1921 for
+  the single-item cases, 2823→2883 and 2944→3004 for the two-item cases, and
+  +32/+33 on the six empty ones for the new `confidence_prior_enabled` ranking
+  key — but that value is asserted against a re-serialization of the packet, not
+  against a pinned literal, so it needed no edit. The contract was tightened
+  rather than relaxed: the packet item key set is now pinned outright, and every
+  case asserts the envelope contains no `confidence` field anywhere. Both new
+  gates are mutation-proved, as are the locator short-circuit, its visibility
+  gate, and the evidence-recency lookup.
+Every live-corpus figure below is read from one `.backup` snapshot frozen at
+**2026-08-28T19:28:58Z**, not from the running database. The corpus is live —
+the hourly curator mints and two operator compactions ran the same afternoon —
+and the retrieval count moved four times while these were being written, so a
+number here without that instant attached would not reproduce by evening.
+
+- Stop an empty retrieval being filed as a bad one. `retrieval_uses.outcome`
+  carries both "the corpus had nothing for this query" and "the corpus served
+  the wrong thing", and feedback is the only ranking signal the brain has. Of
+  the snapshot's **2,048 retrievals (2026-07-15 to 2026-08-28), 1,086 (53.0%)
+  served zero items** — genuinely nothing, not a logging gap, and stable across
+  months (537/983 July, 549/1,065 August). **183 of those zero-item reads carry
+  a relevance verdict anyway** (174 `irrelevant`, 5 `ignored`, 4 `used`), filed
+  against the server's own written instruction not to file one; the agents' own
+  notes say so verbatim ("No prior items were returned"). Restricted to the 962
+  retrievals that did serve something, the picture inverts: **360 of 481 judged
+  verdicts are positive (74.8%)**. An instruction 183 rows ignore is not a rule,
+  so the server enforces it: `brain.feedback` refuses every relevance outcome on
+  a zero-item receipt and says what to write instead, and the zero-item case is
+  recorded as a new `no_coverage` outcome. That value is **server-derived, not
+  caller-supplied** — the item count is observed in the same statement that
+  writes the receipt, and the population a voluntary flag would describe is
+  exactly the one that goes unreported when reporting is voluntary.
+- Say plainly what that fix does *not* do. A zero-item receipt has no
+  `retrieval_items` rows, so those 183 verdicts were never attributable to any
+  belief: reclassifying all of them against the snapshot moved **0 of 191
+  feedback boosts**, while blanking the 104 `irrelevant` verdicts that *did*
+  have items moved 124 — the same instrument, reporting dirty. What the 183
+  polluted is the corpus-level read of whether retrieved context helps, which is
+  what a retirement rule keyed on outcome counts would have used. The existing
+  rows are live history, so rewriting them is an operator's call and not a
+  migration: `ocbrain feedback-repair` reports by default and rewrites under
+  `--apply`, keeping the prior verdict in the row's note. Dry run on the
+  snapshot: **183 candidates, 174 `irrelevant` / 5 `ignored` / 4 `used`, 0
+  written**. The live database is unchanged.
+- Stop retrieval and feedback history dying at every recompile. Each curator
+  pass mints a new `belief_id`, and `retrieval_items` keeps pointing at the old
+  one, so retirement eligibility measured a belief's *age* rather than its
+  usefulness: **390 of 587 ever-retrieved ids are now retracted**, and **106 of
+  303 serving beliefs had never been retrieved at all** — almost entirely
+  recency, not rot, since the never-retrieved share by compile day runs 2/39 on
+  08-04, 13/57 on 08-25, 34/45 on 08-28. A belief now ranks on its whole
+  lineage's record. The lineage is *derived* from the `superseded_by` era pointer
+  the projector already stamps on each predecessor, never copied forward at
+  supersede time: a chain therefore accumulates by construction (generation
+  three walks back through two to one), a copy cannot go stale because there is
+  no copy, and because the walk yields a set of ids folded per
+  `(belief, retrieval_use)` pair, one retrieval that served two members of a
+  lineage is still one verdict. Reading `superseded_by` rather than the
+  successor's `supersedes` is what makes the curator's key-collision cascade
+  visible: **274 era closures against 64**. On the snapshot, **47 serving
+  beliefs inherit 307 verdicts**, **18 of the 106 never-retrieved beliefs gain a
+  judged record**, and beliefs carrying a feedback boost rise from **170 to
+  191**, 45 of them changing value.
+- Walk that lineage in Python off one read of the era pointers. Expressed as a
+  recursive CTE, each step re-scans `current_beliefs` evaluating `json_extract`
+  per row, because no index covers that expression: **85 ms per ranked
+  retrieval, against 1.5 ms** for the same answer, on a path that runs on every
+  `brain.context`. The walk is deliberately *unbounded* in depth, where the
+  forward walk over the same pointer stops at `MAX_RESOLUTION_HOPS = 10`: that
+  bound pays a belief read per hop and needs one answer, this one loads the
+  pointer map once and needs every generation, and the snapshot's deepest
+  serving lineage is **12 generations** (widest, 22 members; 112 of 303
+  serving beliefs have more than one), so a ten-hop cap here would drop two
+  generations of verdicts out of ranking today. Both walks now say so at their
+  own constant, and a test pins the divergence.
+- Do not let the instruction block promise what the open core does not do. The
+  refusal above lives in the v1 feedback path, but the `initialize` instructions
+  and the `brain.feedback` description were served to **every** connection — so
+  a legacy v0 core described itself refusing zero-item feedback and recording
+  `no_coverage`, and did neither: filing `irrelevant` on a zero-item legacy
+  receipt was accepted, and the row read `irrelevant` afterwards. The guard does
+  not port. A legacy `retrieval_uses.outcome` `CHECK` has no `no_coverage` value
+  (the `UPDATE` raises `IntegrityError`), and a legacy receipt cannot prove a
+  read served nothing: `brain.get` of a belief and `brain.digest` both write
+  `knowledge_id` NULL with `served_ids_json` `[]` *having served an item*, so a
+  served-count refusal there would refuse feedback on reads that did serve. Both
+  texts are therefore chosen from the core actually open, and the legacy wording
+  keeps the instruction it has always carried. Two siblings of the same defect
+  fell out of sweeping for it: the legacy wording also named
+  `coverage.feedback_needed`, a key the legacy `coverage` envelope has never
+  emitted (7 keys, confirmed through `brain.context` on a legacy core), and the
+  outcome vocabulary was spelled by hand in **three** places — the v1 validator,
+  the legacy validator, and the `inputSchema` `enum` clients actually act on. All
+  three now read `RELEVANCE_OUTCOMES`, and each is pinned by narrowing that tuple
+  underneath the running server rather than by comparing one copy to another.
+- Enforce the closeout's session identity at write time instead of asking for it
+  in a docstring. `context.session` is the join that makes a closeout's tool-call
+  trace minable, and on the live core **only 211 of 1,239 receipts (17.0%) carry
+  a runtime-shaped id**: 431 are absent and 597 are a human typing something
+  descriptive — `example_cleanup_audit`, `2026-07-22`, `2026-07-21 release
+  checklist`, and one filesystem path in an id field. Guidance had six weeks and
+  moved the rate from 15.1% in July to 19.6% in August, so it now lives in the
+  server. What makes this a shape question rather than a taste question: **all 94
+  closeouts that join a Claude Code transcript are UUIDs, and zero of the 597
+  hand-written ids join one** — admitting exactly the machine-minted shapes keeps
+  94 of 94 and costs none. (Every corpus figure in this entry comes from one
+  read-only backup taken 2026-08-28 12:30:51 PDT; the live core gained rows while
+  it was being written, and a set of numbers assembled from several reads of a
+  moving table is not a measurement.) Three parts:
+  - **The column is filled by the most trustworthy witness available**, in
+    descending order: the harness-attested `client_session_hint` the server read
+    from its own environment, then the caller's claim if it is runtime-shaped,
+    then the server's own connection id under a `conn:` prefix so no later join
+    can mistake it for a transcript. `session_id_source` records which, beside
+    the value. Two runtime-shaped ids that disagree — the Claude Code subagent
+    case — keep both, with `session_id_conflict` set.
+  - **Omitting the field is legal**, and that is what makes the refusal
+    satisfiable: a client with no session id of its own is never unable to file a
+    closeout. Replaying the 77 post-capture live closeouts through the new path:
+    **5 of 77 carried no identity before, 0 of 77 after.**
+  - **The claim is never destroyed.** It stays verbatim in `context.session` in
+    the receipt and is echoed as `session_id_claim` whenever the column stores
+    something else.
+- Give `context.runtime` an enum. It was free text and arrived as **160 distinct
+  spellings across 1,239 closeouts** — five spellings of "local mac", four of
+  "codex desktop", and `local macOS + analytics ClickHouse` (13 rows) with an
+  environment description welded onto the client name. Nothing could be grouped
+  by that column. A `runtime_family` of `claude-code`/`codex`/`cursor`/`hermes`/
+  `mcp`/`cli`/`unknown` is derived at write time from the server-observed
+  `client_runtime_key` first and the model's claim second; the raw spelling stays
+  verbatim beside it, and `runtime_detail` is where the environment goes.
+  Applied to the 160 historical spellings: **codex 426, unknown 438, hermes 123,
+  mcp 95, claude-code 84, cursor 57, cli 16** — 1,239 rows, every one placed. The mapping is a pure function
+  precisely because `task_closeouts` is append-only under a trigger and history
+  can never be rewritten in place. `unknown` is a real answer, not a failure:
+  "local", "desktop" and "macOS" name the machine, and inventing a client for
+  them would be guessing. Install-specific labels go in `closeout.runtime_aliases`,
+  which ships empty.
+  - Matching is on whole segments, not substrings. A substring rule classified
+    those 13 `ClickHouse` rows as the `cli` family, and 16 more besides, because
+    "ClickHouse" contains "cli". A normaliser that guesses is worse than a column
+    nobody can group.
+- Make a closeout that is not a clean success say what did not work. The live
+  status distribution is completed 1,052, partial 148, blocked 38, **failed 1** —
+  one failure in six weeks of unattended agent work, which is a reporting gap, not
+  a failure rate, and `brain.ledger` exists to surface exactly what is missing.
+  Sampling the 148 `partial` receipts says where it went: they are overwhelmingly
+  progress heartbeats ("Main acquisition is healthy at 129/284 receipts"), not
+  partial failures. The evidence that is already in the corpus is elsewhere:
+  **95 receipts claim `completed` while carrying a verifier that reports
+  `failed`**, and not one of them has a field saying which check failed. A new
+  required `unresolved` closes it, triggered by the status **or** by the verifier
+  evidence independently — status alone would miss all 95. Over the live core
+  that is **282 of 1,239 receipts (22.8%) that carry evidence something did not
+  work and no field naming it; after, none of them can be written without one.**
+  - `brain.ledger` reads it, which is what makes the charge honest. `unresolved`
+    rides every `failed_attempts` row and the entry's `latest_unresolved`, and
+    the briefing's FAILED line prints it in place of the summary — "what is still
+    broken" rather than "what the session did" — falling back to the summary for
+    every pre-gate row, which is all 1,239 of them. A required field no reader
+    serves is a toll, not a gate.
+  - Deliberately not a status override. Of the twelve closeouts whose verifiers
+    all failed, **seven are read-only audits where the FAIL verdict is the
+    deliverable** — "Read-only re-review found remaining blockers; verdict FAIL".
+    Deriving `failed` from the evidence would relabel successful work as failure.
+    The caller keeps the verdict and owes a sentence.
+- Report both write-time refusals together. A caller with a hand-written session
+  id *and* an unexplained failure used to learn about one, retry, and learn about
+  the other; one retry now clears both.
+- Both gates are configurable under a new `closeout` config section, and
+  `session_id_policy: "quarantine"` keeps every receipt while still keeping junk
+  out of the identity column. Replaying all 1,239 live closeouts through the
+  shipped defaults refuses **747 (60.3%)** — 597 for the session shape and 150
+  more for a missing `unresolved` — every one satisfiable on retry, and the number
+  an operator should see before deciding which policy they want.
+- Apply the same identity resolution to `retrieval_uses.session_id`, which
+  carried the identical defect at four times the scale: of 2,048 read receipts,
+  1,115 have a session id, **967 of them hand-written and joining nothing**, 148
+  machine-shaped and 18 joining. Both writers — `core_v1.record_core_v1_retrieval`
+  and the legacy `db.log_retrieval_use` — now resolve it under the `quarantine`
+  policy, never `enforce`: a closeout is a write the agent chose and can retry,
+  while this receipt is a side effect of a *read*, and refusing retrieval to fix
+  a join is not a trade worth making. The claim is kept in `provenance_json` as
+  `session_identity.session_id_claim`, so a resolver that replaces a value never
+  destroys the one it replaced. A matching nullable `session_id_source` column is
+  added to both cores.
+- Reconcile the repo's three runtime folders instead of adding a fourth.
+  `scripts/procmine/episodes.normalize_runtime` now asks
+  `closeout.runtime_family` first and falls through to its own install-specific
+  rules only when that abstains, so the two can differ by abstention but never by
+  contradiction — asserted over the frozen live census rather than described in a
+  comment. Two consequences: `ocbrain-runtime-call`, this repository's own
+  runtime, is no longer `unknown` to its own normaliser (matched as an exact
+  spelling, because the token `ocbrain` also appears in `local-agent-mode-ocbrain`
+  on 66 rows); and the miner stops matching family tokens as substrings, the
+  defect the write-time rules were written to avoid and then left standing next
+  door. Measured across the 3,287 closeout and retrieval rows both have ever
+  seen, the reconciliation moves 8 rows — the spelling `cli`, from `unknown` to
+  `host-batch` — and regresses none.
+- `procmine` labels a server-minted `conn:` session id `server_observed` rather
+  than `model_reported`. It was inferring the answer from whether a
+  `client_session_hint` was present; the write path records who filled the column,
+  so the miner reads that and keeps the old heuristic only for the rows written
+  before the column existed.
+- Operator `runtime_aliases` keys are folded the way candidates are, so an entry
+  written `"claude code desktop"` can actually match. The shipped table is empty,
+  so nothing was broken — but a config key that can never fire is a trap with a
+  config file in front of it.
+- Pin the boundary between the two rankers this repo still carries. `core_v1.py`
+  serves the live path — FTS5 bm25 with tuned column weights, a 1024-dim dense
+  sidecar, weighted RRF at k=60, and a multiplicative
+  scope, confidence, quality, recency and feedback prior. `retrieve.py` independently
+  implements a retired blend: a flat `relevance * scope_weight * confidence *
+  pinned * catalog_stub` product with a repo-FTS fallback. `mcp.py`, `cli.py`
+  and `shared_context.py` all still import it, each behind an `is_core_v1` early
+  return, and **nothing enforced that**. A single `retrieve(...)` added outside
+  one of those guards would rank live beliefs by the legacy product, and all 907
+  tests would still pass — the two formulas would just quietly average.
+  Tracing `sys.settrace` over `retrieve.py` while dispatching the complete
+  advertised admin surface against `pre-compaction-20260828-claude.sqlite`, a
+  frozen 208,285,696-byte copy of the live core holding 1,247 current-belief
+  rows and 6,492 evidence objects: **0 of its 22 top-level functions run**. Those
+  two counts describe that file and nothing else — the live core reads 1,258 /
+  6,651 at 19:20Z the same day, because it is compacted and re-minted hourly.
+  Two drivers now assert that zero, one over `call_tool` and one over the
+  read-side CLI, and each carries its own positive control on a legacy core
+  where the count **must** be non-zero (it runs 9 distinct functions), so
+  blinding either driver fails rather than passing on an empty set. A static
+  scanner freezes the call sites at `{mcp.py: 2, cli.py: 1,
+  shared_context.py: 1}`, because a dynamic driver can only see call sites it
+  dispatches. Planting one v1-reachable `retrieve(...)` call in `call_tool`
+  above the `is_core_v1` return: **both gates fail**; removed, green.
+- Fix the containment gate's own two blind spots, found by adversarial review of
+  the commit above. Neither was hypothetical; both were demonstrated with a live
+  legacy call executing on a v1 core while the whole suite stayed green.
+  **The static scanner was an allow-list by import form.** It skipped any module
+  without a line *beginning* `from ocbrain.retrieve import retrieve`, and its
+  regex excluded aliased and attribute-qualified calls — so a function-local
+  import, a relative import, an alias, or `ocbrain.retrieve.retrieve(...)` was
+  invisible, and so was the parenthesized multi-line form this repo already uses
+  elsewhere. Against nine planted call sites written in nine legal binding
+  forms, it found **0 of 9**. It is now an AST binding resolver with no
+  import-form filter, counting every *reference* to the bound name rather than
+  only a direct `retrieve(` — and the scanner's evasive-binding self-test plants
+  all nine and requires all nine. Mutating the resolver back three ways
+  (top-level-only import scan, dropped attribute branch, calls-only counting)
+  fails that test each time.
+  **The dynamic gate had zero coverage of `cli.py`.** The driver dispatched
+  `mcp.call_tool` only, so the CLI trace cited as evidence was a one-off
+  analysis nothing re-ran — and `cmd_preview` is where the reviewer's planted
+  call lived. `READ_SIDE_CLI` now drives `status`, `briefing`, `digest`,
+  `search` and `preview` (with `--project` and `--cross-scope`) under the same
+  tracer, with the same legacy-core positive control; deleting `preview` from
+  that table fails the control.
+  Both of the reviewer's probes — a shim with a function-local import, and the
+  same shim with a relative one — now fail the static gate, and the first also
+  fails the new CLI gate.
+- Give `build_context` the guard its docstring was borrowing. It called the
+  legacy ranker unconditionally; the only `is_core_v1` check was one frame up in
+  `mcp.py`. That made the containment a property of today's call graph rather
+  than of the function — a second caller would have opened a live unguarded path
+  without changing the frozen call-site table, so neither gate would have seen
+  it. `build_context(v1_conn, ...)` did not raise; it returned a packet ranked by
+  the retired blend, because `current_beliefs` is a table name both schemas
+  share and nothing else fails. It now refuses a v1 core and points at
+  `build_context_v1`. `retrieve.py`'s other three call sites were re-read: all
+  three already refuse in their own frame.
+- Pin the tracer to the module under test. `_RETRIEVE_SOURCE` was built from the
+  repo layout, but under a bare interpreter `ocbrain` resolves through the
+  editable install instead of the checkout, no frame matches, and every count in
+  the gate reads a clean zero for the wrong reason — the reviewer hit exactly
+  this and caught it only because the positive control was empty too. It is now
+  derived from the imported module and asserted to be this worktree's file.
+- Nothing in the legacy dual path was deleted, and the reason is a measurement.
+  **Every** core database in `~/.ocbrain/backups/` is v1-shaped —
+  `schema_meta.core_schema = ocbrain.core.v1`, zero of `db.py`'s
+  `evidence`/`knowledge` tables — including the ones whose names imply otherwise
+  (`pre-v2-20260825`, `pre-v22-20260825`, `pre-brainfix-20260804`,
+  `ocbrain-sparse-wiki-20260722-1115`, and the oldest, `ocbrain-2026-07-15`).
+  The claim is "all of them", not a count: that directory gains a file per
+  compaction, and re-running the sweep read-only over all 24 core files present
+  at 19:20Z on 2026-08-28 returned 24 v1-shaped, 0 legacy-shaped. The one
+  non-core file, `ops-2026-07-17-pre-v1.1.0.sqlite`, does come back
+  legacy-shaped, which is the sweep's positive control.
+  No legacy-shaped core exists on this install. But `v1_migration.py` is still
+  reached by the shipped `ocbrain core-migrate-v1` command and is the only
+  reader for a *downstream* legacy archive, and `db.py` exports `connect`,
+  `now_iso`, `DEFAULT_DB_PATH`, `DB_BUSY_TIMEOUT_MS` and `PUBLIC_SCOPES` to
+  eleven other modules — its legacy `init_db` already refuses a v1 core by
+  design, which is why the live core has none of its tables.
+  And `retrieve.py` is imported at module scope by `cli.py`, `mcp.py` and
+  `shared_context.py`, so removing the file does not fail 25 tests — it takes
+  the suite down at collection: **39 collection errors, 0 tests run**. A change
+  that can only go green by deleting the tests that would have judged it is not
+  verified. Whether to drop legacy-core support is a policy call, not a
+  dead-code call; the containment gate above is what makes taking it later
+  cheap.
+
 - Stop the pending supersede ledger growing without bound. The first unattended
   night gave it producers and no consumer: the per-caller rate cap
   (`supersede.direct_cap`, default 8/24h) is sized for a runtime agent, so past

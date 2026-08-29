@@ -284,7 +284,7 @@ bootstrap_min_confidence = 0.85  # zero-signal bootstrap path (memory view empty
 [judge]                          # optional; disabled when api key env unset
 enabled          = true
 api_key_env      = OPENAI_API_KEY   # value NEVER persisted, logged, or printed
-model            = gpt-5-mini
+model            = gpt-5.6-luna     # keep in step with PROVIDER_DEFAULTS
 daily_usd_cap    = 0.50
 batch_size       = 20
 per_run_item_cap = 100

@@ -20,14 +20,17 @@ Checks
                    segment outside a small allowlist (this repo + orchestrator
                    infra). Pragmatic and low-false-positive: only project
                    container segments (``workspace/``, ``code/`` ...) are read.
+(e) infra IDs   -- no non-documentation IPv4 literals, OS Login account
+                   spellings, or the scanning machine's non-generic account
+                   name. Matched values are withheld from reports.
 
 The secret/entropy scanners (c) run only on added diff lines because, as the
 real tree proves, they false-positive on ordinary source (``api_key = env``)
 and on documentation hashes. Placement/denylist/private-path (a,b,d) run
-tree-wide. Test fixtures, lockfiles, the denylist file, and this module's own
-source are excluded from *content* scans because they necessarily contain
-adversarial-looking or definitional patterns; every other tracked file -- all
-product source, docs, ops, scripts -- is scanned.
+tree-wide. Test fixtures are scanned like product files; adversarial values in
+tests must be generated rather than committed verbatim. Only lockfiles, the
+local denylist file, and narrowly identified definitional scanner sources have
+content exemptions.
 """
 
 from __future__ import annotations
@@ -55,16 +58,93 @@ WORKSPACE_ALLOWLIST: set[str] = {"ocbrain", "task-artifacts", "task-status"}
 _FORBIDDEN_PREFIXES = ("data/", "logs/")
 _FORBIDDEN_SUFFIXES = (".jsonl",)
 
-# Files excluded from *content* scans (b/c/d) — see module docstring.
+# Files excluded from every content scan (b/c/d/e) — see module docstring.
 _CONTENT_SKIP_EXACT = {
     "uv.lock",
     "src/ocbrain/publicsafety.py",
     DENYLIST_REL,
 }
 
+# Files excluded only from the built-in heuristic scans (c/d/e). The procmine
+# redactor necessarily spells out the shapes it removes, examples included, but
+# it remains subject to the private denylist (b) just as it was before PR 56.
+_BUILTIN_SCAN_SKIP_EXACT = {"scripts/procmine/normalize.py"}
+
 # Absolute /Users/ path tokens, and the project-container segment inside them.
 _USERS_PATH_RE = re.compile(r"/Users/[^\s:\"'()\[\]<>|]+")
-_CONTAINER_RE = re.compile(r"/(?:workspace|code|repos|projects|git)/([A-Za-z0-9][A-Za-z0-9._-]*)")
+_CONTAINER_RE = re.compile(
+    r"/(?:workspace|code|repos|projects|git|Developer|Documents|Desktop|Downloads)"
+    r"/([A-Za-z0-9][A-Za-z0-9._-]*)"
+)
+# A dot-directory directly under a home directory (`/Users/<name>/.something/…`).
+# The tilde spelling (`~/.ocbrain/…`) stays usable in docs because it names
+# nobody; an absolute one reveals a username (covered by the account-name rule
+# on the machine that owns it) and the tool behind the dot-dir. The agent homes
+# this project itself documents are expected shapes; anything else is flagged.
+_HOME_DOTDIR_RE = re.compile(r"/Users/[^/\s]+/(\.[A-Za-z0-9][A-Za-z0-9._-]*)")
+_KNOWN_AGENT_DOTDIRS = {".ocbrain", ".openclaw", ".claude", ".codex", ".cursor", ".hermes"}
+
+# Infrastructure identifiers that carry no credential but deanonymize the
+# operator or the estate. These are exactly the shapes this scanner passed over
+# on 2026-08-24, when an internal IPv4 and a GCP OS Login account name sat on
+# public main inside committed atlas artifacts (scrubbed in 2f653f7): the
+# built-ins looked for credentials, and none of these is one. Same shapes as
+# scripts/procmine/normalize.py redacts -- copied, not imported, because the
+# package-boundary tests pin src/ocbrain as one distribution with no script
+# imports.
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+# Loopback, unspecified, broadcast, and the RFC 5737 documentation ranges stay
+# usable in examples; everything else routable is presumed real.
+_IPV4_EXEMPT_PREFIXES = ("127.", "0.", "255.", "192.0.2.", "198.51.100.", "203.0.113.")
+# The OS Login spelling of a work email: `first_last_com`. Narrower than the
+# normalize.py redaction pattern on purpose: a redactor can afford to over-match
+# (worst case, an identifier gets masked), a scanner cannot (the live tree
+# proved `search_documents_ai` and friends match an `_ai` TLD arm). Alpha-only
+# name parts, and only the TLDs that read as nothing else.
+_OSLOGIN_USER_RE = re.compile(r"\b[a-z]+_[a-z]+_(?:com|org|net)\b", re.IGNORECASE)
+# Account names too generic to treat as identifying: flagging these would class
+# half of any CI tree (GitHub-hosted runners execute as `runner`).
+_GENERIC_ACCOUNTS = {"runner", "root", "admin", "ubuntu", "jenkins", "builder", "user", "vagrant"}
+
+
+def local_account_pattern(account: str | None = None) -> re.Pattern[str] | None:
+    """A pattern for the scanning machine's own account name, or None.
+
+    The one string guaranteed private on every operator machine is the account
+    the scan runs as, and it needs no configuration to know. Guarded on length
+    and a generic-name set so a hosted runner or a bare `root` never turns the
+    whole tree into findings.
+    """
+    name = account if account is not None else Path.home().name
+    # Match procmine's established redaction floor: six characters catches the
+    # local operator account while the generic-name guard avoids CI identities.
+    if len(name) < 6 or name.lower() in _GENERIC_ACCOUNTS:
+        return None
+    return re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+
+
+def infrastructure_identifier_kinds(
+    text: str, account_pattern: re.Pattern[str] | None
+) -> list[str]:
+    """Which identifying shapes appear in ``text`` -- shapes only, never values.
+
+    Findings from this check land in CI logs, and on a public repository those
+    logs are public too: printing the matched token would re-leak exactly what
+    the finding exists to keep out.
+    """
+    kinds: list[str] = []
+    for match in _IPV4_RE.finditer(text):
+        token = match.group(0)
+        if token.startswith(_IPV4_EXEMPT_PREFIXES):
+            continue
+        if all(int(part) <= 255 for part in token.split(".")):
+            kinds.append("routable IPv4 literal")
+            break
+    if _OSLOGIN_USER_RE.search(text):
+        kinds.append("OS Login account spelling")
+    if account_pattern is not None and account_pattern.search(text):
+        kinds.append("this machine's account name")
+    return kinds
 
 # ``assigned_secret`` (text.py) fires on keyword-assignment to an UNQUOTED RHS,
 # which is exactly the false-positive class the real tree proves out:
@@ -78,6 +158,14 @@ _CONTAINER_RE = re.compile(r"/(?:workspace|code|repos|projects|git)/([A-Za-z0-9]
 # quoted literal the source pattern structurally could not.
 _QUOTED_SECRET_ASSIGN_RE = re.compile(
     r"""(?i)(api[_-]?key|secret|token|password|credential)\s*[:=]\s*["'][^"']{8,}["']"""
+)
+_PYTHON_DECLARATION_RE = re.compile(
+    r"^\s*(?:async\s+)?(?:def|class)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_SQL_DECLARATION_RE = re.compile(
+    r"^\s*CREATE\s+(?:UNIQUE\s+)?(?:INDEX|TRIGGER|TABLE|VIEW)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b",
+    re.IGNORECASE,
 )
 
 # A full public Git object id is reproducibility metadata, not a credential,
@@ -109,6 +197,13 @@ _PUBLIC_VERSION_VALUES = {"dataset-rubric-v3-human-calibration-anchors"}
 _PUBLIC_VERSION_ASSIGN_RE = re.compile(
     r"\bprompt_version\s*(?::[^=]+)?=\s*"
     r'''["'](?P<value>[a-z][a-z0-9]*(?:-[a-z0-9]+){2,})["']'''
+)
+
+# A shell mutation harness commonly passes a pytest node as one quoted
+# ``$VARIABLE::test_name`` argument. The long identifier is executable source,
+# not a literal; keep the exception as narrow as the Python NAME-token rule.
+_SHELL_PYTEST_NODE_RE = re.compile(
+    r'''(?P<quote>["'])\$[A-Z][A-Z0-9_]*::(?P<node>test_[a-z0-9_]+)(?P=quote)'''
 )
 
 
@@ -216,6 +311,10 @@ def private_path_segments(text: str, allowlist: set[str]) -> list[str]:
             name = seg.group(1)
             if name not in allowlist:
                 hits.append(name)
+        for seg in _HOME_DOTDIR_RE.finditer(token):
+            name = seg.group(1)
+            if name not in _KNOWN_AGENT_DOTDIRS and name not in allowlist:
+                hits.append(name)
     return hits
 
 
@@ -234,7 +333,16 @@ def is_forbidden_tracked_path(rel: str) -> bool:
 
 
 def content_scan_excluded(rel: str) -> bool:
-    return rel in _CONTENT_SKIP_EXACT or rel.startswith("tests/") or rel.endswith(".lock")
+    return rel in _CONTENT_SKIP_EXACT or rel.endswith(".lock")
+
+
+def builtin_scan_excluded(rel: str) -> bool:
+    """True when built-in heuristics must skip definitional scanner source.
+
+    This deliberately does not exempt the file from the private denylist.
+    """
+
+    return rel in _BUILTIN_SCAN_SKIP_EXACT
 
 
 def entropy_pathcheck_excluded(rel: str) -> bool:
@@ -281,14 +389,19 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
 
     if not rel.endswith(".py") or not spans:
         return spans
+    declared = _PYTHON_DECLARATION_RE.match(line)
+    names = {declared.group("name")} if declared is not None else set()
     try:
-        names = {
+        names.update(
             token.string
             for token in tokenize.generate_tokens(io.StringIO(line.lstrip()).readline)
             if token.type == tokenize.NAME
-        }
+        )
     except (IndentationError, tokenize.TokenError):
-        return spans
+        # A multiline `def name(` is incomplete by itself and cannot be
+        # tokenized, but its declaration identifier is still structurally
+        # unambiguous. Quoted values never enter `names` through this fallback.
+        pass
     kept: list[str] = []
     for span in spans:
         parts = [part for part in re.split(r"=+", span) if part]
@@ -296,6 +409,27 @@ def filter_python_identifier_spans(rel: str, line: str, spans: list[str]) -> lis
             continue
         kept.append(span)
     return kept
+
+
+def filter_sql_identifier_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop only the object identifier in a SQL DDL declaration."""
+
+    if not rel.endswith(".sql") or not spans:
+        return spans
+    declaration = _SQL_DECLARATION_RE.match(line)
+    if declaration is None:
+        return spans
+    name = declaration.group("name")
+    return [span for span in spans if span != name]
+
+
+def filter_shell_pytest_node_spans(rel: str, line: str, spans: list[str]) -> list[str]:
+    """Drop only quoted ``$VAR::test_<identifier>`` shell node selectors."""
+
+    if not rel.endswith(".sh") or not spans:
+        return spans
+    nodes = {match.group("node") for match in _SHELL_PYTEST_NODE_RE.finditer(line)}
+    return [span for span in spans if span not in nodes]
 
 
 def filter_public_version_spans(rel: str, line: str, spans: list[str]) -> list[str]:
@@ -389,6 +523,7 @@ def _read_text(path: Path) -> str | None:
 
 def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
     result = ScanResult(diff_range=diff_range)
+    account_pattern = local_account_pattern()
     denylist, present = load_denylist(root)
     result.denylist_present = present
     result.denylist_size = len(denylist)
@@ -428,24 +563,39 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                             line=i,
                         )
                     )
+            if builtin_scan_excluded(rel):
+                continue
             # (d) private /Users/ path -- tree-wide, except plists (see
             # entropy_pathcheck_excluded: wrapper/log paths are legitimate).
             if not entropy_pathcheck_excluded(rel):
-                for seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
+                for _seg in private_path_segments(line, WORKSPACE_ALLOWLIST):
                     result.findings.append(
                         Finding(
                             "private_path",
                             rel,
-                            f"absolute /Users/ path reveals non-allowlisted segment '{seg}'",
+                            "absolute /Users/ path reveals a non-allowlisted segment "
+                            "(value withheld from this report)",
                             line=i,
                         )
                     )
+            # (e) infrastructure identifiers -- tree-wide, shapes only.
+            # Unlike path/entropy heuristics, this remains active for plists:
+            # those files can legitimately contain paths but not private hosts.
+            for kind in infrastructure_identifier_kinds(line, account_pattern):
+                result.findings.append(
+                    Finding(
+                        "infra_identifier",
+                        rel,
+                        f"line carries a {kind} (value withheld from this report)",
+                        line=i,
+                    )
+                )
 
     # (c) new secrets -- diff-scoped, high false-positive tree-wide so added
     # lines only. Reuses the text.py secret/leak + entropy scanners.
     if diff_range:
         for rel, lineno, content in git_added_lines(root, diff_range):
-            if content_scan_excluded(rel):
+            if content_scan_excluded(rel) or builtin_scan_excluded(rel):
                 continue
             leaks = refine_secret_leaks(content, find_probable_secret_leaks(content))
             if leaks:
@@ -464,6 +614,8 @@ def scan(root: Path, *, diff_range: str | None = None) -> ScanResult:
                 spans = filter_public_sha256_spans(content, spans)
                 spans = filter_public_url_spans(content, spans)
                 spans = filter_python_identifier_spans(rel, content, spans)
+                spans = filter_sql_identifier_spans(rel, content, spans)
+                spans = filter_shell_pytest_node_spans(rel, content, spans)
                 spans = filter_public_version_spans(rel, content, spans)
                 if spans:
                     result.findings.append(

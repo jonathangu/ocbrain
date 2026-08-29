@@ -102,6 +102,11 @@ def _closeout(conn, ctx, task_ref, status, *, verifier=None, summary="did a thin
         actions=[],
         outcomes=[],
         awaiting=kwargs.pop("awaiting", "a human" if status == "blocked" else None),
+        # Anything that is not a clean success owes an `unresolved`; the fixture
+        # supplies a default so these tests stay about the briefing.
+        unresolved=kwargs.pop(
+            "unresolved", None if status == "completed" else "the thing did not work"
+        ),
         actor="test",
         **kwargs,
     )
@@ -1104,18 +1109,29 @@ def test_cli_briefing_and_ledger_routes(tmp_path, ctx, capsys):
     db = tmp_path / "cli.sqlite"
     conn = connect(db)
     init_core_v1(conn)
-    _closeout(conn, ctx, "TASK-1", "failed", summary="the trainer import is circular")
+    _closeout(
+        conn,
+        ctx,
+        "TASK-1",
+        "failed",
+        summary="tried three import orders",
+        unresolved="the trainer import is circular",
+    )
     conn.commit()
     conn.close()
 
     assert main(["--db", str(db), "briefing", "--project", "ocbrain", "--text"]) == 0
     text = capsys.readouterr().out
     assert text.startswith("OCBRAIN BRIEFING")
+    # The FAILED line carries what is still broken, not what the session did.
+    # Both are in the receipt; only one of them stops the next iteration
+    # repeating the afternoon, and the briefing has 1,500 characters.
     assert "the trainer import is circular" in text
 
     assert main(["--db", str(db), "ledger", "--task-ref", "TASK-1"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["entries"][0]["state"] == "attempted_failed"
+    assert payload["entries"][0]["latest_unresolved"] == "the trainer import is circular"
 
 
 def test_cli_repo_root_resolves_a_pointer_without_narrowing_the_ledger(tmp_path, capsys):

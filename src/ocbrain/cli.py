@@ -27,7 +27,7 @@ from ocbrain.compact import (
     undo_command,
     undo_merge,
 )
-from ocbrain.config import describe_config, load_config
+from ocbrain.config import ConfigError, describe_config, load_config
 from ocbrain.core_ops import (
     backup_database,
     database_status,
@@ -42,10 +42,15 @@ from ocbrain.core_v1 import (
     init_core_v1,
     is_core_v1,
     migrate_core_v1_columns,
+    reclassify_no_coverage_receipts,
     record_core_v1_evidence,
 )
 from ocbrain.curation import apply_curated_manifest
-from ocbrain.curator import PROVIDER_DEFAULTS, resolve_selection_policy
+from ocbrain.curator import (
+    DEFAULT_MEASURED_TTL_DAYS,
+    DEFAULT_VOLATILE_TTL_DAYS,
+    PROVIDER_DEFAULTS,
+)
 from ocbrain.db import (
     DEFAULT_DB_PATH,
     PUBLIC_SCOPES,
@@ -187,6 +192,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     curated_apply.set_defaults(func=cmd_curated_apply)
 
+    feedback_repair = commands.add_parser(
+        "feedback-repair",
+        help="Reclassify relevance verdicts filed on zero-item retrievals as no_coverage",
+    )
+    feedback_repair.add_argument(
+        "--apply",
+        action="store_true",
+        help="rewrite the selected receipts (default: report only)",
+    )
+    feedback_repair.set_defaults(func=cmd_feedback_repair)
+
     hygiene_parser = commands.add_parser(
         "hygiene",
         help="Retire expired, never-retrieved, or badly-judged beliefs",
@@ -280,6 +296,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compact_parser.set_defaults(func=cmd_compact)
 
+    volatility_parser = commands.add_parser(
+        "wiki-volatility",
+        help="Re-date serving beliefs by volatility class; prints a plan by default",
+    )
+    volatility_parser.add_argument(
+        "--volatile-days",
+        type=int,
+        default=DEFAULT_VOLATILE_TTL_DAYS,
+        help="TTL for a belief naming a host, version, credential or live state",
+    )
+    volatility_parser.add_argument(
+        "--measured-days",
+        type=int,
+        default=DEFAULT_MEASURED_TTL_DAYS,
+        help="TTL for a measurement or result",
+    )
+    volatility_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=True,
+        help="print the plan and write nothing (the default)",
+    )
+    volatility_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the new expiries; additionally requires --yes",
+    )
+    volatility_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm that a human read the plan, including already_expired",
+    )
+    volatility_parser.add_argument(
+        "--actor", default="operator", help="who authorised the re-dating"
+    )
+    volatility_parser.set_defaults(func=cmd_wiki_volatility)
+
     config_parser = commands.add_parser(
         "config",
         help="Show the effective configuration and where each value came from",
@@ -298,6 +351,39 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser = commands.add_parser("doctor", help="Check the core and stdio MCP")
     doctor_parser.add_argument("--timeout", type=float, default=8.0)
     doctor_parser.add_argument("--launcher", type=Path)
+    doctor_parser.add_argument(
+        "--ops",
+        action="store_true",
+        help=(
+            "Also verify the machine against its ops manifest: launchd jobs "
+            "loaded with the intended env, hooks byte-identical to their repo "
+            "sources, control files present. The DB can be healthy while the "
+            "wiring around it is not; this is the check that notices."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--write-manifest",
+        action="store_true",
+        help=(
+            "With --ops: snapshot the current wiring as the intended wiring "
+            "before checking. Run once on deployment day, and again whenever "
+            "a wiring change is deliberate."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--ops-manifest",
+        type=Path,
+        help="Manifest location (default ~/.ocbrain/ops-manifest.json)",
+    )
+    doctor_parser.add_argument(
+        "--replace-manifest",
+        action="store_true",
+        help=(
+            "With --ops --write-manifest: replace an existing manifest after "
+            "reviewing the intended wiring change. Without this flag, bootstrap "
+            "refuses to erase an existing drift baseline."
+        ),
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
     runtime = commands.add_parser("runtime-check", help="Probe all three client integrations")
     runtime.add_argument("--timeout", type=float, default=12.0)
@@ -878,6 +964,24 @@ def cmd_curated_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_feedback_repair(args: argparse.Namespace) -> int:
+    """Report, or on ``--apply`` rewrite, relevance verdicts on empty retrievals.
+
+    Deliberately opt-in with a reporting default: the rows are live history, and
+    an automatic migration would rewrite an operator's corpus on the next open
+    of a version they did not choose to run.
+    """
+    conn = open_existing_core_v1(args.db)
+    try:
+        report = reclassify_no_coverage_receipts(conn, apply=bool(args.apply))
+        if args.apply:
+            conn.commit()
+    finally:
+        conn.close()
+    output(args, {"action": "feedback-repair", **report})
+    return 0
+
+
 def cmd_hygiene(args: argparse.Namespace) -> int:
     conn = open_existing_core_v1(args.db)
     try:
@@ -913,8 +1017,57 @@ def cmd_hygiene(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wiki_volatility(args: argparse.Namespace) -> int:
+    """Plan, or on an explicit double confirmation apply, volatility-class TTLs.
+
+    Dry run by default and dry run unless *both* ``--apply`` and ``--yes`` are
+    given, because the number that matters here -- how many serving beliefs the
+    new scheme has already expired -- is only knowable from the plan.
+    """
+    from ocbrain.curator import (
+        apply_volatility_ttl,
+        curator_runtime_settings,
+        plan_volatility_ttl,
+    )
+
+    # The same off switch the compile path honours. `curator.current_ttl_days=0`
+    # means "this brain does not expire beliefs"; a sweep that re-dated them
+    # anyway would be the operator control that works in one place only.
+    current_ttl_days = curator_runtime_settings()["current_ttl_days"]
+    conn = open_existing_core_v1(args.db)
+    try:
+        if args.apply and args.yes:
+            result = apply_volatility_ttl(
+                conn,
+                actor=args.actor,
+                current_ttl_days=current_ttl_days,
+                volatile_ttl_days=args.volatile_days,
+                measured_ttl_days=args.measured_days,
+            )
+            result["applied"] = True
+        else:
+            result = plan_volatility_ttl(
+                conn,
+                current_ttl_days=current_ttl_days,
+                volatile_ttl_days=args.volatile_days,
+                measured_ttl_days=args.measured_days,
+            )
+            result["applied"] = False
+            if args.apply and not args.yes:
+                result["refused"] = "--apply needs --yes; nothing was written"
+    finally:
+        conn.close()
+    output(args, {"action": "wiki-volatility", **result})
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
-    report = describe_config()
+    # The one command an operator runs to debug their config must report a
+    # malformed file, not crash on it.
+    try:
+        report = describe_config()
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.section:
         if args.section not in report["sections"]:
             available = ", ".join(sorted(report["sections"]))
@@ -931,12 +1084,58 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    ops = bool(getattr(args, "ops", False))
+    write_manifest = bool(getattr(args, "write_manifest", False))
+    replace_manifest = bool(getattr(args, "replace_manifest", False))
+    ops_manifest = getattr(args, "ops_manifest", None)
+    if not ops and (write_manifest or replace_manifest or ops_manifest is not None):
+        output(
+            args,
+            {
+                "action": "doctor",
+                "status": "failed",
+                "healthy": False,
+                "error": "--write-manifest, --replace-manifest, and --ops-manifest require --ops",
+            },
+        )
+        return 2
+    if replace_manifest and not write_manifest:
+        output(
+            args,
+            {
+                "action": "doctor",
+                "status": "failed",
+                "healthy": False,
+                "error": "--replace-manifest requires --write-manifest",
+            },
+        )
+        return 2
     result = doctor(
         args.db,
         timeout_seconds=args.timeout,
         launcher=args.launcher,
         check_clients=False,
     )
+    if ops:
+        from ocbrain.opscheck import ops_check, write_ops_manifest
+
+        if write_manifest:
+            try:
+                write_ops_manifest(ops_manifest, replace=replace_manifest)
+            except OSError as exc:
+                result["ops"] = {
+                    "action": "ops-manifest-write",
+                    "status": "failed",
+                    "healthy": False,
+                    "error": str(exc),
+                }
+                result["healthy"] = False
+                result["status"] = "failed"
+                output(args, result)
+                return 2
+        result["ops"] = ops_check(ops_manifest)
+        result["healthy"] = bool(result["healthy"]) and bool(result["ops"]["healthy"])
+        result["status"] = "ok" if result["healthy"] else "failed"
     output(args, result)
     return 0 if result["healthy"] else 1
 
@@ -3006,10 +3205,8 @@ def cmd_compact(args: argparse.Namespace) -> int:
             output(args, {"action": "compact", "undone": result})
             return 0
         curator_cfg = load_config().curator
-        egress_policies, visibilities = resolve_selection_policy(
-            egress_policies=tuple(curator_cfg.egress_policies),
-            visibilities=tuple(curator_cfg.visibilities),
-        )
+        egress_policies = tuple(curator_cfg.egress_policies)
+        visibilities = tuple(curator_cfg.visibilities)
         plan = plan_compaction(
             conn,
             cosine_floor=args.cosine,

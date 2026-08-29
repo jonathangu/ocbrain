@@ -40,7 +40,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -238,6 +238,19 @@ THRESHOLDS: dict[str, Threshold] = {
         "replacement buried in the correction body. Verified on the live core at "
         "2026-08-25 -- 11 agent corrections, all op=retract, zero supersedes.",
     ),
+    "lossy_supersession_share": Threshold(
+        LOWER_BETTER,
+        0.15,
+        0.40,
+        "Share of machine-authored supersessions whose successor drops a "
+        "checkable token (an issue ref, backticked literal, path, flag, "
+        "identifier, or figure) the predecessor carried. The 2026-08-26 backlog "
+        "triage found 15 of 28 curator-proposed supersessions would have "
+        "silently destroyed checkable facts; the landed population measures "
+        "46/82 (56%) with this extractor, 2026-08-26 -- an honest alarm at "
+        "ship. A refresh that legitimately updates a count moves this too, "
+        "which is why the ok band is not zero. Judgement.",
+    ),
     "pending_supersede_age_hours": Threshold(
         LOWER_BETTER,
         72.0,
@@ -327,6 +340,19 @@ THRESHOLDS: dict[str, Threshold] = {
         1.0,
         "SQLite quick_check plus foreign_key_check. Binary: either the core is "
         "structurally sound or it is not.",
+    ),
+    "egress_refusable_policies": Threshold(
+        HIGHER_BETTER,
+        1.0,
+        1.0,
+        "How many egress policies present in this brain's curation-eligible "
+        "evidence the declared allow-list would refuse. Binary by construction: "
+        "at zero the gate has no reachable failing input, so a clean audit means "
+        "nothing. Measured 0 on the live core on 2026-08-28 -- the allow-list "
+        "named all three policies the corpus contains, and all 240 egress audits "
+        "carried rejected_json='[]' across 25,106 transmitted items. Set "
+        "curator.egress_allowlist_ack to declare that as intended; the "
+        "acknowledgement downgrades the verdict and is recorded with it.",
     ),
     "vector_sidecar_lag_events": Threshold(
         LOWER_BETTER,
@@ -1208,6 +1234,88 @@ def _correction_adoption(conn: sqlite3.Connection, cutoff: str) -> Metric:
     )
 
 
+# Something a reader could look up, run, or verify: an issue ref (#3495), a
+# backticked literal, a path, a dotted/underscored/hyphenated identifier, a
+# flag, a figure (with its % or unit prefix intact), a slash pair (A/A), or an
+# acronym. Extends the deslop checkable-content arms from a presence test into
+# a set extractor -- deslop asks "is there anything checkable", this asks
+# "which checkable things, exactly", because a rewording is judged by the
+# difference of the two sets.
+_CHECKABLE_TOKEN_RE = re.compile(
+    r"(?:#\d+|`[^`\n]+`|[~/][\w./-]+|--\w[\w-]*|\w+(?:[._-]\w+)+"
+    r"|\b\d+(?:\.\d+)?%?\b|\b[A-Z][\w]*/[A-Z][\w]*\b|\b[A-Z]{2,}\b)"
+)
+
+
+def _checkable_tokens(body: str) -> set[str]:
+    return set(_CHECKABLE_TOKEN_RE.findall(body or ""))
+
+
+def _lossy_supersessions(conn: sqlite3.Connection, cutoff: str) -> Metric:
+    """Do machine rewordings preserve the facts a reader could check?
+
+    A machine-authored supersession -- a curator refresh or a compactor merge --
+    claims to restate or consolidate, not to correct. When its successor drops a
+    PR reference, a profile list, or a named figure the predecessor carried, the
+    corpus got smoother and knows less. The 2026-08-26 triage found this was the
+    COMMON case among pending curator proposals, not the exception. Agent-issued
+    supersessions are excluded: a correction is SUPPOSED to drop the tokens of
+    the fact it refutes.
+    """
+    rows = list(
+        conn.execute(
+            "SELECT e.writer AS writer,"
+            "       json_extract(e.body_json, '$.target_id') AS old_id,"
+            "       o.body AS old_body, n.body AS new_body"
+            " FROM brain_events e"
+            " JOIN current_beliefs o ON o.belief_id = json_extract(e.body_json, '$.target_id')"
+            " JOIN current_beliefs n ON n.belief_id = json_extract(e.body_json, '$.successor_id')"
+            " WHERE e.kind='correction_recorded'"
+            "   AND json_extract(e.body_json, '$.op')='supersede'"
+            "   AND e.ts >= ?",
+            (cutoff,),
+        )
+    )
+    machine = [row for row in rows if _is_machine_writer(str(row["writer"] or ""))]
+    if not machine:
+        return _unmeasured(
+            "lossy_supersession_share",
+            "C",
+            "Machine rewordings that drop checkable tokens",
+            "no machine-authored supersessions in the window",
+            agent_supersessions=len(rows),
+        )
+    by_writer: dict[str, dict[str, int]] = {}
+    lossy_ids: list[str] = []
+    for row in machine:
+        writer = str(row["writer"] or "")
+        bucket = by_writer.setdefault(writer, {"pairs": 0, "lossy": 0})
+        bucket["pairs"] += 1
+        dropped = _checkable_tokens(str(row["old_body"])) - _checkable_tokens(
+            str(row["new_body"])
+        )
+        if dropped:
+            bucket["lossy"] += 1
+            if len(lossy_ids) < 5:
+                lossy_ids.append(str(row["old_id"]))
+    lossy = sum(bucket["lossy"] for bucket in by_writer.values())
+    share = lossy / len(machine)
+    return _measured(
+        "lossy_supersession_share",
+        "C",
+        "Machine rewordings that drop checkable tokens",
+        share,
+        display=f"{share:.1%} ({lossy}/{len(machine)})",
+        basis=(
+            "machine-authored supersessions whose successor body lost at least "
+            "one checkable token / all machine-authored supersessions"
+        ),
+        by_writer=by_writer,
+        sample_lossy_targets=lossy_ids,
+        agent_supersessions=len(rows) - len(machine),
+    )
+
+
 def _pending_queue(conn: sqlite3.Connection, now: datetime) -> list[Metric]:
     """Distinct beliefs awaiting a supersede decision, and the age of the oldest.
 
@@ -1740,6 +1848,97 @@ def _storage(conn: sqlite3.Connection, cutoff: str, since_days: int) -> list[Met
     return metrics
 
 
+def _egress_gate(conn: sqlite3.Connection) -> Metric:
+    """Can the curator's egress allow-list refuse anything this corpus contains?
+
+    Not "did it refuse something" -- that is the number the audits already give,
+    and on this brain it was zero 240 times running. A guard that admits every
+    value its input can take has no failing input, and every clean run of it is
+    evidence of nothing. So the question asked here is whether a refusal is
+    *reachable*, and the answer is a property of the configuration and the
+    corpus rather than of any one run.
+    """
+    from ocbrain.curator import (
+        ELIGIBLE_KINDS,
+        FORBIDDEN_EGRESS_POLICIES,
+        FORBIDDEN_VISIBILITIES,
+        refusable_policies,
+        resolve_selection_policy,
+    )
+
+    if not _table_exists(conn, "evidence_objects"):
+        return _unmeasured(
+            "egress_refusable_policies", "D", "Egress allow-list has teeth", "no evidence_objects"
+        )
+    acknowledgement = ""
+    declared: tuple[str, ...] = ()
+    try:
+        from ocbrain.config import load_config
+
+        section = load_config().curator
+        acknowledgement = " ".join(str(section.egress_allowlist_ack or "").split())
+        declared, _visibilities = resolve_selection_policy(
+            egress_policies=list(section.egress_policies),
+            visibilities=list(section.visibilities),
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken config is its own finding
+        return _unmeasured(
+            "egress_refusable_policies",
+            "D",
+            "Egress allow-list has teeth",
+            f"curator config unreadable: {type(exc).__name__}",
+        )
+    placeholders = ",".join("?" for _ in ELIGIBLE_KINDS)
+    present = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT DISTINCT egress_policy FROM evidence_objects "  # noqa: S608 - kind count only
+            f"WHERE kind IN ({placeholders}) AND scope_type='project'",
+            tuple(sorted(ELIGIBLE_KINDS)),
+        )
+        if row[0]
+    }
+    # The floor is not part of the operator's declaration and is enforced in
+    # code, so a corpus containing `prohibited` evidence does not earn the
+    # allow-list credit for refusing it. Shared with the audit row's own
+    # `allowlist_vacuous` field, so a stored audit and this scorecard cannot
+    # disagree about whether the gate had teeth.
+    refusable = refusable_policies(declared, present)
+    audits = 0
+    audits_with_refusals = 0
+    if _table_exists(conn, "egress_audits"):
+        audits = int(_scalar(conn, "SELECT COUNT(*) FROM egress_audits") or 0)
+        audits_with_refusals = int(
+            _scalar(
+                conn,
+                "SELECT COUNT(*) FROM egress_audits "
+                "WHERE rejected_json IS NOT NULL AND rejected_json NOT IN ('', '[]')",
+            )
+            or 0
+        )
+    metric = _measured(
+        "egress_refusable_policies",
+        "D",
+        "Egress allow-list has teeth",
+        float(len(refusable)),
+        display=f"{len(refusable)} of {len(present)} present policies refusable",
+        basis="egress policies on curation-eligible evidence the allow-list would refuse",
+        declared_egress_policies=list(declared),
+        present_egress_policies=sorted(present),
+        refusable_policies=refusable,
+        forbidden_in_code=sorted(FORBIDDEN_EGRESS_POLICIES | FORBIDDEN_VISIBILITIES),
+        egress_audits=audits,
+        egress_audits_with_refusals=audits_with_refusals,
+        acknowledgement=acknowledgement or None,
+    )
+    if metric.status == ALARM and acknowledgement:
+        # Declared, not enumerated: an operator who says why an all-admitting
+        # allow-list is intended here gets a WATCH carrying their reason, not a
+        # silent pass and not a permanent red.
+        return replace(metric, status=WATCH)
+    return metric
+
+
 def _sidecar_freshness(conn: sqlite3.Connection) -> Metric:
     from ocbrain.hybrid import VECTOR_SCHEMA_VERSION, connection_path, vector_db_path
 
@@ -2131,12 +2330,14 @@ def run_selftest(
     metrics.append(_calibration(conn, now))
     metrics.extend(_duplicates(conn))
     metrics.append(_correction_adoption(conn, cutoff))
+    metrics.append(_lossy_supersessions(conn, cutoff))
     metrics.extend(_pending_queue(conn, now))
     metrics.append(_contradiction_rate(conn, cutoff))
     metrics.append(_provenance(conn, cutoff))
     metrics.append(_closeout_join(conn, cutoff, transcript_root))
     metrics.append(_harvest(conn, now))
     metrics.extend(_storage(conn, cutoff, since_days))
+    metrics.append(_egress_gate(conn))
     metrics.append(_sidecar_freshness(conn))
     metrics.append(_integrity(conn))
     metrics.extend(_harness_surface(conn, now))

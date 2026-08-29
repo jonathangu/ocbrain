@@ -22,7 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from ocbrain.closeout import normalize_task_ref
+from ocbrain.closeout import normalize_task_ref, resolve_session_identity
 from ocbrain.history_window import is_body_ref
 from ocbrain.hybrid import semantic_neighbors
 from ocbrain.ids import stable_id
@@ -49,6 +49,33 @@ PROCEDURE_BELIEF_TYPE = "procedure"
 # See `ocbrain.briefing` and `_servable_knowledge_sql` below.
 GOAL_BELIEF_TYPE = "goal"
 CORE_V1_EVENT_SCHEMA = "ocbrain.event.v1"
+
+# Retrieval receipt outcomes, split by who is entitled to write them.
+#
+# RELEVANCE_OUTCOMES are judgements about *served items* and are the only values
+# a caller may file through ``brain.feedback``. SERVED_OUTCOME and
+# NO_COVERAGE_OUTCOME are written by the server when it records the receipt: it
+# counts the items it just served in the same statement that writes the row, so
+# the zero-item case is observed, not reported. A caller-supplied "nothing came
+# back" flag would be a second, unverifiable claim about a number the server
+# already holds -- and the population it would describe is exactly the one that
+# goes unreported when reporting is voluntary.
+RELEVANCE_OUTCOMES: tuple[str, ...] = ("helpful", "used", "irrelevant", "ignored", "harmful")
+SERVED_OUTCOME = "served"
+NO_COVERAGE_OUTCOME = "no_coverage"
+# Stamped on a receipt the maintenance command rewrote, so an operator can tell
+# a server-derived no_coverage from a reclassified one.
+NO_COVERAGE_RECLASSIFY_SOURCE = "maintenance:no_coverage_reclassify"
+# What each verdict is worth to ranking. Unchanged from the CASE expression this
+# replaced (see ``retrieval_history_by_lineage``); only the language moved.
+_FEEDBACK_SIGNAL: dict[str, float] = {
+    "helpful": 2.0,
+    "used": 1.0,
+    "irrelevant": -1.5,
+    "ignored": -0.5,
+    "harmful": -4.0,
+}
+
 HYBRID_RRF_K = 60
 # Qwen3's low positive tail is not evidence of topical relevance. Keep a
 # moderately permissive floor for candidates that lexical retrieval can
@@ -65,6 +92,40 @@ MIN_REDUNDANT_LEXICAL_STRENGTH_RATIO = 0.50
 # A lexical hit is held to MIN_DENSE_COSINE too, but only when the dense arm is
 # healthy enough to judge it. See ``_retrieval_tuning``.
 REQUIRE_DENSE_SUPPORT = True
+# Whether `ranking_prior` still multiplies by `0.85 + 0.15 * confidence`.
+# Ships True, which is the behaviour every live packet was built with. Turning
+# it off is a policy change, not a bug fix: see docs/THRESHOLDS.md.
+CONFIDENCE_PRIOR_ENABLED = True
+
+# The shapes a caller uses to name one exact record: a stable object id, a
+# SHA-256, or a terminal artifact URI. These live here rather than in
+# ``ocbrain.mcp_v1`` because ``search_core_v1`` has to recognise them too --
+# ``brain.search`` short-circuited on a locator while ``brain.context`` did not,
+# and that asymmetry is what let a nonexistent locator reach dense ranking.
+SHA256_TEXT_RE = re.compile(r"^[0-9a-f]{64}$")
+STABLE_OBJECT_ID_RE = re.compile(r"^(?:evt|evd|belief|close|ret)_[0-9a-f]{16}$")
+TERMINAL_ARTIFACT_URI_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://\S+|ocbrain-bundle:sha256:[0-9a-f]{64}|"
+    r"closeout:close_[0-9a-f]{16})$",
+    re.IGNORECASE,
+)
+
+
+def looks_like_exact_locator(query: str) -> bool:
+    """True when the query names one exact record rather than a topic.
+
+    Shape only: this says nothing about whether the record exists. That is the
+    point -- a well-formed locator that resolves to nothing must return nothing,
+    and a caller cannot be told "no such record" by a ranker that always has a
+    nearest neighbour to offer.
+    """
+    text = str(query).strip()
+    lowered = text.lower()
+    return bool(
+        STABLE_OBJECT_ID_RE.fullmatch(lowered)
+        or SHA256_TEXT_RE.fullmatch(lowered)
+        or TERMINAL_ARTIFACT_URI_RE.fullmatch(text)
+    )
 
 
 _RETRIEVAL_FALLBACK = SimpleNamespace(
@@ -74,6 +135,7 @@ _RETRIEVAL_FALLBACK = SimpleNamespace(
     min_lexical_query_term_matches=MIN_LEXICAL_QUERY_TERM_MATCHES,
     min_redundant_lexical_strength_ratio=MIN_REDUNDANT_LEXICAL_STRENGTH_RATIO,
     require_dense_support=REQUIRE_DENSE_SUPPORT,
+    confidence_prior_enabled=CONFIDENCE_PRIOR_ENABLED,
     feedback_weight=0.125,
     feedback_clamp=0.25,
     feedback_prior_observations=3.0,
@@ -278,7 +340,12 @@ CREATE TABLE IF NOT EXISTS retrieval_uses (
   provenance_json TEXT,
   -- The folded form of `task_ref` above, so a retrieval and the closeout that
   -- links it agree on which task they belong to. NULL on historical rows.
-  task_ref_norm TEXT
+  task_ref_norm TEXT,
+  -- On whose word `session_id` above was filled, exactly as on task_closeouts.
+  -- The identical defect lived here at four times the scale: 967 of 1,115
+  -- session ids on the live core were hand-written and none joined a
+  -- transcript. NULL on every historical row.
+  session_id_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_retrieval_uses_outcome_served
   ON retrieval_uses(outcome, served_at);
@@ -366,7 +433,15 @@ CREATE TABLE IF NOT EXISTS task_closeouts (
   -- before they existed: the fold happens at write time and history is never
   -- rewritten. See ocbrain.closeout.normalize_task_ref.
   parent_closeout_id TEXT,
-  task_ref_norm TEXT
+  task_ref_norm TEXT,
+  -- Write-time discipline, all three derived in ocbrain.closeout and NULL on
+  -- every historical row. `session_id_source` says on whose word `session_id`
+  -- was filled (harness_attested / agent_reported / server_connection / none);
+  -- `runtime_family` is the groupable form of the free-text `runtime` above,
+  -- which stays verbatim; `unresolved` is what the caller said did not work.
+  session_id_source TEXT,
+  runtime_family TEXT,
+  unresolved TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_task_closeouts_session_hint
   ON task_closeouts(client_session_hint, closed_at);
@@ -493,6 +568,10 @@ _ADDITIVE_CORE_V1_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("task_closeouts", "client_runtime_key", "TEXT"),
     ("task_closeouts", "parent_closeout_id", "TEXT"),
     ("task_closeouts", "task_ref_norm", "TEXT"),
+    ("retrieval_uses", "session_id_source", "TEXT"),
+    ("task_closeouts", "session_id_source", "TEXT"),
+    ("task_closeouts", "runtime_family", "TEXT"),
+    ("task_closeouts", "unresolved", "TEXT"),
 )
 
 _ADDITIVE_CORE_V1_INDEXES: tuple[str, ...] = (
@@ -1789,6 +1868,115 @@ def get_core_v1_evidence(conn: sqlite3.Connection, evidence_id: str) -> dict[str
     return result
 
 
+def _evidence_support(
+    conn: sqlite3.Connection, evidence_ids: Iterable[str]
+) -> tuple[int, str | None]:
+    """How many evidence objects back a belief, and when the newest was recorded.
+
+    Both are facts about the record that a reader can go and check, which is the
+    property the served ``confidence`` number never had.
+    """
+    ids = [str(value) for value in evidence_ids if str(value)]
+    if not ids:
+        return 0, None
+    placeholders = ",".join("?" for _ in ids)
+    row = conn.execute(
+        "SELECT COUNT(*), MAX(recorded_at) FROM evidence_objects "
+        f"WHERE evidence_id IN ({placeholders})",  # noqa: S608 - placeholders only
+        ids,
+    ).fetchone()
+    if row is None:
+        return 0, None
+    return int(row[0] or 0), (str(row[1]) if row[1] else None)
+
+
+def _exact_locator_result(
+    conn: sqlite3.Connection,
+    query: str,
+    *,
+    eligible: dict[str, sqlite3.Row],
+    context: ScopeContext,
+    delivery_target: str,
+    cross_scope: bool,
+    visibility_counts: dict[str, int],
+) -> dict[str, Any]:
+    """Resolve a locator-shaped query by equality only. A miss returns nothing.
+
+    The visibility gate is the same one the ranker applies: holding an id is not
+    authorisation to read confidential material whose scope the caller did not
+    name. A locator naming an evidence object, a closeout, or a retracted belief
+    resolves to no *belief* and is therefore empty here -- ``brain.get`` and
+    ``brain.search`` are the surfaces that answer those.
+    """
+    locator = str(query).strip()
+    canonical = resolve_object_id(conn, locator)
+    row = eligible.get(canonical) or eligible.get(locator)
+    items: list[dict[str, Any]] = []
+    scope_mix: dict[str, int] = {}
+    if row is not None:
+        scope = ScopeTag(
+            str(row["scope_type"]),
+            str(row["scope_id"]),
+            visibility=str(row["visibility"]),
+            egress_policy=str(row["egress_policy"]),
+            provenance=str(row["scope_provenance"]),
+        )
+        if delivery_target == LOCAL_MODEL_TARGET:
+            scope_weight = scope_affinity(scope, context)
+        else:
+            scope_weight = scope_match(scope, context, cross_scope=cross_scope)
+        if scope_weight:
+            belief_id = str(row["belief_id"])
+            evidence_ids = _json_list(row["evidence_ids"])
+            evidence_count, evidence_latest_at = _evidence_support(conn, evidence_ids)
+            items.append(
+                {
+                    "belief_id": belief_id,
+                    "body": row["body"],
+                    "scope": scope.to_dict(),
+                    "score": 1.0,
+                    "relevance": 1.0,
+                    "scope_weight": scope_weight,
+                    "evidence_count": evidence_count,
+                    "evidence_latest_at": evidence_latest_at,
+                    "evidence_ids": evidence_ids,
+                    "source": "core_v1_exact_locator",
+                    "ranking": {
+                        "lexical_rank": None,
+                        "dense_rank": None,
+                        "dense_similarity": None,
+                        "lexical_component": 0.0,
+                        "dense_component": 0.0,
+                        "source_quality": 0.0,
+                        "recency": 0.0,
+                        "ranking_prior": 0.0,
+                        "feedback_boost": 0.0,
+                        "exact_boost": 1.0,
+                    },
+                }
+            )
+            scope_mix[str(scope.scope_id)] = 1
+    return {
+        "items": items,
+        "excluded": [],
+        "scope_mix": scope_mix,
+        "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
+        "exclusion_count_basis": "current_serving_inventory",
+        "ranking": {
+            "mode": "exact_locator",
+            "dense_fallback": None,
+            "eligible_count": visibility_counts["eligible_count"],
+            "lexical_candidates": 0,
+            "dense_candidates": 0,
+            # The two facts a caller needs to tell "no such record" from "the
+            # ranker had nothing to say": the query was read as a locator, and
+            # this is how many records it named.
+            "exact_locator": True,
+            "exact_locator_matches": len(items),
+        },
+    }
+
+
 def search_core_v1(
     conn: sqlite3.Connection,
     query: str,
@@ -1844,6 +2032,22 @@ def search_core_v1(
         )
     )
     eligible = {str(row["belief_id"]): row for row in eligible_rows}
+    if looks_like_exact_locator(query):
+        # An id-shaped query is a lookup, not a topic. Ranking cannot answer it:
+        # a locator shares no terms with any body, so the lexical arm returns
+        # nothing and the dense arm returns whatever happens to be nearest --
+        # which is how the nonexistent, exactly well-formed
+        # `belief_ffffffffffffffff` came back as two confident unrelated beliefs
+        # at cosine 0.56 and 0.61. Resolve by equality, and let a miss be empty.
+        return _exact_locator_result(
+            conn,
+            query,
+            eligible=eligible,
+            context=context,
+            delivery_target=delivery_target,
+            cross_scope=cross_scope,
+            visibility_counts=visibility_counts,
+        )
     tuning = _retrieval_tuning()
     rrf_k = int(tuning.hybrid_rrf_k)
     min_dense_cosine = float(tuning.min_dense_cosine)
@@ -1851,6 +2055,9 @@ def search_core_v1(
     min_lexical_matches = int(tuning.min_lexical_query_term_matches)
     min_redundant_ratio = float(tuning.min_redundant_lexical_strength_ratio)
     require_dense_support = bool(tuning.require_dense_support)
+    confidence_prior_enabled = bool(
+        getattr(tuning, "confidence_prior_enabled", CONFIDENCE_PRIOR_ENABLED)
+    )
     candidate_limit = max(limit * 10, 120)
     lexical_rows: list[sqlite3.Row] = []
     lexical_uncorroborated = False
@@ -1990,6 +2197,7 @@ def search_core_v1(
                 "min_lexical_query_term_matches": min_lexical_matches,
                 "min_redundant_lexical_strength_ratio": min_redundant_ratio,
                 "require_dense_support": require_dense_support and dense_arm_healthy,
+                "confidence_prior_enabled": confidence_prior_enabled,
                 "degraded_excluded_procedures": degraded_excluded_procedures,
             },
         }
@@ -2058,9 +2266,10 @@ def search_core_v1(
             dense_component = dense_similarity[belief_id] / (rrf_k + dense_rank[belief_id])
         rrf = lexical_component + dense_component
         feedback_boost = feedback.get(belief_id, 0.0)
+        confidence_term = (0.85 + 0.15 * confidence) if confidence_prior_enabled else 1.0
         ranking_prior = (
             scope_weight
-            * (0.85 + 0.15 * confidence)
+            * confidence_term
             * (0.85 + 0.15 * quality)
             * (0.99 + 0.01 * recency)
         )
@@ -2076,8 +2285,11 @@ def search_core_v1(
                     "score": round(score, 8),
                     "relevance": round(rrf, 8),
                     "scope_weight": scope_weight,
-                    "confidence": confidence,
-                    "confidence_band": row["confidence_band"],
+                    # Evidence support is filled in below, for the served rows
+                    # only. It replaces the `confidence` / `confidence_band`
+                    # pair this item used to carry; see `_evidence_support`.
+                    "evidence_count": 0,
+                    "evidence_latest_at": None,
                     "evidence_ids": _json_list(row["evidence_ids"]),
                     "source": "core_v1_hybrid",
                     "ranking": {
@@ -2111,6 +2323,13 @@ def search_core_v1(
         items.append(item)
         if len(items) >= limit:
             break
+    # One evidence query for the rows that are actually served, not for every
+    # ranked candidate: at limit=12 that is 12 ids, against a candidate list of
+    # up to 120.
+    for item in items:
+        item["evidence_count"], item["evidence_latest_at"] = _evidence_support(
+            conn, item["evidence_ids"]
+        )
     # What was actually served, by scope. This replaces the old
     # ``excluded_scope_count``, which counted rows the scope filter dropped and
     # so reported 0 forever once the filter was gone. The mix is the signal that
@@ -2139,6 +2358,7 @@ def search_core_v1(
             "min_lexical_query_term_matches": min_lexical_matches,
             "min_redundant_lexical_strength_ratio": min_redundant_ratio,
             "require_dense_support": require_dense_support and dense_arm_healthy,
+            "confidence_prior_enabled": confidence_prior_enabled,
             # Procedures dropped because the dense arm was unavailable. Zero in
             # healthy mode; a non-zero value says the packet is deliberately
             # thinner than the corpus could support.
@@ -2220,14 +2440,32 @@ def record_core_v1_retrieval(
     ``scripts/procmine`` where it belongs, because ``provenance`` carries what
     the server actually observed and there is nothing left to guess about.
 
+    ``session_id`` goes through the same resolver a closeout's does, under the
+    ``quarantine`` policy rather than ``enforce``: this receipt is a side effect
+    of a *read*, and refusing a retrieval because its session label is a slug
+    would break retrieval in order to fix a join. The caller's own word is not
+    destroyed -- it is in ``context_json`` on this same row, where all 1,115
+    live rows that have one already keep it.
+
     ``provenance`` is deliberately absent from the ``stable_id`` inputs and from
     ``context_json``: two identical reads must stay the same read regardless of
     which connection served them.
+
+    A packet holding no items is recorded as ``no_coverage`` rather than
+    ``served``. The distinction is derived here, from the item list this call
+    was handed, because this is the only place that both knows the count and
+    writes the row; downstream, "the brain had nothing" and "the brain served
+    junk" are otherwise indistinguishable in the outcome column.
     """
     rows = list(items)
     served_at = now_iso()
     prov = provenance or EMPTY_PROVENANCE
-    prov_payload = prov.to_dict()
+    identity = resolve_session_identity(session_id, prov, policy="quarantine")
+    # The caller's own word, kept beside what was stored. `context_json` usually
+    # carries it too, but usually is not a guarantee, and a resolver that can
+    # replace a value owes the row the value it replaced. Not a `stable_id`
+    # input: two identical reads stay one read.
+    prov_identity = {**prov.to_dict(), "session_identity": identity}
     retrieval_id = stable_id(
         "ret",
         served_at,
@@ -2243,29 +2481,31 @@ def record_core_v1_retrieval(
           id, served_to_runtime, task_ref, outcome, query_text, served_ids_json,
           context_json, packet_schema, session_id, served_at,
           server_connection_id, client_session_hint, client_runtime_key,
-          provenance_json, task_ref_norm
-        ) VALUES (?, ?, ?, 'served', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          provenance_json, task_ref_norm, session_id_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             retrieval_id,
             runtime,
             task_ref,
+            SERVED_OUTCOME if rows else NO_COVERAGE_OUTCOME,
             query,
             canonical_json(
                 [item.get("belief_id") or item.get("object_id") or item.get("id") for item in rows]
             ),
             canonical_json(context),
             packet_schema,
-            session_id,
+            identity["session_id"],
             served_at,
             prov.server_connection_id,
             prov.client_session_hint,
             prov.client_runtime_key,
-            canonical_json(prov_payload) if prov_payload else None,
+            canonical_json(prov_identity),
             # Same fold the closeout writes, so a read and the receipt that
             # links it agree on which task they belong to without matching on
             # free text.
             normalize_task_ref(task_ref) if task_ref else None,
+            identity["session_id_source"],
         ),
     )
     for rank, item in enumerate(rows):
@@ -2279,6 +2519,88 @@ def record_core_v1_retrieval(
             (retrieval_id, object_id, object_kind, rank, item.get("score")),
         )
     return retrieval_id
+
+
+def retrieval_served_item_count(conn: sqlite3.Connection, retrieval_use_id: str) -> int | None:
+    """How many items one recorded retrieval served, or ``None`` if it is unknown.
+
+    Reads both halves of the receipt and takes the larger: ``served_ids_json``
+    is written in the same statement as the row itself, ``retrieval_items`` is
+    the normalized copy. They agree on all 2,048 rows of the corpus snapshot
+    frozen at 2026-08-28T19:28:58Z (0 disagreements in either direction), and
+    reading both means neither a core whose item rows were never backfilled nor
+    one whose receipt column is empty can be mistaken for a zero-item read.
+    """
+    row = conn.execute(
+        "SELECT served_ids_json FROM retrieval_uses WHERE id=?", (retrieval_use_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    items = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM retrieval_items WHERE retrieval_use_id=?",
+            (retrieval_use_id,),
+        ).fetchone()[0]
+    )
+    return max(items, len(_json_list(row["served_ids_json"])))
+
+
+def reclassify_no_coverage_receipts(
+    conn: sqlite3.Connection, *, apply: bool = False
+) -> dict[str, Any]:
+    """Move relevance verdicts filed on zero-item retrievals to ``no_coverage``.
+
+    The server now refuses these at the door, but the rows already written under
+    the instruction-only rule stay in the corpus, where an ``irrelevant`` filed
+    on an empty packet reads as "the brain served junk" forever. Whether to
+    rewrite live history is an operator's call, not a server's, so this is an
+    explicit command that reports by default and writes only under ``apply``.
+
+    The prior verdict is appended to the row's note rather than dropped, so a
+    reclassification stays legible -- and reversible by hand -- afterwards.
+    """
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT ru.id AS id, ru.outcome AS outcome, ru.note AS note
+            FROM retrieval_uses ru
+            WHERE ru.outcome IN ({",".join("?" for _ in RELEVANCE_OUTCOMES)})
+              AND NOT EXISTS (
+                SELECT 1 FROM retrieval_items ri WHERE ri.retrieval_use_id = ru.id
+              )
+              AND COALESCE(ru.served_ids_json, '[]') IN ('[]', '', 'null')
+            ORDER BY ru.served_at, ru.id
+            """,  # noqa: S608 - placeholder count derives only from the outcome vocabulary
+            tuple(RELEVANCE_OUTCOMES),
+        )
+    )
+    by_outcome: dict[str, int] = {}
+    for row in rows:
+        outcome = str(row["outcome"])
+        by_outcome[outcome] = by_outcome.get(outcome, 0) + 1
+    stamp = now_iso()
+    if apply:
+        for row in rows:
+            marker = f"[reclassified from {row['outcome']}: retrieval served zero items]"
+            note = str(row["note"] or "").strip()
+            conn.execute(
+                "UPDATE retrieval_uses SET outcome=?, note=?, feedback_source=?, "
+                "feedback_at=? WHERE id=?",
+                (
+                    NO_COVERAGE_OUTCOME,
+                    f"{note} {marker}".strip(),
+                    NO_COVERAGE_RECLASSIFY_SOURCE,
+                    stamp,
+                    str(row["id"]),
+                ),
+            )
+    return {
+        "candidates": len(rows),
+        "by_outcome": dict(sorted(by_outcome.items())),
+        "applied": len(rows) if apply else 0,
+        "dry_run": not apply,
+        "sample": [str(row["id"]) for row in rows[:12]],
+    }
 
 
 def _normalize_fts_query(query: str) -> str:
@@ -2432,6 +2754,144 @@ def _recency_score(value: str) -> float:
     return math.exp(-days / 365.0)
 
 
+def retrieval_history_by_lineage(
+    conn: sqlite3.Connection, belief_ids: set[str]
+) -> dict[str, dict[str, float]]:
+    """Judged retrieval history for each belief, counting its lineage's too.
+
+    Returns ``{belief_id: {"n", "signal", "inherited_n"}}`` over every judged
+    retrieval that served the belief, one of its aliases, or any belief it
+    replaced -- transitively, so a claim recompiled five times carries all five
+    generations' record instead of the fortnight since its latest id was minted.
+
+    The lineage is *derived* from the era pointers the ledger already projects
+    (``attributes.superseded_by`` on the predecessor), never copied forward at
+    supersede time. Two consequences matter. A chain accumulates by
+    construction: generation three walks back through generation two to
+    generation one without anything having been summed at each hop, so a copy
+    that was taken once and then went stale is not a state this can reach. And
+    nothing can be counted twice: the walk yields a *set* of ids, and verdicts
+    are folded per ``(belief, retrieval_use)`` pair, so a single retrieval that
+    served both a belief and one of its own ancestors still contributes one
+    verdict.
+
+    Alias-recorded history is attributed to the belief for the same reason:
+    retrieval rows written before an alias was collapsed are stored under the
+    old id, and without ``object_aliases`` that history is silently dropped.
+    """
+    if not belief_ids:
+        return {}
+    lineage = _belief_lineage_members(conn, belief_ids)
+    members = sorted({member for members in lineage.values() for member in members})
+    # Verdicts are fetched by a flat id list rather than by joining the lineage
+    # walk to `retrieval_items` inside one statement: the flat form uses
+    # `idx_retrieval_items_object`, and the joined form does not. On the live
+    # core that difference is 0.9 ms against 88 ms per ranked retrieval.
+    verdicts: dict[str, list[tuple[str, str]]] = {}
+    placeholders = ",".join("?" for _ in members)
+    outcomes = ",".join("?" for _ in RELEVANCE_OUTCOMES)
+    for row in conn.execute(
+        f"""
+        SELECT ri.object_id AS object_id, ru.id AS use_id, ru.outcome AS outcome
+        FROM retrieval_items ri
+        JOIN retrieval_uses ru ON ru.id = ri.retrieval_use_id
+        WHERE ri.object_id IN ({placeholders})
+          AND ru.outcome IN ({outcomes})
+        """,  # noqa: S608 - placeholders derive only from ids and the outcome vocabulary
+        (*members, *RELEVANCE_OUTCOMES),
+    ):
+        verdicts.setdefault(str(row["object_id"]), []).append(
+            (str(row["use_id"]), str(row["outcome"]))
+        )
+    history: dict[str, dict[str, float]] = {}
+    for belief_id, members_by_origin in lineage.items():
+        # Folded per retrieval, so a single retrieval that served two members of
+        # one lineage counts as one verdict. A verdict is inherited only when
+        # every member that carried it was an ancestor, which does not depend on
+        # the order the members are walked in.
+        folded: dict[str, tuple[str, bool]] = {}
+        for member, inherited in members_by_origin.items():
+            for use_id, outcome in verdicts.get(member, ()):
+                previous = folded.get(use_id)
+                folded[use_id] = (
+                    outcome,
+                    inherited and (previous is None or previous[1]),
+                )
+        if not folded:
+            continue
+        history[belief_id] = {
+            "n": len(folded),
+            "signal": sum(_FEEDBACK_SIGNAL[outcome] for outcome, _ in folded.values()),
+            "inherited_n": sum(1 for _, inherited in folded.values() if inherited),
+        }
+    return history
+
+
+def _belief_lineage_members(
+    conn: sqlite3.Connection, belief_ids: set[str]
+) -> dict[str, dict[str, bool]]:
+    """Every id each belief's history may live under: ``{belief: {id: inherited}}``.
+
+    ``inherited`` is False for the belief's own id and its aliases, True for a
+    belief it replaced. The walk reads ``attributes.superseded_by``, which the
+    projector stamps on the *predecessor* of every supersession -- including the
+    curator's key-collision cascade, whose successor is minted through ordinary
+    compilation and carries no ``supersedes`` of its own. Walking the other
+    pointer would see 64 of the 274 era closures in the 2026-08-28T19:28:58Z
+    snapshot.
+
+    The era pointers are read once per call and the walk runs in Python.
+    Expressed as a recursive CTE instead, each step re-scans ``current_beliefs``
+    evaluating ``json_extract`` per row, because no index covers that
+    expression: 85 ms per ranked retrieval against 1.5 ms here, on a hot path
+    that runs on every ``brain.context``.
+
+    Depth is deliberately unbounded, unlike ``mcp_v1.MAX_RESOLUTION_HOPS``, which
+    caps the *forward* walk over this same pointer at ten. That bound exists
+    because resolution reads a belief per hop and only needs one answer, so a
+    long chain there is a corpus problem. This walk needs every generation, pays
+    one query for the whole pointer map, and is bounded by the edges in it; the
+    deepest serving lineage in the 2026-08-28T19:28:58Z snapshot measured 12
+    generations, so a ten-hop cap here would silently drop two of them. The
+    seen-set is what terminates a cycle, and it is checked before descending.
+    """
+    predecessors: dict[str, list[str]] = {}
+    for row in conn.execute(
+        "SELECT belief_id, json_extract(attributes_json, '$.superseded_by') AS successor_id "
+        "FROM current_beliefs WHERE attributes_json LIKE '%superseded_by%'"
+    ):
+        successor = str(row["successor_id"] or "").strip()
+        if successor:
+            predecessors.setdefault(successor, []).append(str(row["belief_id"]))
+    lineage: dict[str, dict[str, bool]] = {}
+    for belief_id in belief_ids:
+        members = {belief_id: False}
+        frontier = [belief_id]
+        while frontier:
+            # A DAG, not a chain: several beliefs can be retired into one
+            # survivor. Membership is checked before descending, so a pointer
+            # cycle terminates and no id is added twice.
+            for ancestor in predecessors.get(frontier.pop(), ()):
+                if ancestor not in members:
+                    members[ancestor] = True
+                    frontier.append(ancestor)
+        lineage[belief_id] = members
+    collected = sorted({member for members in lineage.values() for member in members})
+    placeholders = ",".join("?" for _ in collected)
+    aliases: dict[str, list[str]] = {}
+    for row in conn.execute(
+        f"SELECT alias_id, canonical_id FROM object_aliases WHERE canonical_id IN ({placeholders})",  # noqa: S608 - placeholder count derives only from collected ids
+        tuple(collected),
+    ):
+        aliases.setdefault(str(row["canonical_id"]), []).append(str(row["alias_id"]))
+    if aliases:
+        for members in lineage.values():
+            for member, inherited in list(members.items()):
+                for alias in aliases.get(member, ()):
+                    members.setdefault(alias, inherited)
+    return lineage
+
+
 def _retrieval_feedback_scores(
     conn: sqlite3.Connection,
     belief_ids: set[str],
@@ -2446,39 +2906,17 @@ def _retrieval_feedback_scores(
     damped by ``n / (n + prior_observations)`` so a single verdict cannot swing a
     belief's position; a belief needs a consistent record before it moves far.
 
-    Alias-recorded feedback is attributed to the canonical belief: retrieval rows
-    written before an alias was collapsed are stored under the old id, and
-    without the ``object_aliases`` join that history is silently dropped.
+    History comes from :func:`retrieval_history_by_lineage`, so a recompiled
+    belief keeps the record its predecessors earned instead of restarting at
+    zero observations every curator pass.
     """
-    if not belief_ids:
-        return {}
-    placeholders = ",".join("?" for _ in belief_ids)
-    rows = conn.execute(
-        f"""
-        SELECT COALESCE(oa.canonical_id, ri.object_id) AS object_id,
-          SUM(CASE ru.outcome
-                WHEN 'helpful' THEN 2.0 WHEN 'used' THEN 1.0
-                WHEN 'irrelevant' THEN -1.5 WHEN 'ignored' THEN -0.5
-                WHEN 'harmful' THEN -4.0 ELSE 0.0 END) AS signal,
-          SUM(CASE WHEN ru.outcome IN
-                ('helpful','used','irrelevant','ignored','harmful') THEN 1 ELSE 0 END) AS n
-        FROM retrieval_items ri
-        JOIN retrieval_uses ru ON ru.id=ri.retrieval_use_id
-        LEFT JOIN object_aliases oa ON oa.alias_id=ri.object_id
-        WHERE COALESCE(oa.canonical_id, ri.object_id) IN ({placeholders})
-        GROUP BY COALESCE(oa.canonical_id, ri.object_id)
-        """,  # noqa: S608 - placeholder count derives only from selected belief ids
-        tuple(sorted(belief_ids)),
-    )
     result: dict[str, float] = {}
-    for row in rows:
-        count = int(row["n"] or 0)
-        if not count:
-            continue
-        average = float(row["signal"] or 0.0) / count
+    for belief_id, history in retrieval_history_by_lineage(conn, belief_ids).items():
+        count = int(history["n"])
+        average = history["signal"] / count
         confidence = count / (count + prior_observations)
         boost = average * weight * confidence
-        result[str(row["object_id"])] = min(max(boost, -clamp), clamp)
+        result[belief_id] = min(max(boost, -clamp), clamp)
     return result
 
 
@@ -2587,7 +3025,10 @@ __all__ = [
     "CORE_V1_USER_VERSION",
     "GOAL_BELIEF_TYPE",
     "LEGACY_IMPORT_KINDS",
+    "NO_COVERAGE_OUTCOME",
     "PROCEDURE_BELIEF_TYPE",
+    "RELEVANCE_OUTCOMES",
+    "SERVED_OUTCOME",
     "append_core_event",
     "assert_core_v1_inventory",
     "canonical_json",
@@ -2599,12 +3040,16 @@ __all__ = [
     "get_core_v1_evidence",
     "init_core_v1",
     "is_core_v1",
+    "looks_like_exact_locator",
     "migrate_core_v1_columns",
     "project_core_v1",
     "rebuild_core_v1_search",
+    "reclassify_no_coverage_receipts",
     "record_core_v1_evidence",
     "record_core_v1_retrieval",
     "resolve_object_id",
+    "retrieval_history_by_lineage",
+    "retrieval_served_item_count",
     "search_core_v1",
     "set_core_v1_search_triggers",
     "sha256_text",

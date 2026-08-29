@@ -69,8 +69,10 @@ or erroring, note it and carry on.
 
 - `brain.feedback` when retrieved context *materially shaped* the work (`used` /
   `helpful`) or wasted your time (`irrelevant` / `harmful`). This moves ranking and
-  makes badly-judged facts eligible for retirement. Do **not** file feedback on a
-  zero-item retrieval.
+  makes badly-judged facts eligible for retirement. On a v1 core a zero-item
+  retrieval is **refused**: every outcome judges served items, and the server has
+  already recorded that read as `no_coverage`. On a legacy v0 core that is an
+  instruction rather than a refusal — do not file it there either.
 - `brain.closeout` at the end of substantive work, linking the retrievals you used, the
   artifacts you produced, and the verifiers that prove it.
 
@@ -81,7 +83,13 @@ Two details that cause most closeout failures:
   `repo://<name>/pytest`.
 - **Put the runtime's own session id in `context.session`**, not a human-readable slug.
   That field is what links your receipt to your trace; hand-written names break the join
-  permanently and cannot be repaired later.
+  permanently and cannot be repaired later. Since 2026-08-28 the server enforces it:
+  `brain.closeout` refuses a slug and names the env var to read a real one from, and the
+  read paths quietly keep it out of the identity column. Omitting the field is always
+  legal — the server then records its own connection id under a `conn:` prefix.
+- **Say what did not work in `unresolved`** on any closeout that is not `completed` with
+  no failed verifier. `brain.ledger` and the briefing read it back; a status word alone
+  does not stop the next session repeating your afternoon.
 
 ### 5. Write facts, not chatter
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 import ocbrain.curator
 from ocbrain.core_v1 import (
     get_core_v1_belief,
@@ -658,4 +660,44 @@ def test_a_pinned_belief_is_never_recompiled_over_unattended(tmp_path: Path) -> 
 
     assert result["deferred"] == [belief_id]
     assert _serving(conn) == {belief_id: "The live analysis VM is asa2."}
+    conn.close()
+
+
+def test_a_malformed_operator_config_is_not_reported_as_blocked_claims(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The original outage shape: a typo'd config masquerading as tombstones.
+
+    The supersede router lazily loads the operator config per claim, and
+    json.JSONDecodeError is a ValueError -- the same type the per-claim guard
+    catches to mean "previously tombstoned target". Before ConfigError existed,
+    a malformed file made apply_claims report every claim blocked and the log
+    said nothing about the file. The config problem must surface as itself.
+    """
+    from ocbrain.config import ConfigError
+
+    conn = _core(tmp_path)
+    evidence_id = _evidence(conn, "The live analysis VM is asa2 for research work.")
+    apply_claims(
+        conn,
+        [_claim("research-vm-live", "The live analysis VM is asa2.", evidence_ids=[evidence_id])],
+        model="test",
+        project=PROJECT,
+    )
+    conn.commit()
+
+    broken = tmp_path / "broken-config.json"
+    broken.write_text('{"supersede": {', encoding="utf-8")
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(broken))
+
+    # A changed body against the same key routes through supersede_transaction,
+    # which is where the per-claim config load lives.
+    updated = _claim(
+        "research-vm-live",
+        "The live analysis VM is asa3; asa2 was terminated.",
+        evidence_ids=[_evidence(conn, "asa3 replaced asa2 this week.")],
+    )
+    with pytest.raises(ConfigError) as err:
+        apply_claims(conn, [updated], model="test", project=PROJECT)
+    assert str(broken) in str(err.value)
     conn.close()

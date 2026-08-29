@@ -144,6 +144,91 @@ def test_task_and_session_ids_are_not_folded() -> None:
     assert "task:PR_3504 Review" in context.compatible_scope_ids()
 
 
+def test_legacy_public_visibility_is_narrowed_to_internal() -> None:
+    direct = ScopeTag(
+        "project",
+        "project:legacy",
+        visibility="public",
+        egress_policy="hosted_ok",
+        provenance="legacy-event",
+    )
+    decoded = ScopeTag.from_dict(
+        {
+            "scope_type": "project",
+            "scope_id": "project:legacy",
+            "visibility": "public",
+            "egress_policy": "hosted_ok",
+            "provenance": "legacy-event",
+        }
+    )
+
+    assert direct.visibility == "internal"
+    assert decoded.visibility == "internal"
+    assert direct.to_dict()["visibility"] == "internal"
+
+
+def test_retired_personal_finance_scope_is_quarantined() -> None:
+    direct = ScopeTag(
+        "personal_finance",
+        "personal_finance:pelican",
+        visibility="confidential",
+        egress_policy="local_only",
+        provenance="legacy-event",
+    )
+
+    assert direct.scope_type == "legacy_unscoped"
+    assert direct.scope_id == "personal_finance:pelican"
+    assert direct.visibility == "confidential"
+    assert direct.egress_policy == "local_only"
+
+
+def test_full_replay_narrows_legacy_public_event_scope(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    proposal = append_core_event(
+        conn,
+        "compilation_proposed",
+        {
+            "belief_id": "curated:legacy:public",
+            "belief_type": "curated_fact",
+            "body": "Historical public visibility is served as internal.",
+            "evidence_ids": [],
+            "scope": {
+                "scope_type": "project",
+                "scope_id": "project:legacy",
+                "visibility": "public",
+                "egress_policy": "hosted_ok",
+                "provenance": "legacy-event",
+            },
+            "confidence": 0.9,
+            "attributes": {"source_quality": 0.95},
+        },
+        writer="legacy-test",
+    )
+    decide_proposal_v1(
+        conn,
+        proposal_event_id=proposal,
+        decision="approve",
+        actor="test",
+        edited_body=None,
+        reason="legacy visibility replay fixture",
+    )
+
+    before = conn.execute(
+        "SELECT visibility FROM current_beliefs WHERE belief_id=?",
+        ("curated:legacy:public",),
+    ).fetchone()
+    assert before["visibility"] == "internal"
+
+    project_core_v1(conn, full=True)
+    after = conn.execute(
+        "SELECT visibility FROM current_beliefs WHERE belief_id=?",
+        ("curated:legacy:public",),
+    ).fetchone()
+    assert after["visibility"] == "internal"
+    conn.close()
+
+
 def test_alias_resolution_maps_variant_to_canonical_and_unknown_passes_through(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
