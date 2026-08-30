@@ -307,8 +307,13 @@ verification; it is not training data.
 
 ## MCP profiles
 
-The default runtime profile has nine tools:
+The default runtime profile has thirteen tools:
 
+- `brain.briefing` — deterministic, bounded fresh-context orientation;
+- `brain.ledger` — stable task-ref projection of verified, failed, and in-flight
+  work;
+- `brain.goal_open` / `brain.goal_close` — repository-spec pointers with
+  executable finish lines and verifier-backed lifecycle events;
 - `brain.context` — stable `ocbrain.context.v1` packet with coverage,
   exclusions, contradictions, and source handles;
 - `brain.source` — bounded expansion of an issued handle with scope and content
@@ -323,7 +328,7 @@ The default runtime profile has nine tools:
   and the only correction shape that does not subtract from the corpus.
 
 The admin profile adds six more: preview, egress preview, durable correction,
-proposal decision, proposal listing, and the tombstone control. Fifteen tools
+proposal decision, proposal listing, and the tombstone control. Nineteen tools
 is the whole surface. There is no hosted teacher, training, or scheduler tool,
 and `brain.mark_stale` is gone — it was published for two years and could never
 be dispatched, because `tools_for_profile` returned it for no profile.

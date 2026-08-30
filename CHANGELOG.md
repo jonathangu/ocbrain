@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Correct the client-facing runtime contract to the current thirteen-tool v1
+  surface, document Hermes as a first-class stdio MCP client, and put the
+  deterministic briefing/ledger harness steps ahead of ranked retrieval for a
+  fresh context.
+
 - Stop a restatement becoming a new key, by fixing what the existing cascade
   could not see rather than by adding a threshold to it. A supersession can only
   ever replace a belief filed under the **same** key — the transaction copies the

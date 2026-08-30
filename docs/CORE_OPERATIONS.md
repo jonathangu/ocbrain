@@ -17,7 +17,7 @@ rolls back if its declared event/time budget is exceeded. `doctor` checks the
 database and negotiates initialize/ping/tools-list with a real child MCP
 process.
 
-The v1 runtime MCP should list exactly nine tools. Use
+The v1 runtime MCP should list exactly thirteen tools. Use
 `ocbrain runtime-check` plus real fresh-client acceptance for the broader bridge;
 configuration probes alone are not completion evidence.
 

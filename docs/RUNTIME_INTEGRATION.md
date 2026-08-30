@@ -1,9 +1,9 @@
 # Runtime integration
 
-Codex, Claude Code, OpenClaw, and compatible clients can use the same on-demand
-stdio MCP launcher and local v1 core. OpenClaw is optional. A config entry is
-necessary but not sufficient; acceptance requires a real tool round trip from
-a fresh process.
+Codex, Claude Code, Hermes, OpenClaw, and compatible clients can use the same
+on-demand stdio MCP launcher and local v1 core. OpenClaw is optional. A config
+entry is necessary but not sufficient; acceptance requires a real tool round
+trip from a fresh process.
 
 Current local status: **accepted on 2026-07-13**. Codex, Claude Code, and
 OpenClaw completed the full round trip against the same v1 core, SQLite and
@@ -39,6 +39,7 @@ LAUNCHER="$PWD/scripts/ocbrain-mcp"
 
 codex mcp add ocbrain -- "$LAUNCHER"
 claude mcp add --scope user ocbrain -- "$LAUNCHER"
+hermes mcp add ocbrain --command "$LAUNCHER"
 ```
 
 If you use OpenClaw, register the same launcher:
@@ -54,20 +55,23 @@ Check saved configuration and stdio negotiation:
 ```bash
 codex mcp get ocbrain
 claude mcp get ocbrain
+hermes mcp test ocbrain
 openclaw mcp doctor ocbrain
 openclaw mcp probe ocbrain
 ```
 
-The runtime profile should expose exactly nine tools:
+The runtime profile should expose exactly thirteen tools:
 
 ```text
-brain.context   brain.source   brain.search   brain.digest
-brain.get       brain.feedback brain.ingest   brain.closeout
+brain.briefing  brain.ledger    brain.goal_open brain.goal_close
+brain.context   brain.source    brain.search     brain.digest
+brain.get       brain.feedback  brain.ingest     brain.closeout
 brain.supersede
 ```
 
-`brain.supersede` is only published on a v1 core; a legacy core has no event to
-project it onto, so it is filtered out of that core's tool list.
+The harness and supersession tools are only published on a v1 core; a legacy
+core has no events to project them onto, so they are filtered out of that
+core's tool list.
 
 OpenClaw normalizes dotted MCP names to provider-safe names such as
 `ocbrain__brain-context`; that is transport naming, not a different API.
