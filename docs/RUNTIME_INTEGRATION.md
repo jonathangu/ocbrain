@@ -5,7 +5,7 @@ on-demand stdio MCP launcher and local v1 core. OpenClaw is optional. A config
 entry is necessary but not sufficient; acceptance requires a real tool round
 trip from a fresh process.
 
-Current local status: **accepted on 2026-07-13**. Codex, Claude Code, and
+Historical release baseline: **accepted on 2026-07-13**. Codex, Claude Code, and
 OpenClaw completed the full round trip against the same v1 core, SQLite and
 foreign-key checks passed afterward, and the activation pointer was retained.
 The owner-only receipt inventory is stored beside the live database.
@@ -215,7 +215,7 @@ scripts/ocbrain-mcp --profile admin
 
 The deprecated `--allow-writes` flag selects that same profile. Admin adds six
 tools — correction, proposal decision, proposal listing, tombstone, local
-preview, and egress preview — for fifteen in total. It adds no hosted
+preview, and egress preview — for nineteen in total. It adds no hosted
 judgment, embedding, teacher, training, scheduler, or watchdog tool, and
 `brain.mark_stale` no longer exists in either profile.
 
