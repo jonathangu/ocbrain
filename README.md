@@ -1,12 +1,16 @@
 # OCBrain
 
 OCBrain is the local, source-backed context bridge shared by Codex, Claude Code,
-OpenClaw, and compatible MCP clients. It retrieves a bounded dossier from an
+Hermes, OpenClaw, and compatible MCP clients. It retrieves a bounded dossier from an
 effectively unbounded private history, expands exact sources on demand, records
 whether the context mattered, and links the eventual outcome back to what the
 agent saw.
 
 Current core version: **v1.1.0**. License: Apache-2.0.
+
+The latest packaged release remains v1.1.0. Current `main` contains the newer
+thirteen-tool briefing/ledger/goals/supersession contract documented below; do
+not expect that unreleased surface from the older release artifact.
 
 [Install](#quick-start) · [Connect a client](#connect-the-clients-you-use) ·
 [Agent instructions](docs/RUNTIME_INTEGRATION.md#client-instruction-block) ·
@@ -16,7 +20,7 @@ Current core version: **v1.1.0**. License: Apache-2.0.
 
 **OpenClaw is optional.** OCBrain is a local stdio
 [Model Context Protocol](https://modelcontextprotocol.io/) server. You can use
-it with Codex, Claude Code, OpenClaw, or another compatible MCP client; install
+it with Codex, Claude Code, Hermes, OpenClaw, or another compatible MCP client; install
 and configure only the clients you actually use.
 
 | Requirement | Current support |
@@ -367,6 +371,18 @@ claude mcp add --scope user ocbrain -- "$LAUNCHER"
 claude mcp get ocbrain
 ```
 
+### Hermes
+
+```bash
+hermes mcp add ocbrain --command "$LAUNCHER"
+hermes mcp test ocbrain
+```
+
+Hermes gateways may multiplex sessions over one MCP child. When Hermes cannot
+provide its real runtime session id, omit `context.session`; OCBrain records the
+server connection identity instead. Never invent a session label, because the
+identity is what joins closeouts to tool-call traces.
+
 ### OpenClaw (optional)
 
 If you also use OpenClaw:
@@ -379,12 +395,17 @@ openclaw mcp probe ocbrain
 
 Registration is configuration, not acceptance. A fresh chat alone does not
 activate OCBrain unless the client has the MCP server configured and the agent
-is instructed to use it. A real acceptance turn in every configured client
-should complete:
+is instructed to use it. A real acceptance turn in every configured client on
+current `main` should complete:
 
 ```text
-brain.context → brain.source → brain.feedback → brain.closeout
+brain.briefing → brain.ledger → brain.context → brain.source
+               → brain.feedback → brain.closeout
 ```
+
+`brain.source` is conditional on the context packet issuing a handle. Pass the
+runtime's real session id, or omit the field rather than inventing one. A saved
+configuration or successful transport probe is not a model-driven acceptance.
 
 Already-open chats may retain the MCP process they started before an upgrade.
 Start a fresh task or restart/reconnect the client when testing a new core.
