@@ -123,6 +123,7 @@ from ocbrain.scope import (
     fold_scope_component,
     global_scope,
     hosted_egress_refusal_reason,
+    resolve_scope_alias,
     resolve_write_scope,
 )
 from ocbrain.text import (
@@ -2043,6 +2044,14 @@ def _hosted_approve_one(
         )
     if _evidence_has_current_belief(conn, canonical):
         return refused("already_compiled", "a current belief already covers this evidence")
+    if project and str(row["scope_type"]) == "project":
+        folded = fold_scope_component(project) or str(project)
+        target_scope_id = f"project:{folded}"
+        if resolve_scope_alias(row["scope_id"]) != resolve_scope_alias(target_scope_id):
+            return refused(
+                "project_scope_mismatch",
+                "project-scoped evidence may only be approved into its existing project",
+            )
     if str(row["scope_type"]) == "client" and not project:
         return refused(
             "client_scope_requires_project",

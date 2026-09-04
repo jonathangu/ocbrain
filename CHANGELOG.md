@@ -6,9 +6,10 @@
   narrow policy only on the same canonical scope identity; scope ids must match
   their declared non-legacy type; project-filtered bulk approval includes the
   proposals displayed by that queue; convergent approvals preserve every
-  evidence link; answered hosted proposals leave the pending queue; and both
-  hosted approval commands require a `human:NAME` approver. The strict MCP
-  schema also restores explicit `session` scope support.
+  evidence link; answered hosted proposals leave the pending queue; existing
+  project evidence cannot be relabeled into a sibling project; and both hosted
+  approval commands require a `human:NAME` approver. The strict MCP schema also
+  restores explicit `session` scope support.
 
 - `hosted-approve` lands the belief where its widening request asked. Without
   `--project` it fell back to the evidence row's own scope, so a task-context

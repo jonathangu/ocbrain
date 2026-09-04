@@ -371,6 +371,36 @@ def test_hosted_approve_cli_project_overrides_the_proposal(tmp_path, capsys):
     conn.close()
 
 
+def test_hosted_approve_refuses_cross_project_relabeling(tmp_path, capsys):
+    conn = _seed_core(tmp_path)
+    evidence_id = _seed_evidence(
+        conn,
+        body="Project-scoped evidence must stay in its existing project.",
+    )
+    db = str(tmp_path / "hosted-queue.sqlite")
+    before = _event_count(conn)
+
+    rc, payload = _run(
+        capsys,
+        db,
+        [
+            "hosted-approve",
+            evidence_id,
+            "--project",
+            "other-project",
+            "--approved-by",
+            APPROVER,
+        ],
+    )
+
+    assert rc == 2
+    assert payload["status"] == "blocked"
+    assert payload["refused"][0]["reason"] == "project_scope_mismatch"
+    assert _event_count(conn) == before
+    assert conn.execute("SELECT COUNT(*) FROM current_beliefs").fetchone()[0] == 0
+    conn.close()
+
+
 def test_hosted_approve_dry_run_plans_the_proposals_requested_project(tmp_path, capsys):
     """--dry-run plans the requested project and writes nothing: the plan must
     name where the approval would land, not the evidence row's own scope."""
