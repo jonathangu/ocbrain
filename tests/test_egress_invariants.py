@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from ocbrain.cli import main
 from ocbrain.core_v1 import (
     append_core_event,
     init_core_v1,
@@ -157,6 +158,38 @@ def test_material_without_hosted_ok_never_reaches_a_hosted_model(tmp_path: Path)
         )
         != []
     )
+
+    # The invariant must prove the gate, not just the refusal: promoting the
+    # local-only home belief to hosted_ok lifts exactly that belief into the
+    # hosted packet while every wall — neighbour scope and confidentiality —
+    # keeps standing.
+    assert (
+        main(
+            [
+                "--db",
+                str(tmp_path / "egress.sqlite"),
+                "egress-promote",
+                "belief:home-internal",
+                "--approved-by",
+                "human:jonathan",
+                "--reason",
+                "invariant run: a promoted belief must be served",
+            ]
+        )
+        == 0
+    )
+    packet_after, _handles_after = build_context_v1(
+        conn,
+        QUERY,
+        context=context,
+        limit=50,
+        delivery_target=HOSTED_MODEL_TARGET,
+    )
+    served_after = [item["id"] for item in packet_after["items"]]
+    assert "belief:home-internal" in served_after
+    assert "belief:home-hosted-ok" in served_after
+    assert "belief:neighbour-internal" not in served_after
+    assert "belief:neighbour-confidential" not in served_after
 
 
 def test_confidential_material_is_never_served_locally_outside_its_scope(

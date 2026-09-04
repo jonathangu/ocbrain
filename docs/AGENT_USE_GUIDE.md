@@ -206,6 +206,16 @@ curatable evidence. `brain.digest` reports the queue depth as
 from the CLI with `ocbrain hygiene --supersede <belief_id> <successor_id>`, which
 retires the old belief immediately.
 
+`ocbrain egress-promote` is the human-attributable way to lift a current
+belief's egress to `hosted_ok` (or `approval_required`) — the separate decision
+`scope-promote` deliberately never makes. It is CLI-only and writes an
+`egress_promoted` event carrying `--approved-by` and `--reason`; it changes
+egress only, and it refuses beliefs whose visibility is `confidential` or
+`secret`, which can never be hosted: those refusals are reported, never
+silently skipped. Select beliefs by id or with `--scope-id` (optionally
+filtered by `--provenance`), and always inspect the plan first with
+`--dry-run`.
+
 ## Handling conflicts
 
 When retrieved context conflicts with the current user request or live evidence:

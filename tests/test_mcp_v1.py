@@ -436,6 +436,45 @@ def test_v1_runtime_and_admin_profiles_are_distinct(tmp_path):
     assert "brain.teacher_request" not in admin_names
 
 
+def test_v1_hosted_catalog_omits_tools_that_always_refuse_hosted_delivery(tmp_path):
+    conn = _seed_v1(tmp_path)
+    hosted_runtime = handle_request(
+        conn,
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        delivery_target="hosted_model",
+    )
+    hosted_runtime_names = {
+        item["name"] for item in hosted_runtime["result"]["tools"]
+    }
+    assert hosted_runtime_names == {
+        "brain.context",
+        "brain.source",
+        "brain.search",
+        "brain.digest",
+        "brain.get",
+        "brain.feedback",
+        "brain.ingest",
+        "brain.closeout",
+        "brain.supersede",
+    }
+
+    hosted_admin = handle_request(
+        conn,
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        profile="admin",
+        delivery_target="hosted_model",
+    )
+    hosted_admin_names = {item["name"] for item in hosted_admin["result"]["tools"]}
+    for unavailable in (
+        "brain.briefing",
+        "brain.ledger",
+        "brain.goal_open",
+        "brain.goal_close",
+        "brain.proposals",
+    ):
+        assert unavailable not in hosted_admin_names
+
+
 def test_v1_non_object_jsonrpc_frames_are_invalid_requests(tmp_path):
     conn = _seed_v1(tmp_path)
 

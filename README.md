@@ -80,7 +80,11 @@ four public facts in `examples/hosted-context-demo`, then apply them explicitly:
 
 The acknowledgement is required because those exact fact bodies may be sent
 to a hosted model. It does not authorize the database, full source file, or a
-local path to leave the machine. Start a fresh client and query for `OCBrain
+local path to leave the machine. The curated manifest is the first route to
+hosted delivery; `ocbrain egress-promote --approved-by <you> --reason <why>`
+is the second — a per-belief, human-attributable lift of an existing current
+belief's egress that never touches confidential or secret material. Start a
+fresh client and query for `OCBrain
 installation requirements and client constraints` with `project=ocbrain`; an
 issued source should expand with `hash_verified=true`.
 

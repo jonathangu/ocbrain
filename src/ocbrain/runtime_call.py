@@ -16,9 +16,16 @@ from typing import Any
 
 from ocbrain.db import DEFAULT_DB_PATH, connect
 from ocbrain.mcp import RUNTIME_PROFILE, RUNTIME_TOOLS, handle_request
+from ocbrain.scope import DELIVERY_TARGETS, LOCAL_MODEL_TARGET
 
 
-def invoke(db_path: Path, tool: str, arguments: dict[str, Any]) -> Any:
+def invoke(
+    db_path: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    *,
+    delivery_target: str = LOCAL_MODEL_TARGET,
+) -> Any:
     if tool not in RUNTIME_TOOLS:
         raise PermissionError(f"one-shot fallback permits runtime tools only: {tool}")
     conn = connect(db_path)
@@ -32,6 +39,7 @@ def invoke(db_path: Path, tool: str, arguments: dict[str, Any]) -> Any:
                 "params": {"name": tool, "arguments": arguments},
             },
             profile=RUNTIME_PROFILE,
+            delivery_target=delivery_target,
         )
     finally:
         conn.close()
@@ -61,6 +69,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("tool", choices=sorted(RUNTIME_TOOLS))
     result.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     result.add_argument(
+        "--delivery-target",
+        choices=sorted(DELIVERY_TARGETS),
+        default=LOCAL_MODEL_TARGET,
+        help="Server-controlled delivery policy for this one-shot call",
+    )
+    result.add_argument(
         "--arguments-file",
         type=Path,
         help="JSON object containing tool arguments; omit to read JSON from stdin",
@@ -79,7 +93,12 @@ def _arguments(path: Path | None) -> dict[str, Any]:
 def main() -> int:
     args = parser().parse_args()
     try:
-        payload = invoke(args.db.expanduser().resolve(), args.tool, _arguments(args.arguments_file))
+        payload = invoke(
+            args.db.expanduser().resolve(),
+            args.tool,
+            _arguments(args.arguments_file),
+            delivery_target=args.delivery_target,
+        )
     except Exception as exc:  # noqa: BLE001 - command must return a stable failure
         print(
             json.dumps({"status": "error", "error": f"{type(exc).__name__}: {exc}"}),

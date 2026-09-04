@@ -160,7 +160,8 @@ CREATE TABLE IF NOT EXISTS brain_events (
       'compilation_decided',
       'correction_recorded',
       'tombstone_recorded',
-      'scope_promoted'
+      'scope_promoted',
+      'egress_promoted'
     )
   ) NOT NULL,
   writer TEXT NOT NULL,

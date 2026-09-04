@@ -8,7 +8,13 @@ from typing import Any
 
 from ocbrain.db import now_iso
 from ocbrain.ids import stable_id
-from ocbrain.scope import ScopeContext, ScopeTag, resolve_write_scope, scope_match
+from ocbrain.scope import (
+    ScopeContext,
+    ScopeTag,
+    hosted_egress_refusal_reason,
+    resolve_write_scope,
+    scope_match,
+)
 
 EVENT_KINDS = {
     "evidence_recorded",
@@ -17,6 +23,14 @@ EVENT_KINDS = {
     "correction_recorded",
     "tombstone_recorded",
     "scope_promoted",
+    # A client asked brain.ingest for MORE egress or reach than the inferred
+    # write scope allows. The evidence is stored under the inferred scope; this
+    # event records the request so a human can act on it through the
+    # hosted-approval queue. Nothing folds it into a projection.
+    "hosted_egress_proposal",
+    # egress-promote lifted an existing current belief's egress to
+    # hosted_ok (or back), with human attribution.
+    "egress_promoted",
 }
 DECISIONS = ("approve", "reject", "edit", "shadow")
 
@@ -430,6 +444,8 @@ def _incremental_projection(conn: sqlite3.Connection) -> bool:
             _track(apply_tombstone(event, body, projected), touched)
         elif kind == "scope_promoted":
             _track(apply_scope_promotion(event, body, projected), touched)
+        elif kind == "egress_promoted":
+            _track(apply_egress_promotion(event, body, projected), touched)
     for belief_id in touched:
         _write_belief_row(conn, belief_id, projected[belief_id])
     _set_projection_cursor(conn, consumed[-1]["rid"])
@@ -580,6 +596,8 @@ def fold_projection(
             apply_tombstone(event, body, projected)
         elif kind == "scope_promoted":
             apply_scope_promotion(event, body, projected)
+        elif kind == "egress_promoted":
+            apply_egress_promotion(event, body, projected)
 
     return projected
 
@@ -1215,6 +1233,41 @@ def apply_scope_promotion(
         belief["last_event_id"] = event["id"]
         return body.get("belief_id")
     return None
+
+
+def apply_egress_promotion(
+    event: sqlite3.Row,
+    body: dict[str, Any],
+    projected: dict[str, dict[str, Any]],
+) -> str | None:
+    """Apply an egress promotion to an existing belief. Returns the touched belief_id, or None.
+
+    The twin of :func:`apply_scope_promotion` for the ``egress_promoted`` kind.
+    It changes egress ONLY: scope, visibility, body, confidence, and evidence
+    are carried through verbatim, with the provenance recording who lifted it.
+    The body's ``scope`` is audit history, never authority — the target policy
+    is read from ``to_egress_policy`` and applied to the belief's *current*
+    scope, so a forged event cannot widen reach under cover of an egress edit.
+
+    Refusal is enforced here and not only in the CLI: the ledger is
+    authoritative, so the projection is the last chance to keep confidential
+    and secret material off a hosted model if a bad event ever lands.
+    """
+    belief = projected.get(body.get("belief_id"))
+    if belief is None:
+        return None
+    if not body.get("approved_by"):
+        return None
+    target_policy = str(body.get("to_egress_policy") or "hosted_ok")
+    if target_policy not in {"hosted_ok", "approval_required"}:
+        return None
+    scope = belief["scope"]
+    if hosted_egress_refusal_reason(str(scope["visibility"]), target_policy) is not None:
+        return None
+    scope["egress_policy"] = target_policy
+    scope["provenance"] = "egress_promoted"
+    belief["last_event_id"] = event["id"]
+    return body.get("belief_id")
 
 
 def confidence_band(confidence: float | None) -> str:

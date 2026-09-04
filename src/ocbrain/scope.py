@@ -273,6 +273,12 @@ class ScopeTag:
             raise ValueError(f"invalid scope_type: {self.scope_type}")
         if not self.scope_id:
             raise ValueError("scope_id is required")
+        if self.scope_type != "legacy_unscoped":
+            prefix, separator, component = self.scope_id.partition(":")
+            if not separator or prefix != self.scope_type or not component.strip():
+                raise ValueError(
+                    f"scope_id must use the {self.scope_type}: prefix: {self.scope_id}"
+                )
         if self.visibility not in VISIBILITIES:
             raise ValueError(f"invalid visibility: {self.visibility}")
         if self.egress_policy not in EGRESS_POLICIES:
@@ -304,6 +310,20 @@ class ScopeTag:
             egress_policy=str(data.get("egress_policy") or default_egress_policy(data)),
             provenance=str(data.get("provenance") or "explicit"),
         )
+
+
+def hosted_egress_refusal_reason(visibility: str, egress_policy: str) -> str | None:
+    """The one rule for what may carry ``hosted_ok`` egress.
+
+    ``curated-apply`` refuses to combine ``hosted_ok`` with confidential or
+    secret visibility, and ``egress-promote`` must refuse exactly the same
+    combinations — so the predicate lives here once and both callers import it,
+    rather than each writing a copy that can drift. Returns ``None`` when the
+    combination is allowed, or the human-readable reason it is not.
+    """
+    if egress_policy == "hosted_ok" and visibility in {"confidential", "secret"}:
+        return f"cannot combine hosted_ok with {visibility} visibility"
+    return None
 
 
 @dataclass(frozen=True)
@@ -437,6 +457,67 @@ def resolve_write_scope(
     if context.project:
         return inferred("project", f"project:{context.project}")
     return legacy_unscoped_scope()
+
+
+# How far a scope family travels by default, narrowest first. The ordering mirrors
+# the narrowest-known precedence in :func:`resolve_write_scope` — a task write is
+# narrower than a session write, a session narrower than a repo, then client,
+# then project, and global doctrine travels everywhere — with
+# ``legacy_unscoped`` pinned to zero reach because it is quarantined, not shared.
+# This ladder is a write-time comparison only: it decides whether a client's
+# explicitly requested scope is a narrowing (honor it) or a widening (propose it),
+# and never feeds retrieval or delivery, which have their own gates.
+SCOPE_FAMILY_WIDTH = {
+    "legacy_unscoped": 0,
+    "task": 1,
+    "session": 2,
+    "repo": 3,
+    "client": 4,
+    "project": 5,
+    "global": 6,
+}
+VISIBILITY_WIDTH = {"secret": 0, "confidential": 1, "internal": 2}
+EGRESS_WIDTH = {"prohibited": 0, "local_only": 1, "approval_required": 2, "hosted_ok": 3}
+
+
+def scope_narrows_or_equals(requested: ScopeTag, inferred: ScopeTag) -> bool:
+    """Whether an explicitly requested write scope narrows the inferred one.
+
+    Visibility and egress may narrow, but reach may only stay on the same
+    canonical scope identity. Scope ids are not hierarchical, so a task/repo
+    id cannot be proven to belong below a project id from these tags alone;
+    accepting a different id merely because its family is no wider permits
+    lateral writes into sibling scopes. Any unverifiable reach change is
+    proposed for a human rather than applied unattended.
+    """
+    if SCOPE_FAMILY_WIDTH[requested.scope_type] > SCOPE_FAMILY_WIDTH[inferred.scope_type]:
+        return False
+    if requested.scope_type != inferred.scope_type:
+        return False
+    if resolve_scope_alias(requested.scope_id) != resolve_scope_alias(inferred.scope_id):
+        return False
+    if VISIBILITY_WIDTH[requested.visibility] > VISIBILITY_WIDTH[inferred.visibility]:
+        return False
+    if EGRESS_WIDTH[requested.egress_policy] > EGRESS_WIDTH[inferred.egress_policy]:
+        return False
+    return True
+
+
+def widened_dimensions(requested: ScopeTag, inferred: ScopeTag) -> list[str]:
+    """Which reach/policy dimensions need a human decision."""
+    widened: list[str] = []
+    if SCOPE_FAMILY_WIDTH[requested.scope_type] > SCOPE_FAMILY_WIDTH[inferred.scope_type]:
+        widened.append("scope_type")
+    elif (
+        requested.scope_type != inferred.scope_type
+        or resolve_scope_alias(requested.scope_id) != resolve_scope_alias(inferred.scope_id)
+    ):
+        widened.append("scope_identity")
+    if VISIBILITY_WIDTH[requested.visibility] > VISIBILITY_WIDTH[inferred.visibility]:
+        widened.append("visibility")
+    if EGRESS_WIDTH[requested.egress_policy] > EGRESS_WIDTH[inferred.egress_policy]:
+        widened.append("egress_policy")
+    return widened
 
 
 # Ranking affinities for local delivery. In-scope material outranks everything

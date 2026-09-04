@@ -22,7 +22,7 @@ from ocbrain.core_v1 import (
     sha256_text,
 )
 from ocbrain.mcp_v1 import decide_proposal_v1
-from ocbrain.scope import ScopeTag
+from ocbrain.scope import ScopeTag, hosted_egress_refusal_reason
 
 CURATED_MANIFEST_SCHEMA = "ocbrain.curated-memory.v1"
 
@@ -57,11 +57,10 @@ def apply_curated_manifest(
         seen_fact_ids.add(fact_id)
         visibility = str(raw.get("visibility") or "internal")
         egress_policy = str(raw.get("egress_policy") or "local_only")
+        refusal = hosted_egress_refusal_reason(visibility, egress_policy)
         if egress_policy == "hosted_ok":
-            if visibility in {"confidential", "secret"}:
-                raise ValueError(
-                    f"fact {fact_id} cannot combine hosted_ok with {visibility} visibility"
-                )
+            if refusal is not None:
+                raise ValueError(f"fact {fact_id} {refusal}")
             hosted_fact_ids.append(fact_id)
     if hosted_fact_ids and not allow_hosted_egress:
         joined = ", ".join(hosted_fact_ids)
