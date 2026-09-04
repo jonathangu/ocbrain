@@ -273,6 +273,12 @@ class ScopeTag:
             raise ValueError(f"invalid scope_type: {self.scope_type}")
         if not self.scope_id:
             raise ValueError("scope_id is required")
+        if self.scope_type != "legacy_unscoped":
+            prefix, separator, component = self.scope_id.partition(":")
+            if not separator or prefix != self.scope_type or not component.strip():
+                raise ValueError(
+                    f"scope_id must use the {self.scope_type}: prefix: {self.scope_id}"
+                )
         if self.visibility not in VISIBILITIES:
             raise ValueError(f"invalid visibility: {self.visibility}")
         if self.egress_policy not in EGRESS_POLICIES:
@@ -477,12 +483,18 @@ EGRESS_WIDTH = {"prohibited": 0, "local_only": 1, "approval_required": 2, "hoste
 def scope_narrows_or_equals(requested: ScopeTag, inferred: ScopeTag) -> bool:
     """Whether an explicitly requested write scope narrows the inferred one.
 
-    Three ladders must all be at-most: the scope family no wider, the visibility
-    no more visible, and the egress policy no more permissive. Equal scope counts
-    as narrowing. Anything the caller asks beyond that is a widening request, and
-    widenings are proposed, never applied unattended.
+    Visibility and egress may narrow, but reach may only stay on the same
+    canonical scope identity. Scope ids are not hierarchical, so a task/repo
+    id cannot be proven to belong below a project id from these tags alone;
+    accepting a different id merely because its family is no wider permits
+    lateral writes into sibling scopes. Any unverifiable reach change is
+    proposed for a human rather than applied unattended.
     """
     if SCOPE_FAMILY_WIDTH[requested.scope_type] > SCOPE_FAMILY_WIDTH[inferred.scope_type]:
+        return False
+    if requested.scope_type != inferred.scope_type:
+        return False
+    if resolve_scope_alias(requested.scope_id) != resolve_scope_alias(inferred.scope_id):
         return False
     if VISIBILITY_WIDTH[requested.visibility] > VISIBILITY_WIDTH[inferred.visibility]:
         return False
@@ -492,10 +504,15 @@ def scope_narrows_or_equals(requested: ScopeTag, inferred: ScopeTag) -> bool:
 
 
 def widened_dimensions(requested: ScopeTag, inferred: ScopeTag) -> list[str]:
-    """Which ladders the request exceeds, in ladder order; empty when it narrows or equals."""
+    """Which reach/policy dimensions need a human decision."""
     widened: list[str] = []
     if SCOPE_FAMILY_WIDTH[requested.scope_type] > SCOPE_FAMILY_WIDTH[inferred.scope_type]:
         widened.append("scope_type")
+    elif (
+        requested.scope_type != inferred.scope_type
+        or resolve_scope_alias(requested.scope_id) != resolve_scope_alias(inferred.scope_id)
+    ):
+        widened.append("scope_identity")
     if VISIBILITY_WIDTH[requested.visibility] > VISIBILITY_WIDTH[inferred.visibility]:
         widened.append("visibility")
     if EGRESS_WIDTH[requested.egress_policy] > EGRESS_WIDTH[inferred.egress_policy]:

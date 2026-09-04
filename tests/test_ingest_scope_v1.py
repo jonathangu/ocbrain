@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ocbrain.core_v1 import get_core_v1_evidence, init_core_v1
 from ocbrain.db import connect
-from ocbrain.mcp import handle_request
+from ocbrain.mcp import handle_request, tool_list
 from ocbrain.mcp_v1 import ingest_v1
 from ocbrain.scope import ScopeContext, ScopeTag
 
@@ -97,6 +99,73 @@ def test_ingest_v1_equal_scope_counts_as_narrowing_without_proposal(tmp_path):
     assert stored["scope"]["provenance"] == "explicit"
     assert result["scope_decision"] == "inferred"
     assert "hosted_egress_proposal_event_id" not in result
+
+
+def test_ingest_v1_sibling_scope_identity_is_proposed_not_applied(tmp_path):
+    conn = _conn(tmp_path)
+    requested = ScopeTag(
+        "task",
+        "task:unrelated-sibling",
+        visibility="internal",
+        egress_policy="approval_required",
+        provenance="explicit",
+    )
+    result = ingest_v1(
+        conn,
+        body="A lateral task retarget must never be called narrowing.",
+        kind="observation",
+        context=_task_context(),
+        writer="test",
+        session_id=None,
+        artifact_ref=None,
+        requested_scope=requested,
+    )
+    stored = get_core_v1_evidence(conn, result["evidence_id"])
+    assert stored is not None
+    assert stored["scope"]["scope_id"] == "task:scope-honor"
+    assert result["scope_decision"] == "hosted_egress_proposal"
+    assert result["widened"] == ["scope_identity"]
+
+
+def test_scope_tag_rejects_mismatched_nonlegacy_prefix():
+    with pytest.raises(ValueError, match="task: prefix"):
+        ScopeTag("task", "project:not-a-task")
+
+
+def test_unprovable_cross_family_retarget_is_proposed(tmp_path):
+    conn = _conn(tmp_path)
+    result = ingest_v1(
+        conn,
+        body="A task id is not provably contained by a project id.",
+        kind="observation",
+        context=ScopeContext(project="scope-honor", runtime="test"),
+        writer="test",
+        session_id=None,
+        artifact_ref=None,
+        requested_scope=ScopeTag(
+            "task",
+            "task:scope-honor",
+            visibility="internal",
+            egress_policy="approval_required",
+        ),
+    )
+    stored = get_core_v1_evidence(conn, result["evidence_id"])
+    assert stored is not None
+    assert stored["scope"]["scope_id"] == "project:scope-honor"
+    assert result["scope_decision"] == "hosted_egress_proposal"
+    assert result["widened"] == ["scope_identity"]
+
+
+def test_brain_ingest_schema_includes_session_scope():
+    ingest = next(
+        tool
+        for tool in tool_list(profile="runtime", core_v1=True)
+        if tool["name"] == "brain.ingest"
+    )
+    scope_types = (
+        ingest["inputSchema"]["properties"]["scope"]["properties"]["scope_type"]["enum"]
+    )
+    assert "session" in scope_types
 
 
 def test_ingest_v1_records_widening_request_as_proposal(tmp_path):

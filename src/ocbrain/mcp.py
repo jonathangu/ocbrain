@@ -2036,9 +2036,9 @@ def tool_list(
                 "name": "brain.ingest",
                 "description": (
                     "Append scoped evidence to the event ledger. An explicit scope is "
-                    "honored only when it narrows the inferred write scope (same or "
-                    "narrower scope family, visibility, and egress policy); a widening "
-                    "request is recorded as a hosted_egress_proposal instead of applied."
+                    "honored only when it keeps the inferred canonical scope identity "
+                    "and narrows visibility and/or egress; any reach change or policy "
+                    "widening is recorded as a hosted_egress_proposal instead of applied."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -2051,8 +2051,9 @@ def tool_list(
                         "scope": {
                             "type": "object",
                             "description": (
-                                "Narrowing-only: applied when it is at most the inferred "
-                                "scope on every dimension; otherwise the evidence is "
+                                "Narrowing-only: applied when it keeps the inferred canonical "
+                                "scope identity and does not widen visibility or egress; "
+                                "otherwise the evidence is "
                                 "stored under the inferred scope and a "
                                 "hosted_egress_proposal event records the request."
                             ),
@@ -2065,6 +2066,7 @@ def tool_list(
                                         "repo",
                                         "client",
                                         "task",
+                                        "session",
                                         "legacy_unscoped",
                                     ],
                                 },

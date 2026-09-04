@@ -2056,14 +2056,25 @@ def _hosted_approve_one(
             f"body trips the public-safety scanner: {', '.join(leaks)}",
         )
     scope_source = "cli_project" if project else "evidence_row"
-    answers_proposal: str | None = None
-    if not project:
-        requested = _requested_project_from_proposal(conn, canonical)
-        if requested is not None:
-            project, answers_proposal = requested
-            scope_source = "requested_by_proposal"
+    requested = _requested_project_from_proposal(conn, canonical)
+    answers_proposal = requested[1] if requested is not None else None
+    if not project and requested is not None:
+        project = requested[0]
+        scope_source = "requested_by_proposal"
     target = _hosted_target_scope(project, dict(row))
     belief_id = stable_id("belief", body_text, target.scope_id)
+    evidence_ids = [
+        str(item["evidence_id"])
+        for item in conn.execute(
+            "SELECT be.evidence_id FROM belief_evidence AS be "
+            "JOIN current_beliefs AS cb ON cb.belief_id=be.belief_id "
+            "WHERE be.belief_id=? AND cb.status='current' "
+            "ORDER BY be.created_at, be.evidence_id",
+            (belief_id,),
+        )
+    ]
+    if canonical not in evidence_ids:
+        evidence_ids.append(canonical)
     if dry_run:
         return {
             "evidence_id": canonical,
@@ -2085,7 +2096,12 @@ def _hosted_approve_one(
             "subject": {"kind": "belief", "id": belief_id},
             "belief_id": belief_id,
             "body": body_text,
-            "evidence_ids": [canonical],
+            # Two independently approved evidence rows may converge on the
+            # same body+scope-derived belief id. A compilation decision replaces
+            # that belief's support set, so carry the existing current supports
+            # forward before adding this approval rather than dropping the
+            # earlier evidence link.
+            "evidence_ids": evidence_ids,
             "scope": target.to_dict(),
             "confidence": HOSTED_APPROVAL_CONFIDENCE,
             "attributes": attributes,
@@ -2178,7 +2194,7 @@ def cmd_hosted_approve(args: argparse.Namespace) -> int:
             return 2
         selected = [str(item) for item in args.evidence_id]
         if args.all_from_queue:
-            evidence_rows, _proposals = _hosted_queue_rows(
+            evidence_rows, proposal_rows = _hosted_queue_rows(
                 conn,
                 project=args.project,
                 writer=args.writer,
@@ -2186,6 +2202,13 @@ def cmd_hosted_approve(args: argparse.Namespace) -> int:
                 limit=args.limit,
             )
             selected.extend(str(row["evidence_id"]) for row in evidence_rows)
+            # Project-filtered widening requests live in ``proposal_rows``:
+            # their underlying evidence is deliberately still task/session
+            # scoped, so it cannot match the project-scoped evidence query.
+            # Treat both queue sections as selectable; the stable dedupe below
+            # handles evidence that appears in both sections without approving
+            # it twice.
+            selected.extend(str(row["evidence_id"]) for row in proposal_rows)
         selected = list(dict.fromkeys(selected))
         if not selected:
             if args.all_from_queue:
@@ -2269,6 +2292,18 @@ def cmd_egress_promote(args: argparse.Namespace) -> int:
         return compatibility_refusal(
             args, "egress-promote", "egress promotion requires an event-authoritative v1 core"
         )
+    approved_by = str(args.approved_by or "").strip()
+    if not _HOSTED_APPROVED_BY_RE.match(approved_by):
+        output(
+            args,
+            {
+                "action": "egress-promote",
+                "status": "blocked",
+                "reason": "invalid_approved_by",
+                "detail": "--approved-by must spell the deciding human as human:NAME",
+            },
+        )
+        return 2
     belief_ids = list(dict.fromkeys(args.belief_id))
     if args.scope_id:
         clauses = ["scope_id=?", "status='current'"]
@@ -2337,7 +2372,7 @@ def cmd_egress_promote(args: argparse.Namespace) -> int:
                     },
                     "from_egress_policy": from_egress,
                     "to_egress_policy": args.to,
-                    "approved_by": args.approved_by,
+                    "approved_by": approved_by,
                     "reason": args.reason,
                 },
                 writer="ocbrain-cli",
@@ -2352,7 +2387,7 @@ def cmd_egress_promote(args: argparse.Namespace) -> int:
             "action": "egress-promote",
             "status": "planned" if args.dry_run else "applied",
             "dry_run": bool(args.dry_run),
-            "approved_by": args.approved_by,
+            "approved_by": approved_by,
             "promoted": promoted,
             "unchanged": unchanged,
             "refused": refused,

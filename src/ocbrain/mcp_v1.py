@@ -1627,9 +1627,16 @@ def _normalized_body_hash(body: str) -> str:
 # predicate is how a dedup guard drifts away from the count that is supposed to
 # prove it works, so there is one, and it names its outer table `proposal`.
 _PROPOSAL_DECIDED_SQL = (
-    "EXISTS (SELECT 1 FROM brain_events AS decision "
+    "(EXISTS (SELECT 1 FROM brain_events AS decision "
     "WHERE decision.kind='compilation_decided' "
-    "AND json_extract(decision.body_json, '$.proposal_event_id') = proposal.id)"
+    "AND json_extract(decision.body_json, '$.proposal_event_id') = proposal.id) "
+    "OR (proposal.kind='hosted_egress_proposal' AND EXISTS ("
+    "SELECT 1 FROM brain_events AS compiled "
+    "JOIN brain_events AS hosted_decision "
+    "  ON hosted_decision.kind='compilation_decided' "
+    " AND json_extract(hosted_decision.body_json, '$.proposal_event_id') = compiled.id "
+    "WHERE compiled.kind='compilation_proposed' "
+    "AND json_extract(compiled.body_json, '$.attributes.answers_proposal') = proposal.id)))"
 )
 _UNDECIDED_SUPERSEDE_SQL = (
     "FROM brain_events AS proposal WHERE proposal.kind='compilation_proposed' "

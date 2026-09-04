@@ -106,12 +106,13 @@ refusals, or the invocation was malformed (no ids selected, or an
 `brain.ingest` has always advertised a `scope` argument in its tool schema;
 the v1 dispatcher silently dropped it. Now:
 
-- A requested scope that **narrows** the inferred write scope (same or
-  narrower scope family, visibility no more visible, egress no more
-  permissive; equal counts as narrowing) is honored with
-  `provenance='explicit'` — the legacy dispatcher already worked this way.
-- A request that **widens** any dimension is never applied. The evidence is
-  stored under the inferred scope, and a `hosted_egress_proposal` event
+- A requested scope that keeps the **same canonical scope identity** and only
+  narrows visibility and/or egress is honored with `provenance='explicit'`.
+  Scope IDs are not hierarchical, so lateral sibling IDs and unprovable
+  cross-family retargeting are proposals rather than unattended writes.
+- A request that changes reach or widens visibility/egress is never applied.
+  The evidence is stored under the inferred scope, and a
+  `hosted_egress_proposal` event
   records the request: requested scope, inferred scope, writer, evidence id,
   and a 160-char body excerpt. The ingest receipt names the proposal event
   (`scope_decision: "hosted_egress_proposal"`) and the proposal appears in

@@ -19,7 +19,7 @@ from ocbrain.core_v1 import (
 )
 from ocbrain.db import connect
 from ocbrain.mcp import tool_list
-from ocbrain.mcp_v1 import build_context_v1
+from ocbrain.mcp_v1 import build_context_v1, proposals_v1
 from ocbrain.scope import ScopeContext, ScopeTag
 
 APPROVER = "human:test-approver"
@@ -299,6 +299,50 @@ def test_hosted_approve_lands_the_proposals_requested_project(tmp_path, capsys):
     ).fetchone()
     attributes = json.loads(proposal["body_json"])["attributes"]
     assert attributes["answers_proposal"] == proposal_event_id
+    assert all(
+        item["proposal_event_id"] != proposal_event_id
+        for item in proposals_v1(conn, limit=50, include_decided=False)["proposals"]
+    )
+    decided = {
+        item["proposal_event_id"]: item
+        for item in proposals_v1(conn, limit=50, include_decided=True)["proposals"]
+    }
+    assert decided[proposal_event_id]["decided"] is True
+    conn.close()
+
+
+def test_all_from_project_queue_includes_task_scoped_widening_proposals(tmp_path, capsys):
+    """The project filter selects a proposal by its requested scope even though
+    its evidence remains task-scoped until the human approval is applied."""
+    conn = _seed_core(tmp_path)
+    evidence_id, proposal_event_id = _seed_task_evidence_with_project_proposal(conn)
+    db = str(tmp_path / "hosted-queue.sqlite")
+
+    rc, payload = _run(
+        capsys,
+        db,
+        [
+            "hosted-approve",
+            "--all-from-queue",
+            "--project",
+            "coframe",
+            "--approved-by",
+            APPROVER,
+        ],
+    )
+
+    assert rc == 0, payload
+    assert payload["status"] == "applied"
+    assert [entry["evidence_id"] for entry in payload["approved"]] == [evidence_id]
+    entry = payload["approved"][0]
+    assert entry["scope"]["scope_id"] == "project:coframe"
+    assert entry["scope_source"] == "cli_project"
+    compilation = conn.execute(
+        "SELECT body_json FROM brain_events WHERE kind='compilation_proposed' "
+        "AND json_extract(body_json, '$.attributes.answers_proposal')=?",
+        (proposal_event_id,),
+    ).fetchone()
+    assert compilation is not None
     conn.close()
 
 
@@ -458,6 +502,37 @@ def test_hosted_approve_all_from_queue_then_queue_drains(tmp_path, capsys):
     assert payload["status"] == "applied"
     assert {entry["evidence_id"] for entry in payload["approved"]} == {first, second}
     rc, queue = _run(capsys, db, ["hosted-queue", "--project", "coframe"])
+    assert rc == 0
+    assert queue["count"] == 0
+    conn.close()
+
+
+def test_bulk_approval_preserves_supports_when_evidence_converges(tmp_path, capsys):
+    conn = _seed_core(tmp_path)
+    body = "Two independent observations support the same hosted claim."
+    first = _seed_evidence(conn, body=body, kind="observation")
+    second = _seed_evidence(conn, body=body, kind="task_closeout_summary")
+    db = str(tmp_path / "hosted-queue.sqlite")
+
+    rc, payload = _run(
+        capsys,
+        db,
+        ["hosted-approve", "--all-from-queue", "--approved-by", APPROVER],
+    )
+
+    assert rc == 0, payload
+    assert {entry["evidence_id"] for entry in payload["approved"]} == {first, second}
+    belief_ids = {entry["belief_id"] for entry in payload["approved"]}
+    assert len(belief_ids) == 1
+    belief_id = belief_ids.pop()
+    supports = {
+        row["evidence_id"]
+        for row in conn.execute(
+            "SELECT evidence_id FROM belief_evidence WHERE belief_id=?", (belief_id,)
+        )
+    }
+    assert supports == {first, second}
+    rc, queue = _run(capsys, db, ["hosted-queue"])
     assert rc == 0
     assert queue["count"] == 0
     conn.close()

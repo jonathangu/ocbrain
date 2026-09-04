@@ -315,7 +315,7 @@ def test_randomized_incremental_projection_matches_full_rebuild(tmp_path: Path) 
                 "scope_promoted",
                 {
                     "belief_id": f"belief:random:{index:02d}",
-                    "scope": ScopeTag("global", "global").to_dict(),
+                    "scope": ScopeTag("global", "global:doctrine").to_dict(),
                     "approved_by": "gate",
                 },
             )

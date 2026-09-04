@@ -95,6 +95,26 @@ def _event_count(db: Path, kind: str = "egress_promoted") -> int:
     return count
 
 
+def test_egress_promote_rejects_agent_approver_without_writing(tmp_path: Path, capsys) -> None:
+    db = _seeded(tmp_path)
+    payload = _run(
+        capsys,
+        db,
+        [
+            "egress-promote",
+            "wiki:personalization:packet-target",
+            "--approved-by",
+            "agent:self",
+            "--reason",
+            "an agent must not self-approve hosted egress",
+        ],
+        expected=2,
+    )
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "invalid_approved_by"
+    assert _event_count(db) == 0
+
+
 def test_promoting_local_only_belief_makes_it_hosted_serving(tmp_path: Path, capsys) -> None:
     """The whole point: what the delivery gate refused yesterday it serves today."""
     db = _seeded(tmp_path)
