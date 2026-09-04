@@ -541,6 +541,7 @@ def handle_request(
                     time_travel=not is_core_v1(conn),
                     dialect=schema_dialect_for_client((session_state or {}).get("client_name")),
                     core_v1=is_core_v1(conn),
+                    delivery_target=resolved_delivery_target,
                 )
             }
         elif method == "tools/call":
@@ -1397,6 +1398,7 @@ def call_tool_v1(
             writer=optional_string(arguments, "writer") or "mcp",
             session_id=optional_string(arguments, "session") or context.session,
             artifact_ref=optional_string(arguments, "artifact_ref"),
+            requested_scope=scope_from_arguments(arguments),
         )
         conn.commit()
         return text_result(payload)
@@ -1608,8 +1610,10 @@ def tool_list(
     time_travel: bool = False,
     dialect: str = PLAIN_DIALECT,
     core_v1: bool = True,
+    delivery_target: str = LOCAL_MODEL_TARGET,
 ) -> list[dict[str, Any]]:
     profile = resolve_profile(profile=profile)
+    delivery_target = normalize_delivery_target(delivery_target)
     tools = [
         {
             "name": "brain.context",
@@ -2030,7 +2034,12 @@ def tool_list(
         [
             {
                 "name": "brain.ingest",
-                "description": "Append scoped evidence to the event ledger.",
+                "description": (
+                    "Append scoped evidence to the event ledger. An explicit scope is "
+                    "honored only when it narrows the inferred write scope (same or "
+                    "narrower scope family, visibility, and egress policy); a widening "
+                    "request is recorded as a hosted_egress_proposal instead of applied."
+                ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2041,6 +2050,12 @@ def tool_list(
                         "artifact_ref": {"type": "string"},
                         "scope": {
                             "type": "object",
+                            "description": (
+                                "Narrowing-only: applied when it is at most the inferred "
+                                "scope on every dimension; otherwise the evidence is "
+                                "stored under the inferred scope and a "
+                                "hosted_egress_proposal event records the request."
+                            ),
                             "properties": {
                                 "scope_type": {
                                     "type": "string",
@@ -2437,6 +2452,14 @@ def tool_list(
     allowed = tools_for_profile(profile)
     if not core_v1:
         allowed = allowed - CORE_V1_ONLY_TOOLS
+    if delivery_target == HOSTED_MODEL_TARGET:
+        # The deterministic harness surfaces contain local task state that is
+        # not filtered belief-by-belief. Keep their fail-closed dispatcher
+        # checks and also omit them from the hosted catalogue so a model is not
+        # prompted to call tools that can never succeed on this transport.
+        allowed = allowed - HARNESS_TOOLS - {"brain.proposals"}
+        if not core_v1:
+            allowed = allowed - LEGACY_HOSTED_READ_TOOLS
     tools = [tool for tool in tools if str(tool["name"]) in allowed]
     if not time_travel:
         # The v1 core cannot serve an as-of view, so it must not advertise the

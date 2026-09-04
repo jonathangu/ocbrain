@@ -56,6 +56,8 @@ from ocbrain.scope import (
     egress_allowed,
     normalize_delivery_target,
     resolve_write_scope,
+    scope_narrows_or_equals,
+    widened_dimensions,
 )
 from ocbrain.shared_context import issue_source_handles
 from ocbrain.text import compact_whitespace
@@ -1369,14 +1371,45 @@ def ingest_v1(
     writer: str,
     session_id: str | None,
     artifact_ref: str | None,
+    requested_scope: ScopeTag | None = None,
 ) -> dict[str, Any]:
+    """Record one evidence event, honoring an explicit scope that narrows only.
+
+    The default write scope is the narrowest the context implies. A client may
+    pass an explicit ``scope``; it is honored verbatim (with ``provenance``
+    forced to ``explicit``) when it narrows the inferred scope on every ladder
+    — scope family, visibility, egress policy. A request that WIDENS any of
+    them is never applied unattended: the evidence is still stored under the
+    inferred scope, and a ``hosted_egress_proposal`` event records the request
+    (requested policy, writer, evidence id, a body excerpt) so a human can act
+    on it through the hosted-approval queue. The tool schema has advertised a
+    ``scope`` argument for a long time; before this, the v1 dispatcher dropped
+    it silently, which is exactly the failure this replaces.
+    """
     telemetry = kind in SKILL_TELEMETRY_KINDS
     if telemetry:
         envelope = validate_skill_telemetry(body)
         if envelope["kind"] != kind:
             raise ValueError("skill telemetry body kind must match brain.ingest kind")
         body = canonical_json(envelope)
-    scope = resolve_write_scope(context)
+    inferred_scope = resolve_write_scope(context)
+    scope = inferred_scope
+    scope_decision = "inferred"
+    proposal_event_id: str | None = None
+    if requested_scope is not None:
+        if scope_narrows_or_equals(requested_scope, inferred_scope):
+            scope = ScopeTag(
+                requested_scope.scope_type,
+                requested_scope.scope_id,
+                visibility=requested_scope.visibility,
+                egress_policy=requested_scope.egress_policy,
+                provenance="explicit",
+            )
+            scope_decision = (
+                "explicit" if requested_scope.to_dict() != inferred_scope.to_dict() else "inferred"
+            )
+        else:
+            scope_decision = "hosted_egress_proposal"
     evidence_id, event_id = record_core_v1_evidence(
         conn,
         body=body,
@@ -1386,11 +1419,38 @@ def ingest_v1(
         session_id=session_id,
         artifact_ref=artifact_ref,
     )
-    return {
+    if scope_decision == "hosted_egress_proposal":
+        proposal_event_id = append_core_event(
+            conn,
+            "hosted_egress_proposal",
+            {
+                "schema_version": "ocbrain.hosted-egress-proposal.v1",
+                "subject": {"kind": "evidence", "id": evidence_id},
+                "evidence_id": evidence_id,
+                "requested_scope": requested_scope.to_dict() if requested_scope else None,
+                "inferred_scope": inferred_scope.to_dict(),
+                "applied_scope": scope.to_dict(),
+                "writer": writer,
+                "body_head": _human_excerpt(body, 160),
+            },
+            writer=writer,
+            session_id=session_id,
+        )
+    result: dict[str, Any] = {
         "event_id": event_id,
         "evidence_id": evidence_id,
         "kind": "evidence_recorded",
+        "scope": scope.to_dict(),
+        "scope_decision": scope_decision,
     }
+    if proposal_event_id is not None:
+        result["hosted_egress_proposal_event_id"] = proposal_event_id
+        # Name the widening so the caller can see which ladders it exceeded and
+        # what was asked for; the applied scope in `result["scope"]` is unchanged.
+        result["requested_scope"] = requested_scope.to_dict() if requested_scope else None
+        result["inferred_scope"] = inferred_scope.to_dict()
+        result["widened"] = widened_dimensions(requested_scope, inferred_scope)
+    return result
 
 
 def closeout_v1(
@@ -2080,9 +2140,15 @@ def proposals_v1(
     include_decided: bool,
 ) -> dict[str, Any]:
     result: list[dict[str, Any]] = []
+    # Two proposal kinds share this queue: compilation proposals waiting on the
+    # gate, and hosted-egress proposals a client raised while ingesting. Neither
+    # is applied until a decision event lands; a hosted-egress proposal has no
+    # decide verb at all, so it lists as pending until the evidence it names has
+    # been compiled by some human-approved path.
     for row in conn.execute(
         f"SELECT proposal.*, {_PROPOSAL_DECIDED_SQL} AS is_decided FROM brain_events AS proposal "
-        "WHERE proposal.kind='compilation_proposed' ORDER BY proposal.rowid DESC LIMIT ?",
+        "WHERE proposal.kind IN ('compilation_proposed','hosted_egress_proposal') "
+        "ORDER BY proposal.rowid DESC LIMIT ?",
         (max(limit * 4, 100),),
     ):
         is_decided = bool(row["is_decided"])

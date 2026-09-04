@@ -31,6 +31,7 @@ from ocbrain.scope import (
     LOCAL_MODEL_TARGET,
     ScopeContext,
     ScopeTag,
+    hosted_egress_refusal_reason,
     scope_affinity,
     scope_match,
 )
@@ -941,6 +942,8 @@ def _apply_event(
         _project_tombstone(conn, event, body)
     elif kind == "scope_promoted":
         _project_scope_promotion(conn, event, body)
+    elif kind == "egress_promoted":
+        _project_egress_promotion(conn, event, body)
     elif kind == "legacy_evidence_imported":
         _project_legacy_evidence(conn, event, body)
     elif kind == "legacy_knowledge_imported":
@@ -1220,6 +1223,42 @@ def _project_scope_promotion(
         WHERE belief_id=?
         """,
         (*_scope_values(scope), event["id"], belief_id),
+    )
+
+
+def _project_egress_promotion(
+    conn: sqlite3.Connection, event: sqlite3.Row, body: dict[str, Any]
+) -> None:
+    """Apply an ``egress_promoted`` event: lift one belief's egress, nothing else.
+
+    The replay/rebuild twin of :func:`_project_scope_promotion` and the
+    authority for the live incremental path. A targeted UPDATE keeps the
+    belief's ``serve`` flag, body, confidence, and evidence untouched, and the
+    same refusal predicate the CLI applies is re-checked here: the ledger is
+    authoritative, so the projection — not just the emitter — keeps
+    confidential and secret material off a hosted model. Idempotent on replay
+    (re-applying the same event lands the same row values).
+    """
+    if not body.get("approved_by"):
+        return
+    target_policy = str(body.get("to_egress_policy") or "hosted_ok")
+    if target_policy not in {"hosted_ok", "approval_required"}:
+        return
+    belief_id = resolve_object_id(conn, str(body.get("belief_id") or ""))
+    row = conn.execute(
+        "SELECT visibility FROM current_beliefs WHERE belief_id=?", (belief_id,)
+    ).fetchone()
+    if row is None:
+        return
+    if hosted_egress_refusal_reason(str(row["visibility"]), target_policy) is not None:
+        return
+    conn.execute(
+        """
+        UPDATE current_beliefs SET
+          egress_policy=?, scope_provenance='egress_promoted', last_event_id=?
+        WHERE belief_id=?
+        """,
+        (target_policy, event["id"], belief_id),
     )
 
 
