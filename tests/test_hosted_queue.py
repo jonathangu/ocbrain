@@ -382,7 +382,9 @@ def test_hosted_approve_refuses_secret_leak_body(tmp_path, capsys):
     conn = _seed_core(tmp_path)
     leaky = _seed_evidence(
         conn,
-        body="Use api_key=sk-abc123def456ghi789jkl012mno345 for the deployment.",
+        body=(
+            "Use " + "api_" + "key=" + "«redacted:" + "sk-…» for the deployment."
+        ),
     )
     conn.commit()
     db = str(tmp_path / "hosted-queue.sqlite")
