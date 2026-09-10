@@ -1,12 +1,13 @@
 """ocbrain configuration surface.
 
-Seven sections, one per thing that actually reads configuration: ``retrieval``
+Eight sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
 closeout slop gate), ``closeout`` (the write-time closeout identity and failure
-gates), ``supersede`` (how much authority a runtime supersession carries), and
-``goals`` (where a repo-relative goal spec pointer is resolved).
-There were seventeen; thirteen configured subsystems that were deleted or were
+gates), ``supersede`` (how much authority a runtime supersession carries),
+``goals`` (where a repo-relative goal spec pointer is resolved), and ``rerank``
+(the optional cross-encoder second stage).
+There were seventeen; nine configured subsystems that were deleted or were
 never read at all.
 
 The public entry point is :func:`load_config`, which layers, in order:
@@ -328,6 +329,25 @@ class GoalsConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    """The optional cross-encoder second stage over the fused ranking.
+
+    Ships DISABLED: the stage costs a model load and per-query inference, so the
+    operator turns it on after measuring the ordering. ``candidates`` is how many
+    of the fused head get re-scored, which has to exceed the packet ``limit`` for
+    an item below it to be promotable; ``min_candidates`` is the floor below
+    which re-scoring is pointless.
+    """
+
+    enabled: bool = False
+    model: str = "BAAI/bge-reranker-v2-m3"
+    candidates: int = 24
+    min_candidates: int = 3
+    device: str = "auto"
+    max_document_chars: int = 1200
+
+
+@dataclass(frozen=True)
 class OcbrainConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     scopes: ScopesConfig = field(default_factory=ScopesConfig)
@@ -336,6 +356,7 @@ class OcbrainConfig:
     closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
     goals: GoalsConfig = field(default_factory=GoalsConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
 
 
 def _coerce(current: Any, incoming: Any) -> Any:

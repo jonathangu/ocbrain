@@ -40,6 +40,11 @@ dev = [
 curator = [
   "anthropic>=0.70",
 ]
+# The optional cross-encoder rerank stage. Out of the core dependency set
+# because it pulls in torch; the import is lazy, so retrieval works without it.
+rerank = [
+  "sentence-transformers>=3.0",
+]
 
 [project.scripts]
 ocbrain = "ocbrain.cli:main"

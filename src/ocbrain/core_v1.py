@@ -27,6 +27,7 @@ from ocbrain.history_window import is_body_ref
 from ocbrain.hybrid import semantic_neighbors
 from ocbrain.ids import stable_id
 from ocbrain.provenance import EMPTY_PROVENANCE, Provenance
+from ocbrain.rerank import rerank
 from ocbrain.scope import (
     LOCAL_MODEL_TARGET,
     ScopeContext,
@@ -155,6 +156,19 @@ def _retrieval_tuning() -> Any:
         return load_config().retrieval
     except Exception:  # noqa: BLE001 - config problems must not break serving
         return _RETRIEVAL_FALLBACK
+
+
+def _rerank_tuning() -> Any:
+    """Resolve the rerank stage's settings; a broken config means off, not down."""
+    try:
+        from ocbrain.config import load_config
+
+        return load_config().rerank
+    except Exception:  # noqa: BLE001 - config problems must not break serving
+        from ocbrain.config import RerankConfig
+
+        return RerankConfig()
+
 
 LEGACY_IMPORT_KINDS = {
     "legacy_evidence_imported",
@@ -2360,8 +2374,8 @@ def search_core_v1(
             continue
         seen_content.add(content_key)
         items.append(item)
-        if len(items) >= limit:
-            break
+    items, rerank_info = rerank(query, items, config=_rerank_tuning())
+    items = items[:limit]
     # One evidence query for the rows that are actually served, not for every
     # ranked candidate: at limit=12 that is 12 ids, against a candidate list of
     # up to 120.
@@ -2402,6 +2416,7 @@ def search_core_v1(
             # healthy mode; a non-zero value says the packet is deliberately
             # thinner than the corpus could support.
             "degraded_excluded_procedures": degraded_excluded_procedures,
+            "rerank": rerank_info,
         },
     }
 

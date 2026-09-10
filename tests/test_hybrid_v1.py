@@ -1291,3 +1291,73 @@ def test_uncorroborated_lexical_rows_survive_when_dense_arm_is_down(
         conn, probe, context=context, limit=10, delivery_target="hosted_model"
     )
     assert [item["belief_id"] for item in degraded["items"]] == [target]
+
+
+def _rerank_fixture(conn, monkeypatch) -> list[str]:
+    ids = [f"curated:bountiful:rerank-{index}" for index in range(5)]
+    for index, belief_id in enumerate(ids):
+        _seed_belief(conn, belief_id=belief_id, body=f"Rerank candidate number {index}.")
+    conn.commit()
+    similarities = {belief_id: 0.90 - 0.02 * index for index, belief_id in enumerate(ids)}
+    monkeypatch.setattr(
+        "ocbrain.core_v1.semantic_neighbors",
+        lambda *_args, candidate_ids=None, **_kwargs: (
+            [
+                {"belief_id": belief_id, "similarity": similarity}
+                for belief_id, similarity in similarities.items()
+            ],
+            None,
+        ),
+    )
+    return ids
+
+
+def test_rerank_stage_promotes_a_low_ranked_candidate_into_the_packet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    ids = _rerank_fixture(conn, monkeypatch)
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("OCBRAIN_RERANK_ENABLED", "true")
+
+    class _Scorer:
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            return [10.0 if "number 4" in document else 0.0 for document in documents]
+
+    monkeypatch.setattr("ocbrain.rerank.get_scorer", lambda _config: _Scorer())
+
+    result = search_core_v1(
+        conn,
+        "unmatched semantic probe",
+        context=ScopeContext(project="bountiful"),
+        limit=3,
+        delivery_target="hosted_model",
+    )
+
+    assert result["ranking"]["rerank"]["mode"] == "applied"
+    assert result["ranking"]["rerank"]["candidates"] == 5
+    served = [item["belief_id"] for item in result["items"]]
+    assert served == [ids[4], ids[0], ids[1]]
+    assert result["items"][0]["ranking"]["pre_rerank_rank"] == 5
+    assert result["items"][0]["ranking"]["rerank_score"] == 10.0
+
+
+def test_rerank_stage_off_by_default_changes_nothing(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    ids = _rerank_fixture(conn, monkeypatch)
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
+    monkeypatch.delenv("OCBRAIN_RERANK_ENABLED", raising=False)
+
+    result = search_core_v1(
+        conn,
+        "unmatched semantic probe",
+        context=ScopeContext(project="bountiful"),
+        limit=3,
+        delivery_target="hosted_model",
+    )
+
+    assert result["ranking"]["rerank"] == {"mode": "off"}
+    assert [item["belief_id"] for item in result["items"]] == ids[:3]
+    assert all("rerank_score" not in item["ranking"] for item in result["items"])

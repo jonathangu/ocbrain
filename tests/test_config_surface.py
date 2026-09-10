@@ -133,6 +133,8 @@ def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     assert cfg.curator.provider == "anthropic"
     assert cfg.deslop.reject_closeout_slop is False
     assert cfg.goals.repo_roots == []
+    assert cfg.rerank.enabled is False
+    assert cfg.rerank.model == "BAAI/bge-reranker-v2-m3"
 
 
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:
@@ -252,3 +254,29 @@ def test_config_cache_respects_env_overrides(tmp_path: Path, monkeypatch: pytest
     assert load_config(path).supersede.direct_cap == 7
     monkeypatch.delenv("OCBRAIN_SUPERSEDE_DIRECT_CAP")
     assert load_config(path).supersede.direct_cap == 3
+
+
+def test_rerank_section_loads_from_file_and_env(tmp_path: Path) -> None:
+    path = _write_cfg(
+        tmp_path,
+        {
+            "rerank": {
+                "enabled": True,
+                "candidates": 8,
+                "model": "BAAI/bge-reranker-v2-m3",
+            }
+        },
+    )
+    cfg = load_config(path)
+    assert cfg.rerank.enabled is True
+    assert cfg.rerank.candidates == 8
+    assert cfg.rerank.min_candidates == 3
+
+    overridden = load_config(
+        path,
+        env={"OCBRAIN_RERANK_DEVICE": "cpu", "OCBRAIN_RERANK_MIN_CANDIDATES": "5"},
+    )
+    assert overridden.rerank.enabled is True
+    assert overridden.rerank.device == "cpu"
+    assert overridden.rerank.min_candidates == 5
+    assert overridden.rerank.max_document_chars == 1200
