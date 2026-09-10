@@ -678,9 +678,8 @@ def test_closeout_join_matches_codex_rollout_suffix_and_excludes_unjoinable_runt
     claude_root.mkdir()
     codex_root.mkdir()
     (claude_root / "claude-session-1.jsonl").write_text("", encoding="utf-8")
-    (codex_root / "rollout-2026-01-01T00-00-00-abc-codex-session-1.jsonl").write_text(
-        "", encoding="utf-8"
-    )
+    stamp = "2026-01-01T00-00-00"
+    (codex_root / f"rollout-{stamp}-abc-codex-session-1.jsonl").write_text("", encoding="utf-8")
     conn = connect(core)
     for index in range(20):
         _closeout(
