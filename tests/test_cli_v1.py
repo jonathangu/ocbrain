@@ -118,6 +118,7 @@ def test_every_advertised_core_command_has_a_v1_acceptance_route() -> None:
 
 def test_fresh_v1_operational_cli_routes(tmp_path, capsys, monkeypatch) -> None:
     """Exercise the non-interactive seam of every operational core command."""
+    monkeypatch.delenv("OCBRAIN_DELIVERY_TARGET", raising=False)
     db = tmp_path / "core.sqlite"
     _run(capsys, db, ["init"])
 

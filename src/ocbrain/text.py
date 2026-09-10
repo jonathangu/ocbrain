@@ -18,6 +18,8 @@ _CAMEL_SECRET_KEY = (
     r"Credential|Credentials|Authorization))"
 )
 _SECRET_KEY_ATOM = rf"(?:{_SNAKE_SECRET_KEY}|{_CAMEL_SECRET_KEY})"
+_UNQUOTED_SECRET_VALUE = r"(?:(?=[^\s\"']{16})[^\s\"']+|(?=[^\s\"']{8})(?=[^\s\"']*\d)[^\s\"']+)"
+_ASSIGNED_SECRET_VALUE = rf"(?:\"[^\"\n]+\"|'[^'\n]+'|{_UNQUOTED_SECRET_VALUE})"
 
 _JSON_QUOTED_SECRET = re.compile(rf'(\\?"{_SECRET_KEY_ATOM}\\?"\s*:\s*\\?")([^"]*?)(\\?")')
 _QUOTED_ASSIGNED_SECRET = re.compile(rf"\b({_SECRET_KEY_ATOM}\s*[:=]\s*)(\"[^\"\n]+\"|'[^'\n]+')")
@@ -39,7 +41,7 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (_JSON_QUOTED_SECRET, r"\1[REDACTED]\3"),
     (_QUOTED_ASSIGNED_SECRET, r'\1"[REDACTED]"'),
     (
-        re.compile(rf"({_SECRET_KEY_ATOM})(\s*[:=]\s*)([^\s\"']+)"),
+        re.compile(rf"({_SECRET_KEY_ATOM})(\s*[:=]\s*)({_UNQUOTED_SECRET_VALUE})"),
         r"\1\2[REDACTED]",
     ),
 ]
@@ -62,7 +64,7 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         "assigned_secret",
         re.compile(
             rf"{_SECRET_KEY_ATOM}\s*[:=]\s*"
-            rf"(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]')[^\s]+"
+            rf"(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]'){_ASSIGNED_SECRET_VALUE}"
         ),
     ),
 ]
