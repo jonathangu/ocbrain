@@ -25,6 +25,7 @@ from ocbrain.briefing import (
     MIN_BRIEFING_BUDGET_CHARS,
     SECTION_ORDER,
     GoalError,
+    _source_pointer_warning,
     build_briefing,
     build_ledger,
     close_goal,
@@ -72,6 +73,50 @@ def _git(root: Path, *args: str) -> str:
         text=True,
         check=True,
     ).stdout
+
+
+def _git_repo_with_branch_spec(
+    root: Path, *, branch: str = "spec-branch", spec: str = "docs/SPEC.md"
+) -> Path:
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "test@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / "README.md").write_text("# base\n", encoding="utf-8")
+    _git(root, "add", "--", "README.md")
+    _git(root, "commit", "-q", "-m", "base")
+    _git(root, "checkout", "-q", "-b", branch)
+    target = root / spec
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("# spec\n", encoding="utf-8")
+    _git(root, "add", "--", spec)
+    _git(root, "commit", "-q", "-m", "spec")
+    _git(root, "checkout", "-q", "main")
+    return root
+
+
+def test_missing_recorded_root_never_rebinds_to_another_repo(tmp_path):
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    (other / "SPEC.md").write_text("# unrelated\n")
+    warning = _source_pointer_warning(
+        {"path": "SPEC.md", "root": str(tmp_path / "removed")},
+        repo_root=other,
+        repo_roots=[other],
+    )
+    assert warning is not None
+    assert warning["type"] == "source_pointer_unresolved"
+
+
+def test_nested_recorded_root_resolves_its_pinned_path(tmp_path):
+    repo = _git_repo_with_branch_spec(tmp_path / "repo")
+    (repo / "docs").mkdir(exist_ok=True)
+    warning = _source_pointer_warning(
+        {"path": "SPEC.md", "root": str(repo / "docs"), "git_ref": "spec-branch"},
+        repo_root=None,
+        repo_roots=[],
+    )
+    assert warning is None
 
 
 def _git_repo_with_tag(root: Path, tag: str) -> Path:
@@ -606,6 +651,154 @@ def test_relative_source_pointer_without_a_local_repo_root_stays_unresolved(
     assert warning == {"type": "source_pointer_unresolved", "path": "docs/TARGET-SPEC.md"}
 
 
+def test_relative_source_pointer_resolves_under_a_configured_root(tmp_path, ctx):
+    conn = _core(tmp_path)
+    parent = tmp_path / "checkouts"
+    spec = parent / "target-repo" / "docs" / "TARGET-SPEC.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# target spec\n", encoding="utf-8")
+    open_goal(
+        conn,
+        objective="Resolve under a configured root",
+        finish_line="pytest -q",
+        source_path="docs/TARGET-SPEC.md",
+        context=ctx,
+    )
+    conn.commit()
+
+    goal = list_goals(conn, context=ctx, repo_roots=[parent / "target-repo"])[0]
+    assert "warning" not in goal
+
+
+def test_configured_repo_roots_apply_without_an_explicit_root(tmp_path, ctx, monkeypatch):
+    conn = _core(tmp_path)
+    parent = tmp_path / "checkouts"
+    spec = parent / "target-repo" / "docs" / "TARGET-SPEC.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# target spec\n", encoding="utf-8")
+    monkeypatch.setenv("OCBRAIN_GOALS_REPO_ROOTS", json.dumps([str(parent)]))
+    open_goal(
+        conn,
+        objective="Resolve through the configured roots",
+        finish_line="pytest -q",
+        source_path="docs/TARGET-SPEC.md",
+        context=ctx,
+    )
+    conn.commit()
+
+    goal = list_goals(conn, context=ctx)[0]
+    assert "warning" not in goal
+
+
+def test_spec_that_exists_only_on_a_branch_resolves_through_its_git_ref(tmp_path, ctx):
+    conn = _core(tmp_path)
+    repo = _git_repo_with_branch_spec(tmp_path / "repo")
+    on_branch = open_goal(
+        conn,
+        objective="Read the spec on a branch",
+        finish_line="pytest -q",
+        source_path="docs/SPEC.md",
+        source_git_ref="spec-branch",
+        context=ctx,
+    )
+    without_ref = open_goal(
+        conn,
+        objective="Read the branch spec with no ref",
+        finish_line="pytest -q",
+        source_path="docs/SPEC.md",
+        context=ctx,
+    )
+    conn.commit()
+
+    goals = {goal["goal_id"]: goal for goal in list_goals(conn, context=ctx, repo_roots=[repo])}
+    assert "warning" not in goals[on_branch["goal_id"]]
+    assert goals[without_ref["goal_id"]]["warning"] == {
+        "type": "source_pointer_unresolved",
+        "path": "docs/SPEC.md",
+    }
+
+
+def test_relative_pointer_with_an_unresolvable_ref_names_the_ref(tmp_path, ctx):
+    conn = _core(tmp_path)
+    repo = _git_repo_with_tag(tmp_path / "repo", "base-tag").parent
+    opened = open_goal(
+        conn,
+        objective="Name the ref that does not resolve",
+        finish_line="pytest -q",
+        source_path="SPEC.md",
+        source_git_ref="definitely-not-a-real-git-ref",
+        context=ctx,
+    )
+    conn.commit()
+
+    goals = {goal["goal_id"]: goal for goal in list_goals(conn, context=ctx, repo_roots=[repo])}
+    assert goals[opened["goal_id"]]["warning"] == {
+        "type": "source_git_ref_unresolved",
+        "path": "SPEC.md",
+        "git_ref": "definitely-not-a-real-git-ref",
+    }
+
+
+def test_source_root_is_recorded_and_resolves_without_configured_roots(tmp_path, ctx):
+    conn = _core(tmp_path)
+    repo = tmp_path / "target-repo"
+    spec = repo / "docs" / "SPEC.md"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("# spec\n", encoding="utf-8")
+    opened = open_goal(
+        conn,
+        objective="Record the root the pointer is relative to",
+        finish_line="pytest -q",
+        source_path="docs/SPEC.md",
+        source_root=str(repo),
+        context=ctx,
+    )
+    conn.commit()
+
+    goal = list_goals(conn, context=ctx, repo_roots=[])[0]
+    assert goal["goal_id"] == opened["goal_id"]
+    assert goal["source_pointer"]["root"] == str(repo)
+    assert "warning" not in goal
+
+
+def test_relative_source_root_is_refused(tmp_path, ctx, monkeypatch):
+    conn = _core(tmp_path)
+    (tmp_path / "repo").mkdir()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(GoalError, match="source_root"):
+        open_goal(
+            conn,
+            objective="Refuse a relative root",
+            finish_line="pytest -q",
+            source_path="docs/SPEC.md",
+            source_root="repo",
+            context=ctx,
+        )
+
+
+def test_candidate_ordering_is_deterministic_across_calls(tmp_path, ctx):
+    conn = _core(tmp_path)
+    first = tmp_path / "b-root"
+    second = tmp_path / "a-root"
+    for root in (first, second):
+        spec = root / "docs" / "SPEC.md"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("# spec\n", encoding="utf-8")
+    open_goal(
+        conn,
+        objective="Resolve the same way every call",
+        finish_line="pytest -q",
+        source_path="docs/SPEC.md",
+        context=ctx,
+    )
+    conn.commit()
+
+    forwards = list_goals(conn, context=ctx, repo_roots=[first, second])
+    backwards = list_goals(conn, context=ctx, repo_roots=[second, first])
+    assert forwards == backwards
+    assert "warning" not in forwards[0]
+
+
 def test_git_ref_warning_is_checked_in_the_local_repository(tmp_path, ctx):
     conn = _core(tmp_path)
     repo = tmp_path / "repo"
@@ -1134,7 +1327,9 @@ def test_cli_briefing_and_ledger_routes(tmp_path, ctx, capsys):
     assert payload["entries"][0]["latest_unresolved"] == "the trainer import is circular"
 
 
-def test_cli_repo_root_resolves_a_pointer_without_narrowing_the_ledger(tmp_path, capsys):
+def test_cli_repo_root_resolves_a_pointer_without_narrowing_the_ledger(
+    tmp_path, capsys, monkeypatch
+):
     """``--repo-root`` is a filesystem hint; ``--repo`` is part of the scope.
 
     The SessionStart hook reached for ``--repo`` first, because it was the only
@@ -1145,6 +1340,8 @@ def test_cli_repo_root_resolves_a_pointer_without_narrowing_the_ledger(tmp_path,
     """
     from ocbrain.cli import main
 
+    # The shipped roots name real checkouts; pin empty so only --repo-root resolves.
+    monkeypatch.setenv("OCBRAIN_GOALS_REPO_ROOTS", "[]")
     db = tmp_path / "cli-repo-root.sqlite"
     conn = connect(db)
     init_core_v1(conn)

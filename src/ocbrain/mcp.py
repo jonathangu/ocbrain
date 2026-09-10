@@ -1161,6 +1161,7 @@ def _call_harness_tool_v1(
             finish_line=require_string(arguments, "finish_line"),
             source_path=require_string(arguments, "source_path"),
             source_git_ref=optional_string(arguments, "source_git_ref"),
+            source_root=optional_string(arguments, "source_root"),
             context=context,
             actor=optional_string(arguments, "actor") or "agent",
             provenance=provenance,
@@ -1904,6 +1905,13 @@ def tool_list(
                     "source_git_ref": {
                         "type": "string",
                         "description": "Revision the spec was read at: a sha, tag, or branch.",
+                    },
+                    "source_root": {
+                        "type": "string",
+                        "description": (
+                            "Absolute local directory the source_path is relative to. "
+                            "Recorded verbatim; never guessed."
+                        ),
                     },
                     "actor": {"type": "string"},
                     "context": {

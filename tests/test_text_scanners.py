@@ -153,3 +153,34 @@ def test_benign_metadata_keys_are_not_secret_false_positives(key: str) -> None:
     benign = '{"' + key + '": "ordinary metadata"}'
     assert find_probable_secret_leaks(benign) == []
     assert redact_secrets(benign) == benign
+
+
+_ORDINARY_PROSE_WITH_SECRET_WORDS = [
+    "Verified from the public endpoint, no credentials: GET https://recs.example.test/v1/contract",
+    "Non-secret: tag is a public identifier",
+    "the request carries an Authorization: Bearer header",
+    'authentication ("none"), cors (origins + credentials omit)',
+    "token: expired",
+]
+
+
+@pytest.mark.parametrize("text", _ORDINARY_PROSE_WITH_SECRET_WORDS)
+def test_ordinary_prose_with_secret_words_is_not_a_leak(text: str) -> None:
+    assert find_probable_secret_leaks(text) == []
+    assert redact_secrets(text) == text
+
+
+_UNQUOTED_ASSIGNED_SECRETS = [
+    ("api_key=sk_test_51H8f9d2k3j4l5m6n", "sk_test_51H8f9d2k3j4l5m6n"),
+    ("token: 9f8e7d6c5b4a32100", "9f8e7d6c5b4a32100"),
+    ("password = correcthorsebatterystaple", "correcthorsebatterystaple"),
+    ("DB_PASSWORD=Tr0ub4dor&3xx", "Tr0ub4dor&3xx"),
+]
+
+
+@pytest.mark.parametrize(("text", "value"), _UNQUOTED_ASSIGNED_SECRETS)
+def test_unquoted_secret_shaped_values_are_detected_and_redacted(text: str, value: str) -> None:
+    assert "assigned_secret" in find_probable_secret_leaks(text)
+    redacted = redact_secrets(text)
+    assert "[REDACTED]" in redacted
+    assert value not in redacted

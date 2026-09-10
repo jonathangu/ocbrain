@@ -1,10 +1,11 @@
 """ocbrain configuration surface.
 
-Six sections, one per thing that actually reads configuration: ``retrieval``
+Seven sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
 closeout slop gate), ``closeout`` (the write-time closeout identity and failure
-gates), and ``supersede`` (how much authority a runtime supersession carries).
+gates), ``supersede`` (how much authority a runtime supersession carries), and
+``goals`` (where a repo-relative goal spec pointer is resolved).
 There were seventeen; thirteen configured subsystems that were deleted or were
 never read at all.
 
@@ -308,6 +309,25 @@ class SupersedeConfig:
 
 
 @dataclass(frozen=True)
+class GoalsConfig:
+    """Where a repo-relative goal ``source_pointer`` is resolved.
+
+    A goal records a repo-relative spec path plus a git ref, and nothing about
+    the session that opened it. Resolution therefore cannot depend on the
+    caller's working directory or on ``context.repo`` happening to be a local
+    path, or the same goal resolves in one session and is flagged
+    ``source_pointer_unresolved`` in the next.
+
+    Each entry contributes itself and its immediate subdirectories as candidate
+    repo roots, so listing a parent of your checkouts covers them. Additional
+    roots are opt-in: the default never enumerates unrelated repositories.
+    Recorded source roots and an explicitly supplied caller repo still work.
+    """
+
+    repo_roots: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class OcbrainConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     scopes: ScopesConfig = field(default_factory=ScopesConfig)
@@ -315,6 +335,7 @@ class OcbrainConfig:
     deslop: DeslopConfig = field(default_factory=DeslopConfig)
     closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
+    goals: GoalsConfig = field(default_factory=GoalsConfig)
 
 
 def _coerce(current: Any, incoming: Any) -> Any:

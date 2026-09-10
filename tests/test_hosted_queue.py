@@ -457,7 +457,7 @@ def test_hosted_approve_refuses_secret_leak_body(tmp_path, capsys):
     leaky = _seed_evidence(
         conn,
         body=(
-            "Use " + "api_" + "key=" + "«redacted:" + "sk-…» for the deployment."
+            "Use " + "api_" + "key=" + "«redacted-placeholder:" + "sk-…» for the deployment."
         ),
     )
     conn.commit()
@@ -470,6 +470,38 @@ def test_hosted_approve_refuses_secret_leak_body(tmp_path, capsys):
     assert rc == 2
     refusal = payload["refused"][0]
     assert refusal["reason"] == "secret_leak_body"
+    conn.close()
+
+
+def test_hosted_approve_separates_prose_from_secret_shaped_values(tmp_path, capsys):
+    conn = _seed_core(tmp_path)
+    prose = _seed_evidence(
+        conn,
+        body=(
+            "Verified 2026-09-10 from the public endpoint, no credentials: "
+            "GET https://recs.example.test/v1/contract returns HTTP 200"
+        ),
+    )
+    leaky = _seed_evidence(
+        conn,
+        body="the worker reads token=9f8e7d6c5b4a32100 from its environment",
+    )
+    conn.commit()
+    db = str(tmp_path / "hosted-queue.sqlite")
+
+    rc, payload = _run(capsys, db, ["hosted-approve", prose, "--approved-by", APPROVER])
+    assert rc == 0, payload
+    assert payload["status"] == "applied"
+    assert payload["refused"] == []
+    assert payload["approved"][0]["evidence_id"] == prose
+    assert payload["approved"][0]["status"] == "approved"
+
+    rc, payload = _run(capsys, db, ["hosted-approve", leaky, "--approved-by", APPROVER])
+    assert rc == 2
+    assert payload["status"] == "blocked"
+    assert payload["approved"] == []
+    assert payload["refused"][0]["evidence_id"] == leaky
+    assert payload["refused"][0]["reason"] == "secret_leak_body"
     conn.close()
 
 

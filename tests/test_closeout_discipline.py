@@ -664,9 +664,11 @@ def test_every_non_completion_status_owes_an_explanation(tmp_path):
     (("strict-v1.sql", True), ("v0.sql", False)),
 )
 def test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write(
-    tmp_path: Path, fixture_name: str, strict_v1: bool
+    tmp_path: Path, fixture_name: str, strict_v1: bool, monkeypatch
 ) -> None:
     """Actual 11c69f6 stores choose their dialect and survive their first I/O."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("OCBRAIN_SESSION_ID", raising=False)
     path = _materialize_pre_pr59_fixture(tmp_path, fixture_name)
     before = connect(path)
     assert is_core_v1(before) is strict_v1

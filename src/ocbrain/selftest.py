@@ -90,6 +90,8 @@ HARVEST_SILENCE_ALARM_HOURS = 48.0
 # days" -- which is exactly the shape of a fleet going dark.
 HARVEST_LIVE_DAYS = 7
 HARVEST_MIN_ROWS = 3
+# Rows on this many distinct calendar days, or the label was a single burst.
+HARVEST_MIN_DAYS = 3
 
 # Provenance and trace-join rates are meaningless over rows written before the
 # server could stamp them. Below this many post-capture rows the sample is too
@@ -191,6 +193,15 @@ THRESHOLDS: dict[str, Threshold] = {
         "TARL convention (removal within 14 days of mint). The bands are "
         "judgement: no pre-v2.2 measurement of this exists, because supersession "
         "did not exist to distinguish replacement from deletion.",
+    ),
+    "supersede_churn_rate": Threshold(
+        LOWER_BETTER,
+        0.25,
+        0.50,
+        "Share of the window's cohort superseded within 14 days of mint. A "
+        "superseded belief carries a forward pointer and was true when written, "
+        "so a high value is the curator rewriting dated facts, not injecting "
+        "false ones; the boundaries are a judgement pending measurement.",
     ),
     "structured_removal_share": Threshold(
         HIGHER_BETTER,
@@ -296,7 +307,8 @@ THRESHOLDS: dict[str, Threshold] = {
         HARVEST_SILENCE_ALARM_HOURS,
         "The Hermes fleet once went dark for 14 days and nothing noticed. 48h is "
         "the brief's number and is a judgement. Applied only to live streams "
-        f"(>= {HARVEST_MIN_ROWS} rows in the last {HARVEST_LIVE_DAYS} days), "
+        f"(>= {HARVEST_MIN_ROWS} rows on >= {HARVEST_MIN_DAYS} distinct days in the last "
+        f"{HARVEST_LIVE_DAYS} days), "
         "because per-label freshness across ninety historical runtime spellings "
         "is noise (see docs/THRESHOLDS.md).",
     ),
@@ -791,9 +803,12 @@ def _pollution(conn: sqlite3.Connection, cutoff: str) -> list[Metric]:
             _unmeasured(
                 "structured_removal_share", "B", "Structured removal share", reason, removed=0
             ),
+            _unmeasured(
+                "supersede_churn_rate", "B", "Supersede churn rate", reason, minted_in_window=0
+            ),
         ]
     horizon = timedelta(days=POLLUTION_HORIZON_DAYS)
-    polluted: list[dict[str, Any]] = []
+    removed_in_horizon: list[dict[str, Any]] = []
     for belief_id, mint_ts in cohort:
         removal = removals.get(belief_id)
         if removal is None:
@@ -803,8 +818,11 @@ def _pollution(conn: sqlite3.Connection, cutoff: str) -> list[Metric]:
         if minted_at is None or removed_at is None or removed_at < minted_at:
             continue
         if removed_at - minted_at <= horizon:
-            polluted.append({"belief_id": belief_id, **removal})
+            removed_in_horizon.append({"belief_id": belief_id, **removal})
+    polluted = [item for item in removed_in_horizon if not item["structured"]]
+    superseded = [item for item in removed_in_horizon if item["structured"]]
     rate = len(polluted) / len(cohort)
+    churn = len(superseded) / len(cohort)
     metrics = [
         _measured(
             "pollution_rate",
@@ -812,13 +830,25 @@ def _pollution(conn: sqlite3.Connection, cutoff: str) -> list[Metric]:
             "Memory pollution rate",
             rate,
             display=f"{rate:.1%} ({len(polluted)}/{len(cohort)})",
-            basis=f"approved in window and removed within {POLLUTION_HORIZON_DAYS}d of mint",
+            basis=f"approved in window and retracted or tombstoned within "
+            f"{POLLUTION_HORIZON_DAYS}d of mint",
             minted_in_window=len(cohort),
             removed_within_horizon=len(polluted),
             horizon_days=POLLUTION_HORIZON_DAYS,
-        )
+        ),
+        _measured(
+            "supersede_churn_rate",
+            "B",
+            "Supersede churn rate",
+            churn,
+            display=f"{churn:.1%} ({len(superseded)}/{len(cohort)})",
+            basis=f"approved in window and superseded within {POLLUTION_HORIZON_DAYS}d of mint",
+            minted_in_window=len(cohort),
+            superseded_within_horizon=len(superseded),
+            horizon_days=POLLUTION_HORIZON_DAYS,
+        ),
     ]
-    if not polluted:
+    if not removed_in_horizon:
         metrics.append(
             _unmeasured(
                 "structured_removal_share",
@@ -829,18 +859,18 @@ def _pollution(conn: sqlite3.Connection, cutoff: str) -> list[Metric]:
             )
         )
         return metrics
-    structured = sum(1 for item in polluted if item["structured"])
-    share = structured / len(polluted)
+    structured = sum(1 for item in removed_in_horizon if item["structured"])
+    share = structured / len(removed_in_horizon)
     metrics.append(
         _measured(
             "structured_removal_share",
             "B",
             "Structured removal share",
             share,
-            display=f"{share:.1%} ({structured}/{len(polluted)})",
+            display=f"{share:.1%} ({structured}/{len(removed_in_horizon)})",
             basis="of horizon removals, the share carrying a superseded_by pointer",
             structured=structured,
-            removals=len(polluted),
+            removals=len(removed_in_horizon),
         )
     )
     return metrics
@@ -946,27 +976,32 @@ def _json_object(raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _calibration(conn: sqlite3.Connection, now: datetime) -> Metric:
+def _calibration(conn: sqlite3.Connection, now: datetime, since_days: int) -> Metric:
     """Does a confidence band predict survival?
 
-    The cohort is every belief minted at least one horizon ago, so each one has
-    had a full 30 days in which to be removed. The comparison is against the mean
-    *stated* confidence in the band rather than an invented band midpoint: the
-    stored number is what the brain actually claimed, and inventing a midpoint
-    would be scoring the brain against a number nobody wrote down.
+    The cohort is every belief minted at least one horizon ago and no earlier
+    than the window under test plus one horizon, so each one has had a full 30
+    days in which to be removed while still belonging to the era being scored.
+    The comparison is against the mean *stated* confidence in the band rather
+    than an invented band midpoint: the stored number is what the brain actually
+    claimed, and inventing a midpoint would be scoring the brain against a
+    number nobody wrote down.
     """
     mints = _mint_times(conn)
     removals = _removals(conn)
     horizon = timedelta(days=CALIBRATION_HORIZON_DAYS)
     boundary = now - horizon
+    cohort_from = now - timedelta(days=since_days + CALIBRATION_HORIZON_DAYS)
+    cohort_size = 0
     bands: dict[str, dict[str, Any]] = {}
     for row in conn.execute(
         "SELECT belief_id, confidence, confidence_band FROM current_beliefs"
     ):
         belief_id = str(row["belief_id"])
         minted_at = _parse_ts(mints.get(belief_id))
-        if minted_at is None or minted_at > boundary:
+        if minted_at is None or minted_at > boundary or minted_at < cohort_from:
             continue
+        cohort_size += 1
         band = str(row["confidence_band"] or "unknown")
         entry = bands.setdefault(
             band, {"n": 0, "survived": 0, "confidence_sum": 0.0, "removed_by": {}}
@@ -1019,6 +1054,9 @@ def _calibration(conn: sqlite3.Connection, now: datetime) -> Metric:
         display=f"{worst:.3f} ({worst_band})",
         basis=f"max |mean stated confidence - {CALIBRATION_HORIZON_DAYS}d survival| across bands",
         widest_band=worst_band,
+        cohort_from=cohort_from.isoformat(),
+        cohort_to=boundary.isoformat(),
+        cohort_size=cohort_size,
         bands=detail,
     )
 
@@ -1623,35 +1661,63 @@ def _transcript_ids(root: Path) -> set[str]:
 
 
 def _closeout_join(
-    conn: sqlite3.Connection, cutoff: str, transcript_root: Path | None
+    conn: sqlite3.Connection,
+    cutoff: str,
+    transcript_roots: dict[str, Path] | None = None,
+    *,
+    transcript_root: Path | None = None,
 ) -> Metric:
     """Do closeouts name a session that resolves to a real transcript?
 
     The join is what makes a closeout's tool-call trace minable later, and it has
     only ever worked when the recorded session id is byte-identical to a
-    transcript filename. Without a transcript root on this machine the question
-    cannot be asked, and saying so beats reporting a zero that means "did not
-    look".
+    transcript filename. Codex rollouts embed the session id as a filename
+    suffix instead, and a runtime that keeps no transcript on this machine can
+    never be joined, so both are settled before a rate is reported. Without a
+    configured transcript root the question cannot be asked, and saying so beats
+    reporting a zero that means "did not look".
     """
     columns = _columns(conn, "task_closeouts")
     if not columns:
         return _unmeasured(
             "closeout_trace_join_rate", "D", "Closeout to trace join", "no task_closeouts table"
         )
-    root = transcript_root or (Path.home() / ".claude" / "projects")
-    transcripts = _transcript_ids(root)
-    if not transcripts:
+    if transcript_root is not None:
+        transcript_roots = {"claude": transcript_root}
+    if transcript_roots is None:
+        transcript_roots = {
+            "claude": Path.home() / ".claude" / "projects",
+            "codex": Path.home() / ".codex" / "sessions",
+        }
+    present = {family: root for family, root in transcript_roots.items() if root.is_dir()}
+    roots_detail = {family: str(root) for family, root in transcript_roots.items()}
+    if not present:
+        checked = ", ".join(f"{family}={root}" for family, root in transcript_roots.items())
         return _unmeasured(
             "closeout_trace_join_rate",
             "D",
             "Closeout to trace join",
-            f"no transcripts found under {root}",
-            transcript_root=str(root),
+            f"no transcripts found: none of the configured roots exist ({checked})",
+            transcript_roots=roots_detail,
+        )
+    stems = {family: _transcript_ids(root) for family, root in present.items()}
+    transcripts = set().union(*stems.values()) if stems else set()
+    if not transcripts:
+        checked = ", ".join(f"{family}={root}" for family, root in present.items())
+        return _unmeasured(
+            "closeout_trace_join_rate",
+            "D",
+            "Closeout to trace join",
+            f"no transcripts found under {checked}",
+            transcript_roots=roots_detail,
         )
     hint_column = "client_session_hint" if "client_session_hint" in columns else "NULL"
+    runtime_column = "runtime" if "runtime" in columns else "NULL"
+    key_column = "client_runtime_key" if "client_runtime_key" in columns else "NULL"
     rows = list(
         conn.execute(
-            f"SELECT closed_at, session_id, {hint_column} AS hint FROM task_closeouts"  # noqa: S608
+            f"SELECT closed_at, session_id, {hint_column} AS hint, "  # noqa: S608
+            f"{runtime_column} AS runtime, {key_column} AS runtime_key FROM task_closeouts"
         )
     )
     if not rows:
@@ -1659,10 +1725,27 @@ def _closeout_join(
             "closeout_trace_join_rate", "D", "Closeout to trace join", "no closeouts recorded"
         )
 
+    def family(row: sqlite3.Row) -> str:
+        text = str(row["runtime"] or "").strip() or str(row["runtime_key"] or "").strip()
+        lowered = text.lower()
+        if "claude" in lowered:
+            return "claude"
+        if "codex" in lowered:
+            return "codex"
+        return "unjoinable"
+
     def joins(row: sqlite3.Row) -> bool:
+        known = stems.get(family(row))
+        if not known:
+            return False
+        codex = family(row) == "codex"
         for candidate in (row["session_id"], row["hint"]):
             text = str(candidate or "").strip()
-            if text and text in transcripts:
+            if not text:
+                continue
+            if text in known:
+                return True
+            if codex and any(stem.endswith(f"-{text}") for stem in known):
                 return True
         return False
 
@@ -1680,6 +1763,17 @@ def _closeout_join(
     # against and hiding it would make the improvement unfalsifiable.
     start = _capture_start(conn)
     recent = [row for row in rows if start and str(row["closed_at"] or "") >= start]
+    countable = [row for row in recent if family(row) in present]
+    families: dict[str, dict[str, Any]] = {}
+    for name in sorted({family(row) for row in recent}):
+        members = [row for row in recent if family(row) == name]
+        root = transcript_roots.get(name)
+        families[name] = {
+            "closeouts": len(members),
+            "joined": sum(1 for row in members if joins(row)),
+            "root": str(root) if root is not None else None,
+            "root_present": name in present,
+        }
     shared = {
         "window_closeouts": len(window),
         "window_rate": round(window_rate, 4) if window_rate is not None else None,
@@ -1687,29 +1781,32 @@ def _closeout_join(
         "all_time_rate": round(all_time_rate, 4),
         "window_uuid_shaped": sum(1 for row in window if uuid_shaped(row)),
         "transcripts_on_disk": len(transcripts),
-        "transcript_root": str(root),
+        "transcript_roots": roots_detail,
         "capture_started_at": start,
+        "unjoinable_closeouts": len(recent) - len(countable),
+        "families": families,
     }
-    if len(recent) < MIN_PROVENANCE_SAMPLE:
+    if len(countable) < MIN_PROVENANCE_SAMPLE:
         return _unmeasured(
             "closeout_trace_join_rate",
             "D",
             "Closeout to trace join",
-            f"only {len(recent)} closeouts written since provenance capture began; "
+            f"only {len(countable)} closeouts written since provenance capture began whose "
+            f"runtime has a transcript root on this machine; "
             f"{MIN_PROVENANCE_SAMPLE} needed for a verdict",
             closeouts_since_capture=len(recent),
             **shared,
         )
-    joined = sum(1 for row in recent if joins(row))
-    rate = joined / len(recent)
+    joined = sum(1 for row in countable if joins(row))
+    rate = joined / len(countable)
     return _measured(
         "closeout_trace_join_rate",
         "D",
         "Closeout to trace join",
         rate,
-        display=f"{rate:.1%} ({joined}/{len(recent)})",
-        basis="closeouts written since provenance capture began whose session id or harness "
-        "hint names a transcript file",
+        display=f"{rate:.1%} ({joined}/{len(countable)})",
+        basis="closeouts written since provenance capture began whose runtime keeps transcripts "
+        "on this machine and whose session id or harness hint names one",
         closeouts_since_capture=len(recent),
         joined_since_capture=joined,
         **shared,
@@ -1734,9 +1831,10 @@ def _harvest(conn: sqlite3.Connection, now: datetime) -> Metric:
     rows = list(
         conn.execute(
             "SELECT COALESCE(source_runtime, '(unattributed)') AS runtime, COUNT(*) AS n, "
+            "COUNT(DISTINCT substr(recorded_at, 1, 10)) AS active_days, "
             "MAX(recorded_at) AS newest FROM evidence_objects WHERE recorded_at >= ? "
-            "GROUP BY runtime HAVING n >= ?",
-            (live_cutoff, HARVEST_MIN_ROWS),
+            "GROUP BY runtime HAVING n >= ? AND active_days >= ?",
+            (live_cutoff, HARVEST_MIN_ROWS, HARVEST_MIN_DAYS),
         )
     )
     tracked: list[dict[str, Any]] = []
@@ -1749,6 +1847,7 @@ def _harvest(conn: sqlite3.Connection, now: datetime) -> Metric:
             {
                 "runtime": str(row["runtime"]),
                 "rows_in_live_window": int(row["n"]),
+                "active_days": int(row["active_days"]),
                 "newest": str(row["newest"]),
                 "silent_hours": round(silence, 1),
             }
@@ -1758,8 +1857,8 @@ def _harvest(conn: sqlite3.Connection, now: datetime) -> Metric:
             "harvest_silence_hours",
             "D",
             "Harvest freshness",
-            f"no runtime wrote >= {HARVEST_MIN_ROWS} evidence rows in the last "
-            f"{HARVEST_LIVE_DAYS} days",
+            f"no runtime wrote >= {HARVEST_MIN_ROWS} evidence rows on "
+            f">= {HARVEST_MIN_DAYS} distinct days in the last {HARVEST_LIVE_DAYS} days",
             distinct_runtimes_all_time=all_runtimes,
         )
     tracked.sort(key=lambda item: -item["silent_hours"])
@@ -1771,8 +1870,8 @@ def _harvest(conn: sqlite3.Connection, now: datetime) -> Metric:
         "Harvest freshness",
         float(worst["silent_hours"]),
         display=f"{worst['silent_hours']:.1f}h ({worst['runtime']})",
-        basis=f"longest silence among live streams (>= {HARVEST_MIN_ROWS} rows in the last "
-        f"{HARVEST_LIVE_DAYS} days)",
+        basis=f"longest silence among live streams (>= {HARVEST_MIN_ROWS} rows on "
+        f">= {HARVEST_MIN_DAYS} distinct days in the last {HARVEST_LIVE_DAYS} days)",
         live_streams=len(tracked),
         distinct_runtimes_all_time=all_runtimes,
         silent_streams=silent or None,
@@ -2317,6 +2416,7 @@ def run_selftest(
     since_days: int = 30,
     now: datetime | None = None,
     transcript_root: Path | None = None,
+    transcript_roots: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Measure one core and return the scorecard."""
     started = time.monotonic()
@@ -2327,14 +2427,18 @@ def run_selftest(
     metrics.extend(_section_a(conn, cutoff))
     metrics.extend(_pollution(conn, cutoff))
     metrics.append(_conflict_preservation(conn, cutoff))
-    metrics.append(_calibration(conn, now))
+    metrics.append(_calibration(conn, now, since_days))
     metrics.extend(_duplicates(conn))
     metrics.append(_correction_adoption(conn, cutoff))
     metrics.append(_lossy_supersessions(conn, cutoff))
     metrics.extend(_pending_queue(conn, now))
     metrics.append(_contradiction_rate(conn, cutoff))
     metrics.append(_provenance(conn, cutoff))
-    metrics.append(_closeout_join(conn, cutoff, transcript_root))
+    metrics.append(
+        _closeout_join(
+            conn, cutoff, transcript_roots=transcript_roots, transcript_root=transcript_root
+        )
+    )
     metrics.append(_harvest(conn, now))
     metrics.extend(_storage(conn, cutoff, since_days))
     metrics.append(_egress_gate(conn))

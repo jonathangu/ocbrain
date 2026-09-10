@@ -1700,6 +1700,7 @@ def apply_claims(
     # claims for no new information.
     vector_cache: dict[str, list[float]] = {}
     critic_provider, critic_model = critic_settings()
+    moot: list[str] = []
     project_scope_id = f"project:{project}"
     actor = f"operator-approved:{CURATOR_VERSION}"
     for claim in claims:
@@ -1936,6 +1937,10 @@ def apply_claims(
 
         claim_belief_id: str | None = None
         if target is not None:
+            target_canonical_id = str(target["canonical_id"])
+            if _serving_belief(conn, target_canonical_id) is None:
+                moot.append(target_canonical_id)
+                continue
             stored_confidence = float(target.get("confidence") or 0.0)
             margin_shortfall = (
                 stored_confidence - SUPERSEDE_CONFIDENCE_MARGIN - float(claim["confidence"])
@@ -2076,6 +2081,7 @@ def apply_claims(
         "pending_deduped": pending_deduped,
         "pended_unverified": pended_unverified,
         "duplicate_routed": duplicate_routed,
+        "moot": moot,
     }
 
 
