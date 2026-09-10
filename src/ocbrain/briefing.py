@@ -145,11 +145,14 @@ class SourcePointer:
 
     path: str
     git_ref: str | None = None
+    root: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"path": self.path}
         if self.git_ref:
             payload["git_ref"] = self.git_ref
+        if self.root:
+            payload["root"] = self.root
         return payload
 
 
@@ -189,6 +192,7 @@ def open_goal(
     source_path: str,
     context: ScopeContext,
     source_git_ref: str | None = None,
+    source_root: str | None = None,
     actor: str = "agent",
     provenance: Provenance | None = None,
     session_id: str | None = None,
@@ -226,7 +230,22 @@ def open_goal(
         )
     provenance = provenance or EMPTY_PROVENANCE
     scope = goal_scope(context)
-    pointer = SourcePointer(source_path, (source_git_ref or "").strip() or None)
+    root = (source_root or "").strip()
+    if root:
+        # Recorded, never guessed: a relative root would resolve against
+        # whichever process happened to read the goal.
+        try:
+            root_path = Path(root).expanduser()
+            usable = root_path.is_absolute() and root_path.is_dir()
+        except (OSError, RuntimeError):
+            usable = False
+        if not usable:
+            raise GoalError(
+                "source_root must be an absolute path to an existing directory"
+            )
+    pointer = SourcePointer(
+        source_path, (source_git_ref or "").strip() or None, root or None
+    )
     opened = opened_at or now_iso()
 
     # Content-and-scope addressed like a supersede successor: re-opening the
@@ -434,6 +453,7 @@ def list_goals(
     limit: int = MAX_GOALS,
     check_source_pointers: bool = True,
     repo_root: Path | None = None,
+    repo_roots: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     """Return goals for a scope, selected by scope and status only.
 
@@ -457,6 +477,8 @@ def list_goals(
     pointer_repo_root = _usable_local_directory(repo_root) or _usable_local_directory(
         context.repo
     )
+    if repo_roots is None:
+        repo_roots = _configured_repo_roots()
     placeholders = ",".join("?" for _ in scope_ids)
     rows = conn.execute(
         f"""
@@ -489,7 +511,9 @@ def list_goals(
         if isinstance(attributes.get("verifier"), dict):
             entry["verifier"] = attributes["verifier"]
         if check_source_pointers:
-            warning = _source_pointer_warning(pointer, repo_root=pointer_repo_root)
+            warning = _source_pointer_warning(
+                pointer, repo_root=pointer_repo_root, repo_roots=repo_roots
+            )
             if warning is not None:
                 entry["warning"] = warning
         goals.append(entry)
@@ -500,7 +524,10 @@ def list_goals(
 
 
 def _source_pointer_warning(
-    pointer: dict[str, Any], *, repo_root: Path | None
+    pointer: dict[str, Any],
+    *,
+    repo_root: Path | None,
+    repo_roots: list[Path] | None = None,
 ) -> dict[str, Any] | None:
     """Type a spec pointer that no longer resolves. Never silently drop the goal.
 
@@ -515,38 +542,89 @@ def _source_pointer_warning(
         candidate = Path(raw).expanduser()
     except (OSError, RuntimeError):
         return {"type": "source_pointer_unresolved", "path": raw}
-    is_absolute = candidate.is_absolute()
-    if not is_absolute:
-        if repo_root is None:
-            return {"type": "source_pointer_unresolved", "path": raw}
-        candidate = repo_root / candidate
-    try:
-        exists = candidate.exists()
-    except OSError:
-        exists = False
-    if not exists:
-        return {"type": "source_pointer_unresolved", "path": raw}
-
     git_ref = str(pointer.get("git_ref") or "").strip()
-    if not git_ref:
-        return None
-    if is_absolute:
-        # An explicit path owns its repository identity; repo_root is only a
+
+    recorded_root = _usable_local_directory(pointer.get("root"))
+    if recorded_root is not None:
+        candidates = [recorded_root]
+    else:
+        candidates = [repo_root] if repo_root is not None else []
+        candidates.extend(repo_roots or [])
+
+    if candidate.is_absolute():
+        if not _path_exists(candidate):
+            return {"type": "source_pointer_unresolved", "path": raw}
+        if not git_ref:
+            return None
+        # An explicit path owns its repository identity; a root is only a
         # resolution hint for pointers that need one.
         git_root = _git_repository_root(candidate if candidate.is_dir() else candidate.parent)
-    else:
-        git_root = _git_repository_root(repo_root)
-        if git_root is None:
-            git_root = _git_repository_root(
-                candidate if candidate.is_dir() else candidate.parent
-            )
-    if git_root is None or not _git_ref_resolves(git_root, git_ref):
-        return {
-            "type": "source_git_ref_unresolved",
-            "path": raw,
-            "git_ref": git_ref,
-        }
-    return None
+        if git_root is None or not _git_ref_resolves(git_root, git_ref):
+            return {
+                "type": "source_git_ref_unresolved",
+                "path": raw,
+                "git_ref": git_ref,
+            }
+        return None
+
+    if git_ref:
+        for root in candidates:
+            git_root = _git_repository_root(root)
+            if git_root is None or not _git_ref_resolves(git_root, git_ref):
+                continue
+            if _git_path_exists_at_ref(git_root, git_ref, raw):
+                return None
+        for root in candidates:
+            if _path_exists(root / candidate):
+                return {
+                    "type": "source_git_ref_unresolved",
+                    "path": raw,
+                    "git_ref": git_ref,
+                }
+        return {"type": "source_pointer_unresolved", "path": raw}
+
+    for root in candidates:
+        if _path_exists(root / candidate):
+            return None
+    return {"type": "source_pointer_unresolved", "path": raw}
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _configured_repo_roots() -> list[Path]:
+    from ocbrain.config import load_config
+
+    return _expand_repo_roots(load_config().goals.repo_roots)
+
+
+def _expand_repo_roots(entries: list[str]) -> list[Path]:
+    """Expand configured entries into candidate roots, deterministically."""
+    candidates: dict[str, Path] = {}
+    for entry in entries:
+        try:
+            base = Path(str(entry)).expanduser()
+        except (OSError, RuntimeError):
+            continue
+        if not _path_exists(base) or not base.is_dir():
+            continue
+        candidates.setdefault(str(base), base)
+        try:
+            children = sorted(base.iterdir(), key=lambda item: str(item))
+        except OSError:
+            continue
+        for child in children:
+            try:
+                is_dir = child.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                candidates.setdefault(str(child), child)
+    return [candidates[key] for key in sorted(candidates)][:64]
 
 
 def _usable_local_directory(value: str | Path | None) -> Path | None:
@@ -597,6 +675,30 @@ def _git_ref_resolves(repo_root: Path, git_ref: str) -> bool:
                 "--quiet",
                 "--end-of-options",
                 f"{git_ref}^{{commit}}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _git_path_exists_at_ref(repo_root: Path, git_ref: str, path: str) -> bool:
+    """Whether ``path`` exists at ``git_ref``, checked literally after the marker."""
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "cat-file",
+                "-e",
+                "--end-of-options",
+                f"{git_ref}:{path}",
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

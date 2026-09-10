@@ -132,6 +132,7 @@ def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     assert cfg.scopes.aliases == {}
     assert cfg.curator.provider == "anthropic"
     assert cfg.deslop.reject_closeout_slop is False
+    assert cfg.goals.repo_roots == ["~/coframe", "~/Developer"]
 
 
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:
@@ -147,6 +148,13 @@ def test_env_override_of_a_dict_field_parses_json(tmp_path: Path) -> None:
         env={"OCBRAIN_SCOPES_ALIASES": json.dumps({"project:brain": "project:coframe"})},
     )
     assert cfg.scopes.aliases == {"project:brain": "project:coframe"}
+
+
+def test_goal_repo_roots_load_from_file_and_env(tmp_path: Path) -> None:
+    path = _write_cfg(tmp_path, {"goals": {"repo_roots": ["/tmp/one"]}})
+    assert load_config(path).goals.repo_roots == ["/tmp/one"]
+    env = {"OCBRAIN_GOALS_REPO_ROOTS": json.dumps(["/tmp/two", "/tmp/three"])}
+    assert load_config(path, env=env).goals.repo_roots == ["/tmp/two", "/tmp/three"]
 
 
 def test_retired_sections_and_keys_are_ignored_not_fatal(tmp_path: Path) -> None:
