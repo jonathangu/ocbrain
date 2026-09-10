@@ -4,7 +4,7 @@ The compiler only ever grows the corpus. Without a retirement pass, a brain
 accumulates facts that expired or restate a fact it already carries, and
 precision decays until someone runs a one-off sweep by hand.
 
-Two independent classes, each separately counted so a run says *why* it acted:
+Three independent classes, each separately counted so a run says *why* it acted:
 
 ``expired``
     Past its ``valid_until``, or explicitly marked ``superseded_by`` another
@@ -16,6 +16,13 @@ Two independent classes, each separately counted so a run says *why* it acted:
     chose, so a later run that rewords the same fact under a new key mints a second
     belief instead of updating the first -- exact-body dedup never sees it, and
     every scheduled run adds a phrasing.
+
+``moot_proposals``
+    An undecided supersede proposal whose target belief is no longer current and
+    serving, because the corpus retired it through some other path. Nothing can
+    decide it and nothing will ever be served differently because of it, so the
+    class rejects it -- an appended ``compilation_decided``, no belief touched --
+    and the queue stops accumulating decisions nobody can make.
 
 There were two more, ``unused`` and ``unhelpful``, and they are gone. Across 155
 consecutive scheduled runs neither ever selected a belief. ``unhelpful`` also
@@ -59,7 +66,7 @@ DEFAULT_BATCH_CAP = 200
 # little redundancy while over-retiring loses knowledge.
 DEFAULT_RESTATEMENT_THRESHOLD = DEFAULT_RESTATEMENT_SIMILARITY
 
-CLASSES = ("expired", "redundant")
+CLASSES = ("expired", "redundant", "moot_proposals")
 
 
 def _expired_targets(conn: sqlite3.Connection, *, now: datetime) -> list[dict[str, str]]:
@@ -153,6 +160,45 @@ def _redundant_targets(
     return targets
 
 
+def _moot_proposals(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Undecided supersede proposals whose target no longer serves.
+
+    A target the corpus retired through another path -- hygiene's own redundant
+    sweep, a re-key, a restore-then-retire -- leaves the proposal undecidable:
+    approving it would era-close a belief that is already closed, and its
+    successor would be minted against nothing. Nobody can decide these
+    meaningfully, so they sit in the queue forever and age the headline metric.
+    """
+    rows = conn.execute(
+        """
+        SELECT proposal.id AS proposal_event_id, proposal.ts AS proposed_at,
+               proposal.writer AS writer,
+               json_extract(proposal.body_json, '$.attributes.supersedes') AS target_id
+        FROM brain_events AS proposal
+        LEFT JOIN current_beliefs AS target
+          ON target.belief_id = json_extract(proposal.body_json, '$.attributes.supersedes')
+        WHERE proposal.kind='compilation_proposed'
+          AND json_extract(proposal.body_json, '$.attributes.supersedes') IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM brain_events AS decision
+              WHERE decision.kind='compilation_decided'
+                AND json_extract(decision.body_json, '$.proposal_event_id') = proposal.id
+          )
+          AND (target.belief_id IS NULL OR target.status != 'current' OR target.serve != 1)
+        ORDER BY proposal.ts, proposal.id
+        """
+    ).fetchall()
+    return [
+        {
+            "proposal_event_id": str(row["proposal_event_id"]),
+            "target_id": str(row["target_id"]),
+            "proposed_at": str(row["proposed_at"]),
+            "writer": str(row["writer"]),
+        }
+        for row in rows
+    ]
+
+
 def plan_retirements(
     conn: sqlite3.Connection,
     *,
@@ -174,6 +220,16 @@ def plan_retirements(
         candidates += _expired_targets(conn, now=resolved_now)
     if "redundant" in classes:
         candidates += _redundant_targets(conn, threshold=restatement_threshold)
+    if "moot_proposals" in classes:
+        candidates += [
+            {
+                "belief_id": moot["target_id"],
+                "reason": "moot_proposals",
+                "detail": f"supersedes {moot['target_id']}, which no longer serves",
+                "proposal_event_id": moot["proposal_event_id"],
+            }
+            for moot in _moot_proposals(conn)
+        ]
 
     # One belief can qualify twice; keep the first (most explicit) reason.
     deduped: dict[str, dict[str, str]] = {}
@@ -202,13 +258,21 @@ def plan_retirements(
 
 
 def apply_retirements(conn: sqlite3.Connection, plan: dict[str, Any]) -> dict[str, Any]:
-    """Soft-retract every belief in ``plan``, then reproject once."""
+    """Soft-retract every belief in ``plan``, reject its moot proposals, reproject once."""
+    from ocbrain.mcp_v1 import decide_proposal_v1
+
     targets = list(plan.get("targets") or [])
     if not targets:
-        return dict(plan) | {"applied": 0, "applied_belief_ids": []}
+        return dict(plan) | {
+            "applied": 0,
+            "applied_belief_ids": [],
+            "moot_proposals_rejected": 0,
+        }
+    retirements = [target for target in targets if target["reason"] != "moot_proposals"]
+    moot_proposals = [target for target in targets if target["reason"] == "moot_proposals"]
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for target in targets:
+        for target in retirements:
             append_core_event(
                 conn,
                 "correction_recorded",
@@ -227,6 +291,15 @@ def apply_retirements(conn: sqlite3.Connection, plan: dict[str, Any]) -> dict[st
                 writer=WRITER,
                 project=False,
             )
+        for target in moot_proposals:
+            decide_proposal_v1(
+                conn,
+                proposal_event_id=target["proposal_event_id"],
+                decision="reject",
+                actor=WRITER,
+                edited_body=None,
+                reason="target_not_current",
+            )
         # One projection pass for the whole batch; per-event projection would be
         # quadratic over a large sweep.
         project_core_v1(conn)
@@ -235,8 +308,9 @@ def apply_retirements(conn: sqlite3.Connection, plan: dict[str, Any]) -> dict[st
         conn.rollback()
         raise
     return dict(plan) | {
-        "applied": len(targets),
-        "applied_belief_ids": [target["belief_id"] for target in targets],
+        "applied": len(retirements),
+        "applied_belief_ids": [target["belief_id"] for target in retirements],
+        "moot_proposals_rejected": len(moot_proposals),
     }
 
 

@@ -21,7 +21,7 @@ from ocbrain.hygiene import (
     supersede,
     verify_serving_invariants,
 )
-from ocbrain.mcp_v1 import decide_proposal_v1
+from ocbrain.mcp_v1 import decide_proposal_v1, pending_supersede_count
 from ocbrain.scope import ScopeContext, ScopeTag
 
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
@@ -394,6 +394,98 @@ def test_retired_belief_leaves_the_search_index_and_stops_being_served(tmp_path:
     )
     assert after["items"] == []
     assert verify_serving_invariants(conn) == {"serving": 0, "unserved_in_search_index": 0}
+
+
+def _pend_supersede(conn, *, target: str, successor: str) -> str:
+    return append_core_event(
+        conn,
+        "compilation_proposed",
+        {
+            "schema_version": "ocbrain.compilation.v1",
+            "subject": {"kind": "belief", "id": successor},
+            "belief_id": successor,
+            "belief_type": "wiki_fact",
+            "body": "The replacement statement awaiting a decision.",
+            "evidence_ids": [],
+            "scope": SCOPE.to_dict(),
+            "confidence": 0.7,
+            "attributes": {"supersedes": target},
+        },
+        writer="wiki-curator",
+    )
+
+
+def test_moot_proposals_class_rejects_supersedes_of_retired_targets(tmp_path: Path) -> None:
+    """A proposal whose target is already retired can never be decided.
+
+    Nothing the decision does can serve anything differently, so it sits in the
+    queue forever and ages the headline metric. The class appends a rejection
+    instead of touching the belief -- append-only, nothing deleted.
+    """
+    conn = _core(tmp_path)
+    target = "curated:bountiful:moot-target"
+    successor = "belief:bountiful:moot-successor"
+    _seed(
+        conn,
+        belief_id=target,
+        body="A fact that expires while a supersession of it is undecided.",
+        attributes={"valid_until": "2026-07-01T00:00:00+00:00"},
+    )
+    proposal = _pend_supersede(conn, target=target, successor=successor)
+    conn.commit()
+    assert pending_supersede_count(conn) == 1
+    # Still serving: the proposal is a live decision and must be left alone.
+    assert plan_retirements(conn, classes=("moot_proposals",), now=NOW)["targets"] == []
+
+    apply_retirements(conn, plan_retirements(conn, classes=("expired",), now=NOW))
+    plan = plan_retirements(conn, classes=("moot_proposals",), now=NOW)
+    assert [item["belief_id"] for item in plan["targets"]] == [target]
+    assert plan["targets"][0]["proposal_event_id"] == proposal
+    assert plan["targets_by_reason"] == {"moot_proposals": 1}
+
+    applied = apply_retirements(conn, plan)
+    assert applied["moot_proposals_rejected"] == 1
+    assert applied["applied"] == 0
+
+    decisions = [
+        json.loads(str(row["body_json"]))
+        for row in conn.execute(
+            "SELECT body_json FROM brain_events WHERE kind='compilation_decided' "
+            "AND json_extract(body_json, '$.proposal_event_id')=?",
+            (proposal,),
+        )
+    ]
+    assert len(decisions) == 1
+    assert decisions[0]["decision"] == "reject"
+    assert decisions[0]["reason"] == "target_not_current"
+    assert decisions[0]["actor"].startswith("maintenance:")
+    assert pending_supersede_count(conn) == 0
+    conn.close()
+
+
+def test_moot_proposals_class_leaves_live_targets_alone(tmp_path: Path) -> None:
+    """The queue is a backlog, not garbage: a decidable proposal stays decidable."""
+    conn = _core(tmp_path)
+    target = "curated:bountiful:live-target"
+    successor = "belief:bountiful:live-successor"
+    _seed(conn, belief_id=target, body="A fact still serving while its correction waits.")
+    proposal = _pend_supersede(conn, target=target, successor=successor)
+    conn.commit()
+
+    plan = plan_retirements(conn, classes=("moot_proposals",), now=NOW)
+    assert plan["targets"] == []
+    applied = apply_retirements(conn, plan)
+    assert applied["moot_proposals_rejected"] == 0
+    assert pending_supersede_count(conn) == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM brain_events WHERE kind='compilation_decided' "
+            "AND json_extract(body_json, '$.proposal_event_id')=?",
+            (proposal,),
+        ).fetchone()[0]
+        == 0
+    )
+    conn.close()
 
 
 def test_unknown_class_is_rejected(tmp_path: Path) -> None:

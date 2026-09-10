@@ -27,6 +27,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
+import ocbrain.curator as curator
 import ocbrain.mcp_v1 as mcp_v1
 from ocbrain.core_v1 import (
     append_core_event,
@@ -140,6 +141,14 @@ def _propose(conn, old: dict, statement: str, *, actor: str = "agent:one", **kwa
 
 def _events(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM brain_events").fetchone()[0])
+
+
+def _proposed(conn) -> int:
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM brain_events WHERE kind='compilation_proposed'"
+        ).fetchone()[0]
+    )
 
 
 def _serving(conn) -> dict[str, str]:
@@ -333,6 +342,57 @@ def test_the_curator_reports_a_deduped_supersession_apart_from_a_deferred_one(
     assert second["deferred"] == []
     assert second["pending_deduped"] == [standing]
     assert pending_supersede_count(conn) == 1
+    conn.close()
+
+
+def test_the_curator_does_not_pend_a_supersession_of_a_retracted_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A target retired between selection and the write is moot, not pending.
+
+    The curator shares the core with the wiki-curator script and with hygiene, so
+    the belief it selected can be retired by another writer before it proposes.
+    A supersession whose target is already gone cannot be decided by anyone --
+    approving it would era-close a closed belief -- so it must never reach the
+    queue and age the headline metric.
+    """
+    conn = _core(tmp_path)
+    standing = apply_claims(
+        conn,
+        [_claim("research-vm-live", "The live analysis VM is asa2.", confidence=0.95)],
+        model="test",
+        project=PROJECT,
+    )["applied"][0]
+    below_margin = _claim("research-vm-live", "The live analysis VM is asa3.", confidence=0.6)
+    proposed_before = _proposed(conn)
+
+    real_serving_belief = curator._serving_belief
+    retired: list[str] = []
+
+    def _retired_by_another_writer(cnx, belief_id):
+        if str(belief_id) == standing and not retired:
+            retired.append(str(belief_id))
+            correct_v1(
+                cnx,
+                layer="belief",
+                target=belief_id,
+                op="retract",
+                body=None,
+                actor="human:jonathan",
+                hard=False,
+            )
+            cnx.commit()
+        return real_serving_belief(cnx, belief_id)
+
+    monkeypatch.setattr(curator, "_serving_belief", _retired_by_another_writer)
+    result = apply_claims(conn, [below_margin], model="test", project=PROJECT)
+
+    assert retired == [standing]
+    assert result["moot"] == [standing]
+    assert result["deferred"] == []
+    assert result["pending_deduped"] == []
+    assert _proposed(conn) == proposed_before
+    assert pending_supersede_count(conn) == 0
     conn.close()
 
 
