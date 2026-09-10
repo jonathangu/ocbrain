@@ -457,7 +457,7 @@ def test_hosted_approve_refuses_secret_leak_body(tmp_path, capsys):
     leaky = _seed_evidence(
         conn,
         body=(
-            "Use " + "api_" + "key=" + "«redacted:" + "sk-…» for the deployment."
+            "Use " + "api_" + "key=" + "«redacted-placeholder:" + "sk-…» for the deployment."
         ),
     )
     conn.commit()
