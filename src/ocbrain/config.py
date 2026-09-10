@@ -1,13 +1,14 @@
 """ocbrain configuration surface.
 
-Eight sections, one per thing that actually reads configuration: ``retrieval``
+Nine sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
 closeout slop gate), ``closeout`` (the write-time closeout identity and failure
 gates), ``supersede`` (how much authority a runtime supersession carries),
-``goals`` (where a repo-relative goal spec pointer is resolved), and ``rerank``
-(the optional cross-encoder second stage).
-There were seventeen; nine configured subsystems that were deleted or were
+``goals`` (where a repo-relative goal spec pointer is resolved), ``entities`` (the
+operator vocabulary that anchors entity retrieval), and ``rerank`` (the optional
+cross-encoder second stage).
+There were seventeen; thirteen configured subsystems that were deleted or were
 never read at all.
 
 The public entry point is :func:`load_config`, which layers, in order:
@@ -310,6 +311,28 @@ class SupersedeConfig:
 
 
 @dataclass(frozen=True)
+class EntitiesConfig:
+    """Operator vocabulary for entity-anchored retrieval.
+
+    ``vocabulary`` maps a canonical entity name to the aliases that also name
+    it, matched case-insensitively on word boundaries. The shipped table is
+    EMPTY and the operator sets theirs in ``~/.ocbrain/ocbrain.config.json``:
+    real tenant, customer, and host names are operator data, and this repo is
+    public. With an empty table only the code-shaped entities (PRs, record ids,
+    hostnames, digests, dates) anchor a query.
+
+    ``min_filter_candidates`` is how many serving beliefs must mention a query's
+    entities before retrieval restricts the candidate pool to them rather than
+    only boosting them. Restricting a corpus that mentions the entity in one
+    place would hide the beliefs that answer the question without repeating its
+    name, so the floor stays above a handful.
+    """
+
+    vocabulary: dict[str, list[str]] = field(default_factory=dict)
+    min_filter_candidates: int = 5
+
+
+@dataclass(frozen=True)
 class GoalsConfig:
     """Where a repo-relative goal ``source_pointer`` is resolved.
 
@@ -356,6 +379,7 @@ class OcbrainConfig:
     closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
     goals: GoalsConfig = field(default_factory=GoalsConfig)
+    entities: EntitiesConfig = field(default_factory=EntitiesConfig)
     rerank: RerankConfig = field(default_factory=RerankConfig)
 
 

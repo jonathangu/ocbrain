@@ -75,6 +75,39 @@ def test_describe_config_attributes_every_value_to_its_layer(tmp_path: Path, mon
     )
 
 
+def test_entities_section_round_trips_its_vocabulary_from_file_and_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The vocabulary is operator data: it must survive both config layers."""
+    monkeypatch.delenv("OCBRAIN_ENTITIES_VOCABULARY", raising=False)
+    monkeypatch.delenv("OCBRAIN_ENTITIES_MIN_FILTER_CANDIDATES", raising=False)
+    assert load_config(tmp_path / "absent.json").entities.vocabulary == {}
+
+    config_path = tmp_path / "ocbrain.config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "entities": {
+                    "vocabulary": {"asa2": ["asa2", "applied-science-analytics-2"]},
+                    "min_filter_candidates": 7,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    from_file = load_config(config_path)
+    assert from_file.entities.vocabulary == {"asa2": ["asa2", "applied-science-analytics-2"]}
+    assert from_file.entities.min_filter_candidates == 7
+
+    monkeypatch.setenv(
+        "OCBRAIN_ENTITIES_VOCABULARY", json.dumps({"recs worker": ["recs-api"]})
+    )
+    monkeypatch.setenv("OCBRAIN_ENTITIES_MIN_FILTER_CANDIDATES", "2")
+    from_env = load_config(config_path)
+    assert from_env.entities.vocabulary == {"recs worker": ["recs-api"]}
+    assert from_env.entities.min_filter_candidates == 2
+
+
 def test_describe_config_reports_defaults_when_no_file_exists(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
     report = describe_config()

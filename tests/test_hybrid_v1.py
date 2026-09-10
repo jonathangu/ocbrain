@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from ocbrain.core_v1 import (
+    KEYWORD_QUERY_HINT,
     _retrieval_feedback_scores,
     append_core_event,
     get_core_v1_belief,
@@ -1361,3 +1362,150 @@ def test_rerank_stage_off_by_default_changes_nothing(tmp_path: Path, monkeypatch
     assert result["ranking"]["rerank"] == {"mode": "off"}
     assert [item["belief_id"] for item in result["items"]] == ids[:3]
     assert all("rerank_score" not in item["ranking"] for item in result["items"])
+
+
+ASA2_VOCABULARY = {"asa2": ["asa2", "applied-science-analytics-2"]}
+
+
+def _entity_vocabulary(monkeypatch) -> None:
+    monkeypatch.setenv("OCBRAIN_ENTITIES_VOCABULARY", json.dumps(ASA2_VOCABULARY))
+
+
+def _mention_entities(conn, belief_id: str) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT entity FROM entity_mentions WHERE belief_id=?", (belief_id,)
+        )
+    }
+
+
+def test_a_query_entity_with_enough_corpus_filters_the_candidate_pool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A query naming one thing must not serve beliefs about another.
+
+    Five asa2 beliefs and three slt beliefs all say "cadence"; the entity is the
+    only thing that separates them.
+    """
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    asa2_ids = [f"curated:bountiful:asa2-{index}" for index in range(5)]
+    slt_ids = [f"curated:bountiful:slt-{index}" for index in range(3)]
+    for index, belief_id in enumerate(asa2_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The asa2 headroom leg cadence is weekly ({index}).",
+        )
+    for index, belief_id in enumerate(slt_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The slt retrain cadence is quarterly ({index}).",
+        )
+    conn.commit()
+
+    result = search_core_v1(
+        conn,
+        "asa2 headroom leg cadence",
+        context=ScopeContext(project="bountiful"),
+        limit=8,
+        delivery_target="hosted_model",
+    )
+    assert result["ranking"]["entities"] == {
+        "query": ["asa2"],
+        "mode": "filter",
+        "candidates": 5,
+    }
+    assert {item["belief_id"] for item in result["items"]} == set(asa2_ids)
+
+
+def test_a_query_entity_with_a_thin_corpus_boosts_instead_of_filtering(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two mentions is not enough evidence to hide the beliefs that answer
+    without repeating the entity name."""
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    asa2_ids = ["curated:bountiful:asa2-a", "curated:bountiful:asa2-b"]
+    for index, belief_id in enumerate(asa2_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The asa2 headroom leg cadence is weekly ({index}).",
+        )
+    for index in range(3):
+        _seed_belief(
+            conn,
+            belief_id=f"curated:bountiful:slt-{index}",
+            body=f"The slt retrain cadence is quarterly ({index}).",
+        )
+    conn.commit()
+
+    result = search_core_v1(
+        conn,
+        "asa2 headroom leg cadence",
+        context=ScopeContext(project="bountiful"),
+        limit=8,
+        delivery_target="hosted_model",
+    )
+    assert result["ranking"]["entities"]["mode"] == "boost"
+    assert {item["belief_id"] for item in result["items"][:2]} == set(asa2_ids)
+    assert result["items"][0]["ranking"]["entity_boost"] > 0
+    assert result["items"][0]["ranking"]["matched_entities"] >= 1
+
+
+def test_query_shape_and_the_keyword_hint_reach_the_caller(tmp_path: Path, monkeypatch) -> None:
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_belief(
+        conn, belief_id="curated:bountiful:cadence", body="The asa2 cadence is weekly."
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+
+    question = search_core_v1(
+        conn, "What is the asa2 cadence?", context=context, limit=3, delivery_target="hosted_model"
+    )
+    assert question["ranking"]["query_shape"] == "question"
+    assert question["ranking"]["hint"] is None
+
+    keywords = search_core_v1(
+        conn,
+        "cadence retrain notes",
+        context=context,
+        limit=3,
+        delivery_target="hosted_model",
+    )
+    assert keywords["ranking"]["query_shape"] == "keywords"
+    assert keywords["ranking"]["hint"] == KEYWORD_QUERY_HINT
+
+    packet, _handles = build_context_v1(
+        conn,
+        "cadence retrain notes",
+        context=context,
+        limit=3,
+        delivery_target="hosted_model",
+    )
+    assert packet["coverage"]["ranking"]["query_shape"] == "keywords"
+    assert packet["coverage"]["ranking"]["hint"] == KEYWORD_QUERY_HINT
+
+
+def test_reprojection_rewrites_entity_mentions_when_a_body_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    belief_id = "curated:bountiful:constraint"
+    _seed_belief(conn, belief_id=belief_id, body="The asa2 headroom leg is the constraint.")
+    conn.commit()
+    assert _mention_entities(conn, belief_id) == {"asa2"}
+
+    _seed_belief(conn, belief_id=belief_id, body="The slt retrain cadence is quarterly.")
+    conn.commit()
+    assert _mention_entities(conn, belief_id) == set()

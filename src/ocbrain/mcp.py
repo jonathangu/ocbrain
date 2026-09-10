@@ -1619,6 +1619,8 @@ def tool_list(
         {
             "name": "brain.context",
             "description": (
+                "Ask a question that names the entity (tenant, host, service, PR, id) and "
+                "the attribute you need; a list of task keywords retrieves poorly. "
                 "Return the stable ocbrain.context.v1 shared-context envelope, including "
                 "coverage metadata and scope-bound source handles."
             ),
@@ -1680,6 +1682,8 @@ def tool_list(
         {
             "name": "brain.search",
             "description": (
+                "Ask a question that names the entity (tenant, host, service, PR, id) and "
+                "the attribute you need; a list of task keywords retrieves poorly. "
                 "Search source-backed ocbrain knowledge and evidence. Feedback handles are "
                 "best-effort during a database writer window; do not retry a successful search "
                 "solely when retrieval_use_status is database_busy."

@@ -17,12 +17,14 @@ import math
 import re
 import sqlite3
 from collections.abc import Iterable
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from ocbrain.closeout import normalize_task_ref, resolve_session_identity
+from ocbrain.entities import extract_entities
 from ocbrain.history_window import is_body_ref
 from ocbrain.hybrid import semantic_neighbors
 from ocbrain.ids import stable_id
@@ -130,6 +132,37 @@ def looks_like_exact_locator(query: str) -> bool:
     )
 
 
+_ENTITIES_FALLBACK = SimpleNamespace(vocabulary={}, min_filter_candidates=5)
+
+# Held for one projection call so the vocabulary is read once, not once per row.
+_ENTITY_VOCABULARY: ContextVar[dict[str, list[str]] | None] = ContextVar(
+    "ocbrain_projection_entity_vocabulary", default=None
+)
+
+# Said to a caller whose query is a keyword list naming nothing.
+KEYWORD_QUERY_HINT = (
+    "State a question that names the thing you need and the attribute: e.g. "
+    "'What is the current TOMS repack cadence and who owns it?' Entity names "
+    "and ids anchor retrieval."
+)
+
+
+def _entities_config() -> Any:
+    try:
+        from ocbrain.config import load_config
+
+        return load_config().entities
+    except Exception:  # noqa: BLE001 - config problems must not break retrieval
+        return _ENTITIES_FALLBACK
+
+
+def _projection_vocabulary() -> dict[str, list[str]]:
+    active = _ENTITY_VOCABULARY.get()
+    if active is not None:
+        return active
+    return dict(_entities_config().vocabulary or {})
+
+
 _RETRIEVAL_FALLBACK = SimpleNamespace(
     hybrid_rrf_k=HYBRID_RRF_K,
     min_dense_cosine=MIN_DENSE_COSINE,
@@ -194,6 +227,7 @@ CORE_V1_TABLES: tuple[str, ...] = (
     "task_closeout_retrievals",
     "search_documents",
     "search_index",
+    "entity_mentions",
 )
 
 # SQLite creates these implementation tables for the one FTS5 virtual table.
@@ -495,6 +529,14 @@ CREATE TABLE IF NOT EXISTS search_documents (
   path
 );
 
+CREATE TABLE IF NOT EXISTS entity_mentions (
+  belief_id TEXT NOT NULL,
+  entity TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (belief_id, entity)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   kind,
   title,
@@ -589,6 +631,19 @@ _ADDITIVE_CORE_V1_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("task_closeouts", "unresolved", "TEXT"),
 )
 
+# Tables added to a v1 core after the first release; see the columns below.
+_ADDITIVE_CORE_V1_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "entity_mentions",
+        (
+            "CREATE TABLE IF NOT EXISTS entity_mentions ("
+            " belief_id TEXT NOT NULL, entity TEXT NOT NULL, kind TEXT NOT NULL,"
+            " PRIMARY KEY (belief_id, entity))",
+            "CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity)",
+        ),
+    ),
+)
+
 _ADDITIVE_CORE_V1_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_retrieval_uses_session_hint "
     "ON retrieval_uses(client_session_hint, served_at)",
@@ -600,20 +655,27 @@ _ADDITIVE_CORE_V1_INDEXES: tuple[str, ...] = (
 
 
 def migrate_core_v1_columns(conn: sqlite3.Connection) -> list[str]:
-    """Apply the additive column set to an already-initialized v1 core.
+    """Apply the additive schema surface to an already-initialized v1 core.
 
     Idempotent and cheap enough to run on every open: it is one
     ``PRAGMA table_info`` per table when there is nothing to do. Run it there
     rather than behind a separate migrate command, because the MCP server opens
     an existing core without calling :func:`init_core_v1` at all, and a write
-    path that referenced a column the running server had never added would fail
-    at the first ``brain.context`` after deploy.
+    path that referenced a column or table the running server had never added
+    would fail at the first ``brain.context`` after deploy.
     """
     added: list[str] = []
     tables = {
         str(row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
+    for table, statements in _ADDITIVE_CORE_V1_TABLES:
+        if table in tables:
+            continue
+        for statement in statements:
+            conn.execute(statement)
+        tables.add(table)
+        added.append(f"table:{table}")
     by_table: dict[str, set[str]] = {}
     for table, column, decl in _ADDITIVE_CORE_V1_COLUMNS:
         if table not in tables:
@@ -636,12 +698,13 @@ def migrate_core_v1_columns(conn: sqlite3.Connection) -> list[str]:
 def init_core_v1(conn: sqlite3.Connection) -> None:
     """Initialize a fresh v1 core; refuse to layer it over legacy tables."""
     if is_core_v1(conn):
-        assert_core_v1_inventory(conn)
         # Migrate columns before replaying the current schema. The schema also
         # declares indexes on additive columns; on an older core those indexes
         # cannot be prepared until the columns exist.
         migrate_core_v1_columns(conn)
         conn.executescript(CORE_V1_SCHEMA)
+        # The replay creates a table added to CORE_V1_TABLES since this core was.
+        assert_core_v1_inventory(conn)
         return
     existing = [
         str(row[0])
@@ -856,14 +919,18 @@ def project_core_v1(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
     last_rowid = cursor
     last_hash = expected_previous
     constraints = _constraint_cache(conn)
-    for event in events:
-        if event["prev_hash"] != last_hash:
-            raise RuntimeError(f"event-chain boundary mismatch at rowid {event['rid']}")
-        _verify_one_event(event)
-        _apply_event(conn, event, constraints=constraints)
-        applied += 1
-        last_rowid = int(event["rid"])
-        last_hash = str(event["event_hash"])
+    vocabulary_token = _ENTITY_VOCABULARY.set(dict(_entities_config().vocabulary or {}))
+    try:
+        for event in events:
+            if event["prev_hash"] != last_hash:
+                raise RuntimeError(f"event-chain boundary mismatch at rowid {event['rid']}")
+            _verify_one_event(event)
+            _apply_event(conn, event, constraints=constraints)
+            applied += 1
+            last_rowid = int(event["rid"])
+            last_hash = str(event["event_hash"])
+    finally:
+        _ENTITY_VOCABULARY.reset(vocabulary_token)
     cursor_updated_at = (
         str(conn.execute("SELECT ts FROM brain_events WHERE rowid=?", (last_rowid,)).fetchone()[0])
         if last_rowid
@@ -901,6 +968,7 @@ def _clear_projections(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM evidence_objects")
     conn.execute("DELETE FROM current_beliefs")
     conn.execute("DELETE FROM search_documents")
+    conn.execute("DELETE FROM entity_mentions")
     conn.execute("DELETE FROM projection_cursor")
 
 
@@ -1732,6 +1800,7 @@ def _write_belief(
         )
     else:
         conn.execute("DELETE FROM search_documents WHERE doc_id=?", (belief_id,))
+        conn.execute("DELETE FROM entity_mentions WHERE belief_id=?", (belief_id,))
 
 
 def _replace_belief_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
@@ -1828,6 +1897,19 @@ def _replace_search_row(
         """,
         (doc_id, kind, title, body, path),
     )
+    _replace_entity_mentions(conn, doc_id, title=title, body=body)
+
+
+def _replace_entity_mentions(
+    conn: sqlite3.Connection, belief_id: str, *, title: str, body: str
+) -> None:
+    conn.execute("DELETE FROM entity_mentions WHERE belief_id=?", (belief_id,))
+    text = " ".join(part for part in (title, body) if part)
+    for entity, kind in extract_entities(text, _projection_vocabulary()):
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions(belief_id, entity, kind) VALUES (?, ?, ?)",
+            (belief_id, entity, kind),
+        )
 
 
 def resolve_object_id(conn: sqlite3.Connection, object_id: str) -> str:
@@ -2026,6 +2108,7 @@ def _exact_locator_result(
             # this is how many records it named.
             "exact_locator": True,
             "exact_locator_matches": len(items),
+            "query_shape": _query_shape(query),
         },
     }
 
@@ -2101,6 +2184,45 @@ def search_core_v1(
             cross_scope=cross_scope,
             visibility_counts=visibility_counts,
         )
+    entities_section = _entities_config()
+    query_entities = extract_entities(query, dict(entities_section.vocabulary or {}))
+    query_shape = _query_shape(query)
+    min_filter_candidates = int(entities_section.min_filter_candidates)
+    entity_matches: dict[str, int] = {}
+    if query_entities:
+        entity_values = sorted({entity for entity, _kind in query_entities})
+        placeholders = ",".join("?" for _ in entity_values)
+        entity_matches = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                f"""
+                SELECT em.belief_id, COUNT(DISTINCT em.entity)
+                FROM entity_mentions em
+                JOIN current_beliefs cb ON cb.belief_id=em.belief_id
+                WHERE em.entity IN ({placeholders})
+                  AND cb.serve=1 AND cb.status='current' AND {scope_sql} AND {delivery_sql}
+                GROUP BY em.belief_id
+                """,  # noqa: S608 - clauses are selected from fixed local constants
+                (*entity_values, *scope_params),
+            )
+        }
+    entity_mode = "none"
+    if query_entities:
+        entity_mode = "filter" if len(entity_matches) >= min_filter_candidates else "boost"
+    entity_sql = ""
+    entity_params: list[Any] = []
+    if entity_mode == "filter":
+        entity_ids = sorted(entity_matches)
+        entity_sql = f" AND cb.belief_id IN ({','.join('?' for _ in entity_ids)})"
+        entity_params = list(entity_ids)
+        eligible = {
+            belief_id: row for belief_id, row in eligible.items() if belief_id in entity_matches
+        }
+    entity_provenance: dict[str, Any] = {
+        "query": sorted({entity for entity, _kind in query_entities}),
+        "mode": entity_mode,
+        "candidates": len(entity_matches),
+    }
     tuning = _retrieval_tuning()
     rrf_k = int(tuning.hybrid_rrf_k)
     min_dense_cosine = float(tuning.min_dense_cosine)
@@ -2123,11 +2245,11 @@ def search_core_v1(
                 JOIN search_documents sd ON sd.rowid=search_index.rowid
                 JOIN current_beliefs cb ON cb.belief_id=sd.doc_id
                 WHERE search_index MATCH ? AND cb.serve=1 AND cb.status='current'
-                  AND {scope_sql} AND {delivery_sql}
+                  AND {scope_sql} AND {delivery_sql}{entity_sql}
                 ORDER BY lexical_score, cb.pinned DESC, cb.last_compiled_at DESC, cb.belief_id
                 LIMIT ?
                 """,  # noqa: S608 - clauses are selected from fixed local constants
-                (fts, *scope_params, candidate_limit),
+                (fts, *scope_params, *entity_params, candidate_limit),
             )
         )
         query_terms = {
@@ -2252,6 +2374,9 @@ def search_core_v1(
                 "require_dense_support": require_dense_support and dense_arm_healthy,
                 "confidence_prior_enabled": confidence_prior_enabled,
                 "degraded_excluded_procedures": degraded_excluded_procedures,
+                "entities": entity_provenance,
+                "query_shape": query_shape,
+                "hint": _keyword_hint(query_shape, query_entities),
             },
         }
     feedback = _retrieval_feedback_scores(
@@ -2319,6 +2444,10 @@ def search_core_v1(
             dense_component = dense_similarity[belief_id] / (rrf_k + dense_rank[belief_id])
         rrf = lexical_component + dense_component
         feedback_boost = feedback.get(belief_id, 0.0)
+        matched_entities = int(entity_matches.get(belief_id, 0))
+        entity_boost = (
+            min(1.0, 0.5 * matched_entities) if entity_mode == "boost" else 0.0
+        )
         confidence_term = (0.85 + 0.15 * confidence) if confidence_prior_enabled else 1.0
         ranking_prior = (
             scope_weight
@@ -2326,7 +2455,13 @@ def search_core_v1(
             * (0.85 + 0.15 * quality)
             * (0.99 + 0.01 * recency)
         )
-        score = rrf * ranking_prior * (1.0 + feedback_boost) * (1.0 + exact_boost)
+        score = (
+            rrf
+            * ranking_prior
+            * (1.0 + feedback_boost)
+            * (1.0 + exact_boost)
+            * (1.0 + entity_boost)
+        )
         ranked.append(
             (
                 score,
@@ -2356,6 +2491,8 @@ def search_core_v1(
                         "ranking_prior": round(ranking_prior, 6),
                         "feedback_boost": round(feedback_boost, 6),
                         "exact_boost": round(exact_boost, 6),
+                        "entity_boost": round(entity_boost, 6),
+                        "matched_entities": matched_entities,
                     },
                 },
             )
@@ -2417,6 +2554,9 @@ def search_core_v1(
             # thinner than the corpus could support.
             "degraded_excluded_procedures": degraded_excluded_procedures,
             "rerank": rerank_info,
+            "entities": entity_provenance,
+            "query_shape": query_shape,
+            "hint": _keyword_hint(query_shape, query_entities),
         },
     }
 
@@ -2655,6 +2795,41 @@ def reclassify_no_coverage_receipts(
         "dry_run": not apply,
         "sample": [str(row["id"]) for row in rows[:12]],
     }
+
+
+_QUESTION_STARTS = frozenset(
+    {
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "why",
+        "how",
+        "is",
+        "does",
+        "can",
+        "should",
+    }
+)
+
+
+def _query_shape(query: str) -> str:
+    text = str(query).strip()
+    if "?" in text:
+        return "question"
+    words = re.findall(r"[a-z]+", text.lower())
+    if words and words[0] in _QUESTION_STARTS:
+        return "question"
+    return "keywords"
+
+
+def _keyword_hint(query_shape: str, query_entities: list[tuple[str, str]]) -> str | None:
+    if query_shape == "keywords" and not query_entities:
+        return KEYWORD_QUERY_HINT
+    return None
 
 
 def _normalize_fts_query(query: str) -> str:
