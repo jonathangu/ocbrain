@@ -161,6 +161,9 @@ def _write_cfg(tmp_path: Path, data: dict) -> Path:
 def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "missing.json")
     assert cfg.retrieval.hybrid_rrf_k == 60
+    assert cfg.retrieval.adaptive_fusion is True
+    assert cfg.retrieval.keyword_lexical_weight == 0.65
+    assert cfg.retrieval.question_dense_weight == 0.65
     assert cfg.scopes.fold_enabled is True
     assert cfg.scopes.aliases == {}
     assert cfg.curator.provider == "anthropic"
@@ -186,6 +189,22 @@ def test_dense_serving_knobs_load_from_file_and_env(tmp_path: Path) -> None:
     overridden = load_config(path, env=env).retrieval
     assert overridden.min_dense_coverage == 0.9
     assert overridden.embed_on_write is False
+
+
+def test_adaptive_fusion_weights_load_from_file_and_env(tmp_path: Path) -> None:
+    path = _write_cfg(
+        tmp_path,
+        {"retrieval": {"adaptive_fusion": False, "question_dense_weight": 0.8}},
+    )
+    configured = load_config(path).retrieval
+    assert configured.adaptive_fusion is False
+    assert configured.question_dense_weight == 0.8
+    assert configured.keyword_lexical_weight == 0.65
+
+    env = {"OCBRAIN_RETRIEVAL_ADAPTIVE_FUSION": "1"}
+    overridden = load_config(path, env=env).retrieval
+    assert overridden.adaptive_fusion is True
+    assert overridden.keyword_lexical_weight == 0.65
 
 
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:

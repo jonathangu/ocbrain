@@ -27,6 +27,7 @@ from ocbrain.hybrid import (
     _serving_rows,
     build_vector_index,
     embed_missing_beliefs,
+    semantic_neighbors,
     vector_db_path,
     vector_status,
 )
@@ -211,8 +212,11 @@ def test_stale_fingerprint_with_high_coverage_still_serves_dense(
 
     monkeypatch.setenv("OCBRAIN_EMBED_DIMENSIONS", "1")
     dimension_drift = _search(conn, "citrus harvest")
-    assert dimension_drift["ranking"]["mode"] == "lexical"
-    assert dimension_drift["ranking"]["dense_fallback"] == "vector_dimension_config_mismatch"
+    assert dimension_drift["ranking"]["mode"] == "hybrid_rrf"
+    assert dimension_drift["ranking"]["dense_fallback"] is None
+    dimension_status = vector_status(path)
+    assert dimension_status["configured_dimensions_differ"] is True
+    assert dimension_status["healthy"] is True
     monkeypatch.setenv("OCBRAIN_EMBED_DIMENSIONS", "2")
 
     installed_digest[0] = "sha256:test-model-v2"
@@ -1821,3 +1825,154 @@ def test_as_of_serves_the_belief_that_was_current_then(tmp_path: Path) -> None:
     assert past_view["items"][0]["status"] == "retracted"
     assert past_view["items"][0]["era"]["valid_until"] is not None
     assert past_view["retired_included"] >= 1
+
+
+def _seed_dense_pair(conn, tmp_path: Path, monkeypatch) -> Path:
+    path = tmp_path / "core.sqlite"
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    conn.commit()
+    _local_dense_arm(monkeypatch)
+    build_vector_index(path, model="test-local")
+    return path
+
+
+def test_sidecar_model_is_authoritative_over_the_configured_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    path = _seed_dense_pair(conn, tmp_path, monkeypatch)
+    build_vector_index(path, model="model-a")
+
+    monkeypatch.setenv("OCBRAIN_EMBED_MODEL", "model-b")
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert fallback is None
+    assert neighbors[0]["belief_id"] == "curated:bountiful:citrus"
+
+    status = vector_status(path)
+    assert status["sidecar_model"] == "model-a"
+    assert status["configured_model"] == "model-b"
+    assert status["model_matches_configured"] is False
+    assert status["identity_fresh"] is True
+    assert status["healthy"] is True
+
+
+def test_sidecar_model_ollama_does_not_know_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "ocbrain.hybrid._ollama_model_metadata", lambda *_a, **_k: {"digest": "unknown"}
+    )
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert neighbors == []
+    assert fallback == "vector_model_identity_unavailable"
+
+
+def test_sidecar_dimension_metadata_must_match_the_stored_blob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    path = _seed_dense_pair(conn, tmp_path, monkeypatch)
+    sidecar = sqlite3.connect(vector_db_path(path))
+    try:
+        sidecar.execute("UPDATE meta SET value='3' WHERE key='dimensions'")
+        sidecar.commit()
+    finally:
+        sidecar.close()
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert neighbors == []
+    assert fallback == "vector_dimension_config_mismatch"
+
+
+def test_embed_missing_beliefs_uses_the_sidecar_model(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+    seen: list[str] = []
+
+    def _record(texts, *, model, **kwargs):
+        seen.append(model)
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("ocbrain.hybrid.embed_texts", _record)
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE", "0")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+    monkeypatch.delenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE")
+    monkeypatch.setenv("OCBRAIN_EMBED_MODEL", "model-b")
+
+    refresh = embed_missing_beliefs(conn)
+    assert refresh["embedded"] == 1
+    assert seen == ["test-local"]
+
+
+def test_fusion_weights_follow_the_query_shape(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+
+    question = _search(conn, "What is the citrus harvest like?")
+    assert question["ranking"]["query_shape"] == "question"
+    assert question["ranking"]["fusion"] == {
+        "lexical_weight": pytest.approx(0.35),
+        "dense_weight": pytest.approx(0.65),
+        "reason": "question",
+    }
+
+    identifier = _search(conn, "belief_0123456789abcdef citrus")
+    assert identifier["ranking"]["fusion"]["reason"] == "identifiers"
+    assert identifier["ranking"]["fusion"]["lexical_weight"] == pytest.approx(0.65)
+
+    keywords = _search(conn, "citrus harvest")
+    assert keywords["ranking"]["query_shape"] == "keywords"
+    assert keywords["ranking"]["fusion"] == {
+        "lexical_weight": pytest.approx(0.65),
+        "dense_weight": pytest.approx(0.35),
+        "reason": "keywords",
+    }
+
+    question_with_identifier = _search(conn, "What changed in belief_0123456789abcdef?")
+    assert question_with_identifier["ranking"]["fusion"]["reason"] == "identifiers"
+
+
+def test_adaptive_fusion_off_reproduces_the_unweighted_fusion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_ADAPTIVE_FUSION", "0")
+    result = _search(conn, "citrus harvest", limit=5)
+    assert result["ranking"]["fusion"] == {
+        "lexical_weight": 0.5,
+        "dense_weight": 0.5,
+        "reason": "disabled",
+    }
+    assert result["items"]
+    for item in result["items"]:
+        unweighted = item["ranking"]["lexical_component"] + item["ranking"]["dense_component"]
+        assert item["relevance"] == pytest.approx(unweighted)
+
+
+def test_fusion_reports_dense_unavailable_when_the_arm_is_down(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    conn.commit()
+
+    result = _search(conn, "What is the citrus harvest like?")
+    assert result["ranking"]["dense_fallback"] == "vector_sidecar_missing"
+    assert result["ranking"]["fusion"] == {
+        "lexical_weight": 0.5,
+        "dense_weight": 0.5,
+        "reason": "dense_unavailable",
+    }

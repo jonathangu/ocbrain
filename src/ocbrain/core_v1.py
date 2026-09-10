@@ -2389,6 +2389,33 @@ def search_core_v1(
     # is set and every dense score is absent — holding lexical hits to a dense
     # floor then would return nothing at all, so the extra gate stands down.
     dense_arm_healthy = dense_fallback is None
+    adaptive_fusion = bool(getattr(tuning, "adaptive_fusion", True))
+    keyword_lexical_weight = float(getattr(tuning, "keyword_lexical_weight", 0.65))
+    question_dense_weight = float(getattr(tuning, "question_dense_weight", 0.65))
+    has_identifier_entity = any(
+        kind in {"id", "digest", "pr", "host"} for _entity, kind in query_entities
+    )
+    if not adaptive_fusion:
+        lexical_weight, dense_weight, fusion_reason = 0.5, 0.5, "disabled"
+    elif dense_fallback is not None:
+        lexical_weight, dense_weight, fusion_reason = 0.5, 0.5, "dense_unavailable"
+    elif has_identifier_entity:
+        lexical_weight = keyword_lexical_weight
+        dense_weight = 1.0 - keyword_lexical_weight
+        fusion_reason = "identifiers"
+    elif query_shape == "question":
+        lexical_weight = 1.0 - question_dense_weight
+        dense_weight = question_dense_weight
+        fusion_reason = "question"
+    else:
+        lexical_weight = keyword_lexical_weight
+        dense_weight = 1.0 - keyword_lexical_weight
+        fusion_reason = "keywords"
+    fusion_provenance = {
+        "lexical_weight": lexical_weight,
+        "dense_weight": dense_weight,
+        "reason": fusion_reason,
+    }
     degraded_excluded_procedures = 0
     if not dense_arm_healthy:
         # A wrong belief is a wrong sentence; a wrong procedure is a wrong
@@ -2445,6 +2472,7 @@ def search_core_v1(
                 "entities": entity_provenance,
                 "query_shape": query_shape,
                 "hint": _keyword_hint(query_shape, query_entities),
+                "fusion": fusion_provenance,
             },
         }
     feedback = _retrieval_feedback_scores(
@@ -2520,7 +2548,9 @@ def search_core_v1(
         dense_component = 0.0
         if belief_id in dense_rank:
             dense_component = dense_similarity[belief_id] / (rrf_k + dense_rank[belief_id])
-        rrf = lexical_component + dense_component
+        rrf = 2.0 * (
+            lexical_weight * lexical_component + dense_weight * dense_component
+        )
         feedback_boost = feedback.get(belief_id, 0.0)
         matched_entities = int(entity_matches.get(belief_id, 0))
         entity_boost = (
@@ -2642,6 +2672,7 @@ def search_core_v1(
             "entities": entity_provenance,
             "query_shape": query_shape,
             "hint": _keyword_hint(query_shape, query_entities),
+            "fusion": fusion_provenance,
         },
     }
 

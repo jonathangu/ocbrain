@@ -127,6 +127,11 @@ class RetrievalConfig:
     current_recency_half_life_days: float = 30.0
     current_recency_weight: float = 0.35
     durable_recency_weight: float = 0.01
+    # Weight the lexical and dense arms by query shape; equal weights (0.5/0.5)
+    # reproduce the pre-adaptive fused numbers exactly.
+    adaptive_fusion: bool = True
+    keyword_lexical_weight: float = 0.65
+    question_dense_weight: float = 0.65
 
 
 @dataclass(frozen=True)

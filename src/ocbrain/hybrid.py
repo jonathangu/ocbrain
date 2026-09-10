@@ -4,6 +4,10 @@ The semantic event/evidence ledger remains authoritative.  This module stores
 only derived vectors in a separate SQLite file and talks only to a loopback
 Ollama endpoint.  A missing model, server, or sidecar degrades to lexical-only
 retrieval; no hosted embedding fallback exists.
+
+The sidecar's recorded model is authoritative: queries are embedded with the
+model the sidecar was built with, so ``OCBRAIN_EMBED_MODEL`` only decides what
+``vector-build`` builds when ``--model`` is not given.
 """
 
 from __future__ import annotations
@@ -282,21 +286,23 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             and meta.get("corpus_rows") == str(len(corpus_rows))
         )
         configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-        configured_dimensions = int(
-            os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
+        sidecar_model = meta.get("model") or DEFAULT_EMBED_MODEL
+        model_matches_configured = sidecar_model == configured_model
+        env_dimensions = os.environ.get("OCBRAIN_EMBED_DIMENSIONS")
+        configured_dimensions = int(env_dimensions or DEFAULT_EMBED_DIMENSIONS)
+        configured_dimensions_differ = bool(env_dimensions) and (
+            meta.get("dimensions") != str(configured_dimensions)
         )
         configured_instruction_hash = _sha256(DEFAULT_QUERY_INSTRUCTION)
         endpoint = os.environ.get("OCBRAIN_OLLAMA_URL") or DEFAULT_OLLAMA_URL
         try:
             _require_loopback(endpoint)
-            installed = _ollama_model_metadata(endpoint, configured_model)
+            installed = _ollama_model_metadata(endpoint, sidecar_model)
             installed_digest = installed.get("digest", "")
         except ValueError:
             installed_digest = "invalid_endpoint"
         identity_fresh = (
-            meta.get("model") == configured_model
-            and meta.get("dimensions") == str(configured_dimensions)
-            and meta.get("query_instruction_sha256") == configured_instruction_hash
+            meta.get("query_instruction_sha256") == configured_instruction_hash
             and meta.get("model_digest", "unknown") == installed_digest
         )
         # Retrieval receipts, feedback, and other ledger-only events do not
@@ -322,7 +328,10 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             "coverage": coverage,
             "min_dense_coverage": min_coverage,
             "configured_model": configured_model,
+            "sidecar_model": sidecar_model,
+            "model_matches_configured": model_matches_configured,
             "configured_dimensions": configured_dimensions,
+            "configured_dimensions_differ": configured_dimensions_differ,
             "configured_query_instruction_sha256": configured_instruction_hash,
             "installed_model_digest": installed_digest,
             "current_core_event_seq": int(current_seq),
@@ -349,17 +358,14 @@ def _verify_sidecar(
     if meta.get("schema_version") != VECTOR_SCHEMA_VERSION:
         return "vector_schema_mismatch"
     model = meta.get("model") or DEFAULT_EMBED_MODEL
-    configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-    if model != configured_model:
-        return "vector_model_config_mismatch"
     try:
         dimensions = int(meta.get("dimensions") or 0)
-        configured_dimensions = int(
-            os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
-        )
     except ValueError:
         return "vector_dimension_metadata_invalid"
-    if dimensions <= 0 or dimensions != configured_dimensions:
+    if dimensions <= 0:
+        return "vector_dimension_config_mismatch"
+    sample = sidecar.execute("SELECT vector FROM belief_vectors LIMIT 1").fetchone()
+    if sample is not None and len(bytes(sample[0])) != dimensions * array("f").itemsize:
         return "vector_dimension_config_mismatch"
     if meta.get("query_instruction_sha256") != _sha256(DEFAULT_QUERY_INSTRUCTION):
         return "vector_query_instruction_mismatch"
