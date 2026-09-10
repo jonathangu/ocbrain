@@ -34,7 +34,6 @@ DELETED_COMPANION_MODULES = {
     "loops.py",
     "maintenance.py",
     "promote.py",
-    "retrieval_eval.py",
     "review.py",
     "safeguards.py",
     "schema.py",
