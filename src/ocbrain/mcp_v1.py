@@ -45,7 +45,12 @@ from ocbrain.core_v1 import (
 from ocbrain.deslop import ENFORCED_RULE_IDS, find_slop
 from ocbrain.events import SKILL_TELEMETRY_KINDS, validate_skill_telemetry
 from ocbrain.history_window import rehydrate_history_window
-from ocbrain.hybrid import VECTOR_SCHEMA_VERSION, connection_path, vector_db_path
+from ocbrain.hybrid import (
+    VECTOR_SCHEMA_VERSION,
+    connection_path,
+    embed_missing_beliefs,
+    vector_db_path,
+)
 from ocbrain.ids import stable_id
 from ocbrain.provenance import EMPTY_PROVENANCE, Provenance
 from ocbrain.scope import (
@@ -1362,6 +1367,53 @@ def feedback_v1(
     return {"retrieval_use_id": retrieval_use_id, "outcome": outcome, "served_items": served}
 
 
+def _embed_on_write_enabled() -> bool:
+    try:
+        from ocbrain.config import load_config
+
+        return bool(load_config().retrieval.embed_on_write)
+    except Exception:  # noqa: BLE001 - config problems must not break writes
+        return True
+
+
+DEFERRED_VECTOR_REFRESH = {
+    "embedded": 0,
+    "remaining": 0,
+    "skipped_reason": "deferred_until_commit",
+}
+
+
+def _run_vector_refresh(conn: sqlite3.Connection) -> dict[str, Any]:
+    try:
+        if not _embed_on_write_enabled():
+            return {"embedded": 0, "remaining": 0, "skipped_reason": "embed_on_write_disabled"}
+        return embed_missing_beliefs(conn)
+    except Exception as exc:  # noqa: BLE001 - an optional index never fails a write
+        return {
+            "embedded": 0,
+            "remaining": 0,
+            "skipped_reason": f"vector_refresh_failed:{type(exc).__name__}",
+        }
+
+
+def _with_vector_refresh(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    if conn.in_transaction:
+        payload["vector_refresh"] = dict(DEFERRED_VECTOR_REFRESH)
+        return payload
+    payload["vector_refresh"] = _run_vector_refresh(conn)
+    return payload
+
+
+def finish_vector_refresh(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the refresh a handler deferred while its transaction was open."""
+    pending = payload.get("vector_refresh") if isinstance(payload, dict) else None
+    if isinstance(pending, dict) and pending.get("skipped_reason") == "deferred_until_commit":
+        if conn.in_transaction:
+            return payload
+        payload["vector_refresh"] = _run_vector_refresh(conn)
+    return payload
+
+
 def ingest_v1(
     conn: sqlite3.Connection,
     *,
@@ -1450,7 +1502,7 @@ def ingest_v1(
         result["requested_scope"] = requested_scope.to_dict() if requested_scope else None
         result["inferred_scope"] = inferred_scope.to_dict()
         result["widened"] = widened_dimensions(requested_scope, inferred_scope)
-    return result
+    return _with_vector_refresh(conn, result)
 
 
 def closeout_v1(
@@ -1530,7 +1582,7 @@ def closeout_v1(
     receipt["evidence_id"] = evidence_id
     if slop:
         receipt["slop_findings"] = [finding.to_dict() for finding in slop]
-    return receipt
+    return _with_vector_refresh(conn, receipt)
 
 
 def correct_v1(
@@ -1910,22 +1962,25 @@ def supersede_transaction(
                 conn, superseded_id=old_id, successor_id=successor_id
             )
             if duplicate is not None:
-                return {
-                    "schema_version": SUPERSEDE_SCHEMA_VERSION,
-                    "mode": "pending",
-                    "deduped": True,
-                    "superseded_id": old_id,
-                    "successor_id": successor_id,
-                    "scope": scope.to_dict(),
-                    "confidence": confidence,
-                    "pending_reason": pending_reason,
-                    "proposal_event_id": str(duplicate["id"]),
-                    "proposed_at": str(duplicate["ts"]),
-                    "next_step": (
-                        "this supersession is already in the pending ledger, undecided; "
-                        "an admin decides it with brain.proposal_decide"
-                    ),
-                }
+                return _with_vector_refresh(
+                    conn,
+                    {
+                        "schema_version": SUPERSEDE_SCHEMA_VERSION,
+                        "mode": "pending",
+                        "deduped": True,
+                        "superseded_id": old_id,
+                        "successor_id": successor_id,
+                        "scope": scope.to_dict(),
+                        "confidence": confidence,
+                        "pending_reason": pending_reason,
+                        "proposal_event_id": str(duplicate["id"]),
+                        "proposed_at": str(duplicate["ts"]),
+                        "next_step": (
+                            "this supersession is already in the pending ledger, undecided; "
+                            "an admin decides it with brain.proposal_decide"
+                        ),
+                    },
+                )
 
         evidence_id, evidence_event_id = record_core_v1_evidence(
             conn,
@@ -1987,19 +2042,19 @@ def supersede_transaction(
                 "an admin approves this proposal with brain.proposal_decide; "
                 f"{old_id} keeps serving until they do"
             )
-            return payload
-        decision = decide_proposal_v1(
-            conn,
-            proposal_event_id=proposal_event_id,
-            decision="approve",
-            actor=actor,
-            edited_body=None,
-            reason=f"runtime supersede; {rationale}",
-            provenance=provenance,
-        )
-        payload["decision_event_id"] = decision["event_id"]
-        payload["correction_event_id"] = decision.get("correction_event_id")
-        return payload
+        else:
+            decision = decide_proposal_v1(
+                conn,
+                proposal_event_id=proposal_event_id,
+                decision="approve",
+                actor=actor,
+                edited_body=None,
+                reason=f"runtime supersede; {rationale}",
+                provenance=provenance,
+            )
+            payload["decision_event_id"] = decision["event_id"]
+            payload["correction_event_id"] = decision.get("correction_event_id")
+    return _with_vector_refresh(conn, payload)
 
 
 def _complete_supersede_pair(
@@ -2247,7 +2302,7 @@ def decide_proposal_v1(
             )
             if paired is not None:
                 result.update(paired)
-        return result
+    return _with_vector_refresh(conn, result)
 
 
 def _scope_allowed_for_delivery(

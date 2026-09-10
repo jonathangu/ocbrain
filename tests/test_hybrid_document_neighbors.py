@@ -115,10 +115,10 @@ def test_document_reader_answers_while_the_corpus_fingerprint_is_stale(
 ) -> None:
     """The gate must keep working from the first write of a cycle onward.
 
-    `semantic_neighbors` requires a fresh whole-corpus fingerprint and correctly
-    refuses here. If `document_neighbors` required it too, the duplicate gate
-    would switch itself off for the rest of every curation run -- which is the
-    defect this reader was added to fix.
+    A sidecar built an hour ago holds no vector for the belief written a minute
+    ago. If `document_neighbors` refused on that, the duplicate gate would
+    switch itself off for the rest of every curation run -- which is the defect
+    this reader was added to fix.
     """
     conn, _path = _built_core(
         tmp_path,
@@ -131,9 +131,12 @@ def test_document_reader_answers_while_the_corpus_fingerprint_is_stale(
     ids = ["curated:bountiful:citrus", "curated:bountiful:tomato", "curated:bountiful:pear"]
     _rewrite_body(conn, "curated:bountiful:tomato", "Tomatoes are available in the shed.")
 
-    # Control: the query-side reader is now blind, and says so.
-    _, query_side_reason = semantic_neighbors(conn, "citrus", candidate_ids=ids)
-    assert query_side_reason == "vector_sidecar_stale"
+    # Control: the query-side reader also scores past the moved row, and counts
+    # it out of the coverage it reports.
+    _, query_side_reason, query_side_stats = semantic_neighbors(conn, "citrus", candidate_ids=ids)
+    assert query_side_reason is None
+    assert query_side_stats["dense_serving_rows"] == 3
+    assert query_side_stats["dense_stale_rows"] == 1
 
     neighbors, unavailable, coverage = document_neighbors(conn, CITRUS, candidate_ids=ids)
     assert unavailable is None

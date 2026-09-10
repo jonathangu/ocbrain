@@ -120,6 +120,7 @@ def _stub_neighbors(monkeypatch, neighbors, unavailable=None) -> None:
                 if candidate_ids is None or item["belief_id"] in set(candidate_ids)
             ][:limit],
             unavailable,
+            {},
         ),
     )
 

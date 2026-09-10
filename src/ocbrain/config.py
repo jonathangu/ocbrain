@@ -100,6 +100,11 @@ class RetrievalConfig:
     min_lexical_query_term_matches: int = 2
     min_redundant_lexical_strength_ratio: float = 0.50
     require_dense_support: bool = True
+    # Share of serving beliefs the sidecar must still hold a current vector for
+    # before the dense arm ranks at all; below it, retrieval falls back lexically.
+    min_dense_coverage: float = 0.60
+    # Embed a belief as it is minted, so coverage does not decay between builds.
+    embed_on_write: bool = True
     # Whether `ranking_prior` keeps its `0.85 + 0.15 * confidence` term.
     #
     # `confidence` is authored, not measured: 345 of the 347 serving beliefs on

@@ -83,7 +83,7 @@ def _healthy_dense_arm(monkeypatch) -> None:
             {"belief_id": belief_id, "similarity": 0.9 if belief_id == MATCHING else 0.0}
             for belief_id in sorted(candidate_ids or [])
         ]
-        return rows, None
+        return rows, None, {}
 
     monkeypatch.setattr("ocbrain.core_v1.semantic_neighbors", fake_neighbors)
 

@@ -64,6 +64,7 @@ from ocbrain.mcp_v1 import (
     digest_v1,
     expand_source_v1,
     feedback_v1,
+    finish_vector_refresh,
     forget_v1,
     get_v1,
     ingest_v1,
@@ -1402,7 +1403,7 @@ def call_tool_v1(
             requested_scope=scope_from_arguments(arguments),
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.closeout":
         context = context_from_arguments(arguments)
         task_ref = optional_string(arguments, "task_ref") or context.task
@@ -1429,7 +1430,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.supersede":
         context = context_from_arguments(arguments)
         payload = supersede_v1(
@@ -1442,7 +1443,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.correct":
         payload = correct_v1(
             conn,
@@ -1468,7 +1469,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.proposals":
         if delivery_target == HOSTED_MODEL_TARGET:
             raise PermissionError("brain.proposals is unavailable for hosted_model delivery")

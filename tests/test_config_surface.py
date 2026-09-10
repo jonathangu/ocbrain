@@ -170,6 +170,24 @@ def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     assert cfg.rerank.model == "BAAI/bge-reranker-v2-m3"
 
 
+def test_dense_serving_knobs_load_from_file_and_env(tmp_path: Path) -> None:
+    default = load_config(tmp_path / "missing.json").retrieval
+    assert default.min_dense_coverage == 0.60
+    assert default.embed_on_write is True
+
+    path = _write_cfg(
+        tmp_path, {"retrieval": {"min_dense_coverage": 0.25, "embed_on_write": False}}
+    )
+    configured = load_config(path).retrieval
+    assert configured.min_dense_coverage == 0.25
+    assert configured.embed_on_write is False
+
+    env = {"OCBRAIN_RETRIEVAL_MIN_DENSE_COVERAGE": "0.9", "OCBRAIN_RETRIEVAL_EMBED_ON_WRITE": "0"}
+    overridden = load_config(path, env=env).retrieval
+    assert overridden.min_dense_coverage == 0.9
+    assert overridden.embed_on_write is False
+
+
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:
     path = _write_cfg(tmp_path, {"retrieval": {"hybrid_rrf_k": 30}})
     assert load_config(path).retrieval.hybrid_rrf_k == 30

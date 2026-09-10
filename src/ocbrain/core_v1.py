@@ -2311,7 +2311,7 @@ def search_core_v1(
                 # lexical rank 1-2. Defer the decision: dropping them is only
                 # right if the dense arm is healthy enough to answer instead.
                 lexical_uncorroborated = True
-    dense_rows, dense_fallback = semantic_neighbors(
+    dense_rows, dense_fallback, dense_stats = semantic_neighbors(
         conn,
         query,
         candidate_ids=eligible,
@@ -2364,6 +2364,7 @@ def search_core_v1(
             "ranking": {
                 "mode": "lexical" if dense_fallback else "hybrid",
                 "dense_fallback": dense_fallback,
+                **dense_stats,
                 "eligible_count": visibility_counts["eligible_count"],
                 "lexical_candidates": 0,
                 "dense_candidates": 0,
@@ -2538,6 +2539,7 @@ def search_core_v1(
         "ranking": {
             "mode": "lexical" if dense_fallback else "hybrid_rrf",
             "dense_fallback": dense_fallback,
+            **dense_stats,
             "eligible_count": visibility_counts["eligible_count"],
             "lexical_candidates": len(lexical_rank),
             "dense_candidates": len(dense_rank),
