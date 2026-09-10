@@ -463,6 +463,30 @@ def test_moot_proposals_class_rejects_supersedes_of_retired_targets(tmp_path: Pa
     conn.close()
 
 
+def test_moot_proposals_preserve_each_action_and_cap_accounting(tmp_path: Path) -> None:
+    conn = _core(tmp_path)
+    target = "curated:bountiful:multiple-moot"
+    _seed(
+        conn, belief_id=target, body="An expired synthetic fact.",
+        attributes={"valid_until": "2026-07-01T00:00:00+00:00"},
+    )
+    proposals = {
+        _pend_supersede(conn, target=target, successor=f"belief:successor-{i}")
+        for i in range(2)
+    }
+    conn.commit()
+    apply_retirements(conn, plan_retirements(conn, classes=("expired",), now=NOW))
+    capped = plan_retirements(conn, classes=("moot_proposals",), now=NOW, batch_cap=1)
+    assert (
+        capped["eligible_total"], capped["selected_total"], capped["deferred_by_cap"]
+    ) == (2, 1, 1)
+    plan = plan_retirements(conn, classes=("moot_proposals",), now=NOW)
+    assert {item["proposal_event_id"] for item in plan["targets"]} == proposals
+    assert apply_retirements(conn, plan)["moot_proposals_rejected"] == 2
+    assert pending_supersede_count(conn) == 0
+    conn.close()
+
+
 def test_moot_proposals_class_leaves_live_targets_alone(tmp_path: Path) -> None:
     """The queue is a backlog, not garbage: a decidable proposal stays decidable."""
     conn = _core(tmp_path)

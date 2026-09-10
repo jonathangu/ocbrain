@@ -319,12 +319,12 @@ class GoalsConfig:
     ``source_pointer_unresolved`` in the next.
 
     Each entry contributes itself and its immediate subdirectories as candidate
-    repo roots, so listing a parent of your checkouts covers them. Defaults name
-    the two conventional parents; an operator whose checkouts live elsewhere
-    sets their own list here.
+    repo roots, so listing a parent of your checkouts covers them. Additional
+    roots are opt-in: the default never enumerates unrelated repositories.
+    Recorded source roots and an explicitly supplied caller repo still work.
     """
 
-    repo_roots: list[str] = field(default_factory=lambda: ["~/coframe", "~/Developer"])
+    repo_roots: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -132,7 +132,7 @@ def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     assert cfg.scopes.aliases == {}
     assert cfg.curator.provider == "anthropic"
     assert cfg.deslop.reject_closeout_slop is False
-    assert cfg.goals.repo_roots == ["~/coframe", "~/Developer"]
+    assert cfg.goals.repo_roots == []
 
 
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:

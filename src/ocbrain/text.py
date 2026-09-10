@@ -20,6 +20,9 @@ _CAMEL_SECRET_KEY = (
 _SECRET_KEY_ATOM = rf"(?:{_SNAKE_SECRET_KEY}|{_CAMEL_SECRET_KEY})"
 _UNQUOTED_SECRET_VALUE = r"(?:(?=[^\s\"']{16})[^\s\"']+|(?=[^\s\"']{8})(?=[^\s\"']*\d)[^\s\"']+)"
 _ASSIGNED_SECRET_VALUE = rf"(?:\"[^\"\n]+\"|'[^'\n]+'|{_UNQUOTED_SECRET_VALUE})"
+# Equals assignments are machine-shaped, unlike colon-delimited prose. Never
+# require entropy or length to protect an explicitly assigned short password.
+_UNQUOTED_EQUALS_SECRET = re.compile(rf"({_SECRET_KEY_ATOM}\s*=\s*)([^\s\"']+)")
 
 _JSON_QUOTED_SECRET = re.compile(rf'(\\?"{_SECRET_KEY_ATOM}\\?"\s*:\s*\\?")([^"]*?)(\\?")')
 _QUOTED_ASSIGNED_SECRET = re.compile(rf"\b({_SECRET_KEY_ATOM}\s*[:=]\s*)(\"[^\"\n]+\"|'[^'\n]+')")
@@ -40,6 +43,7 @@ SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"xox[baprs]-[A-Za-z0-9-]{20,}"), "[REDACTED]"),
     (_JSON_QUOTED_SECRET, r"\1[REDACTED]\3"),
     (_QUOTED_ASSIGNED_SECRET, r'\1"[REDACTED]"'),
+    (_UNQUOTED_EQUALS_SECRET, r"\1[REDACTED]"),
     (
         re.compile(rf"({_SECRET_KEY_ATOM})(\s*[:=]\s*)({_UNQUOTED_SECRET_VALUE})"),
         r"\1\2[REDACTED]",
@@ -63,8 +67,9 @@ LEAK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "assigned_secret",
         re.compile(
-            rf"{_SECRET_KEY_ATOM}\s*[:=]\s*"
-            rf"(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]'){_ASSIGNED_SECRET_VALUE}"
+            rf"{_SECRET_KEY_ATOM}\s*(?:"
+            rf"=\s*(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]')[^\s]+|"
+            rf":\s*(?!\[REDACTED\])(?!\"\[REDACTED\]\")(?!'\[REDACTED\]'){_ASSIGNED_SECRET_VALUE})"
         ),
     ),
 ]

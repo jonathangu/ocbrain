@@ -231,10 +231,16 @@ def plan_retirements(
             for moot in _moot_proposals(conn)
         ]
 
-    # One belief can qualify twice; keep the first (most explicit) reason.
-    deduped: dict[str, dict[str, str]] = {}
+    # Belief retirements dedupe by belief; distinct proposal decisions must
+    # remain distinct so every action and deferred-by-cap count is represented.
+    deduped: dict[tuple[str, str], dict[str, str]] = {}
     for candidate in candidates:
-        deduped.setdefault(candidate["belief_id"], candidate)
+        key = (
+            ("proposal", candidate["proposal_event_id"])
+            if candidate["reason"] == "moot_proposals"
+            else ("belief", candidate["belief_id"])
+        )
+        deduped.setdefault(key, candidate)
     ordered = sorted(deduped.values(), key=lambda item: (item["reason"], item["belief_id"]))
     capped = ordered[: max(0, batch_cap)]
 

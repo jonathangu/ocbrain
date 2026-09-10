@@ -545,6 +545,8 @@ def _source_pointer_warning(
     git_ref = str(pointer.get("git_ref") or "").strip()
 
     recorded_root = _usable_local_directory(pointer.get("root"))
+    if not candidate.is_absolute() and pointer.get("root") and recorded_root is None:
+        return {"type": "source_pointer_unresolved", "path": raw}
     if recorded_root is not None:
         candidates = [recorded_root]
     else:
@@ -572,7 +574,11 @@ def _source_pointer_warning(
             git_root = _git_repository_root(root)
             if git_root is None or not _git_ref_resolves(git_root, git_ref):
                 continue
-            if _git_path_exists_at_ref(git_root, git_ref, raw):
+            try:
+                relative = (root / candidate).resolve().relative_to(git_root.resolve())
+            except (OSError, ValueError):
+                continue
+            if _git_path_exists_at_ref(git_root, git_ref, relative.as_posix()):
                 return None
         for root in candidates:
             if _path_exists(root / candidate):

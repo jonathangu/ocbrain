@@ -25,6 +25,7 @@ from ocbrain.briefing import (
     MIN_BRIEFING_BUDGET_CHARS,
     SECTION_ORDER,
     GoalError,
+    _source_pointer_warning,
     build_briefing,
     build_ledger,
     close_goal,
@@ -92,6 +93,30 @@ def _git_repo_with_branch_spec(
     _git(root, "commit", "-q", "-m", "spec")
     _git(root, "checkout", "-q", "main")
     return root
+
+
+def test_missing_recorded_root_never_rebinds_to_another_repo(tmp_path):
+    other = tmp_path / "unrelated"
+    other.mkdir()
+    (other / "SPEC.md").write_text("# unrelated\n")
+    warning = _source_pointer_warning(
+        {"path": "SPEC.md", "root": str(tmp_path / "removed")},
+        repo_root=other,
+        repo_roots=[other],
+    )
+    assert warning is not None
+    assert warning["type"] == "source_pointer_unresolved"
+
+
+def test_nested_recorded_root_resolves_its_pinned_path(tmp_path):
+    repo = _git_repo_with_branch_spec(tmp_path / "repo")
+    (repo / "docs").mkdir(exist_ok=True)
+    warning = _source_pointer_warning(
+        {"path": "SPEC.md", "root": str(repo / "docs"), "git_ref": "spec-branch"},
+        repo_root=None,
+        repo_roots=[],
+    )
+    assert warning is None
 
 
 def _git_repo_with_tag(root: Path, tag: str) -> Path:
