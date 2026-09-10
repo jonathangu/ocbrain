@@ -170,14 +170,23 @@ def _closeout(
     session_id: str | None,
     connection_id: str | None = None,
     context: dict | None = None,
+    runtime: str | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO task_closeouts(id, schema_version, closed_at, task_ref, status, summary, "
         "decision_impact, context_json, artifact_refs_json, verifier_refs_json, "
-        "provenance_json, receipt_json, content_hash, session_id, server_connection_id) "
+        "provenance_json, receipt_json, content_hash, session_id, server_connection_id, runtime) "
         "VALUES (?, 'ocbrain.closeout.v1', ?, 'task', 'completed', 's', 'informed', "
-        "?, '[]', '[]', '{}', '{}', ?, ?, ?)",
-        (cid, _ts(days_ago), json.dumps(context or {}), cid, session_id, connection_id),
+        "?, '[]', '[]', '{}', '{}', ?, ?, ?, ?)",
+        (
+            cid,
+            _ts(days_ago),
+            json.dumps(context or {}),
+            cid,
+            session_id,
+            connection_id,
+            runtime,
+        ),
     )
 
 
@@ -239,8 +248,8 @@ def core(tmp_path: Path) -> Path:
 
     for days in (30, 20, 10):
         _evidence(conn, writer="live-stream", days_ago=days)
-    for index in range(3):
-        _evidence(conn, writer="stale-stream", days_ago=5 + index * 0.1)
+    for days in (5.0, 6.0, 6.9):
+        _evidence(conn, writer="stale-stream", days_ago=days)
     for days in (2.0, 1.0, 0.5):
         _evidence(conn, writer="live-stream", days_ago=days)
 
@@ -328,6 +337,37 @@ def test_pollution_rate_counts_only_beliefs_removed_inside_the_horizon(core: Pat
     assert metric["value"] == pytest.approx(0.5)
 
 
+def test_pollution_rate_excludes_supersessions_and_reports_them_as_churn(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "churn.sqlite"
+    conn = connect(path)
+    init_core_v1(conn)
+    for index in range(4):
+        _belief(conn, belief_id=f"belief:c{index}", body=f"C{index}.", days_ago=10)
+    _correct(
+        conn, target="belief:c0", op="supersede", days_ago=8, writer="curator",
+        successor="belief:c1",
+    )
+    _correct(
+        conn, target="belief:c1", op="supersede", days_ago=8, writer="curator",
+        successor="belief:c2",
+    )
+    _correct(conn, target="belief:c2", op="retract", days_ago=8, writer="curator")
+    conn.commit()
+    conn.close()
+    scorecard = _score(path)
+    pollution = _metric(scorecard, "pollution_rate")
+    # Only the bare retract is pollution; a supersession carries a forward
+    # pointer and is reported separately as churn.
+    assert pollution["detail"]["removed_within_horizon"] == 1
+    assert pollution["value"] == pytest.approx(0.25)
+    churn = _metric(scorecard, "supersede_churn_rate")
+    assert churn["detail"]["superseded_within_horizon"] == 2
+    assert churn["detail"]["minted_in_window"] == 4
+    assert churn["value"] == pytest.approx(0.5)
+
+
 def test_structured_removal_share_sees_a_bare_retract_as_unstructured(core: Path) -> None:
     metric = _metric(_score(core), "structured_removal_share")
     assert metric["value"] == pytest.approx(0.0)
@@ -370,6 +410,18 @@ def test_calibration_reports_the_widest_band_and_why_beliefs_left(core: Path) ->
     # rot and slow-rot, neither of which has had a full 30-day horizon.
     assert bands["strong"]["beliefs"] == 3
     assert bands["strong"]["survival_rate"] == pytest.approx(1.0)
+
+
+def test_calibration_cohort_ignores_beliefs_minted_before_the_window(core: Path) -> None:
+    conn = connect(core)
+    _belief(conn, belief_id="belief:ancient", body="Ancient.", days_ago=200)
+    _correct(conn, target="belief:ancient", op="retract", days_ago=199, writer="agent-four")
+    conn.commit()
+    conn.close()
+    metric = _metric(_score(core), "calibration_gap")
+    assert metric["detail"]["cohort_size"] == 4
+    assert metric["detail"]["cohort_from"] == (NOW - timedelta(days=60)).isoformat()
+    assert metric["detail"]["cohort_to"] == (NOW - timedelta(days=30)).isoformat()
 
 
 def test_duplicate_key_clusters_counts_shared_attribute_keys(core: Path) -> None:
@@ -575,6 +627,20 @@ def test_harvest_ignores_one_shot_runtime_labels(core: Path) -> None:
     assert "one-shot-lane" not in {item["runtime"] for item in metric["detail"]["streams"]}
 
 
+def test_harvest_requires_rows_on_several_days(core: Path) -> None:
+    conn = connect(core)
+    for index in range(5):
+        _evidence(conn, writer="burst-stream", days_ago=2 + index * 0.05)
+    for index in range(3):
+        _evidence(conn, writer="spread-stream", days_ago=2 + index)
+    conn.commit()
+    conn.close()
+    metric = _metric(_score(core), "harvest_silence_hours")
+    runtimes = {item["runtime"] for item in metric["detail"]["streams"]}
+    assert "burst-stream" not in runtimes
+    assert "spread-stream" in runtimes
+
+
 def test_growth_reports_rows_by_table(core: Path) -> None:
     metric = _metric(_score(core), "rows_added_in_window")
     tables = metric["detail"]["tables"]
@@ -602,6 +668,64 @@ def test_closeout_join_is_not_measured_without_a_transcript_root(
     metric = _metric(_score(core, transcript_root=tmp_path / "absent"), "closeout_trace_join_rate")
     assert metric["status"] == NOT_MEASURED
     assert "no transcripts found" in metric["reason"]
+
+
+def test_closeout_join_matches_codex_rollout_suffix_and_excludes_unjoinable_runtimes(
+    core: Path, tmp_path: Path
+) -> None:
+    claude_root = tmp_path / "claude-projects"
+    codex_root = tmp_path / "codex-sessions"
+    claude_root.mkdir()
+    codex_root.mkdir()
+    (claude_root / "claude-session-1.jsonl").write_text("", encoding="utf-8")
+    (codex_root / "rollout-2026-01-01T00-00-00-abc-codex-session-1.jsonl").write_text(
+        "", encoding="utf-8"
+    )
+    conn = connect(core)
+    for index in range(20):
+        _closeout(
+            conn,
+            cid=f"close_claude_{index}",
+            days_ago=0.5,
+            session_id="claude-session-1" if index == 0 else f"absent-{index}",
+            connection_id="conn",
+            runtime="claude-code",
+        )
+    _closeout(
+        conn,
+        cid="close_codex",
+        days_ago=0.5,
+        session_id="codex-session-1",
+        connection_id="conn",
+        runtime="codex-cli",
+    )
+    _closeout(
+        conn,
+        cid="close_hermes",
+        days_ago=0.5,
+        session_id="hermes-session-1",
+        connection_id="conn",
+        runtime="hermes-pokemon",
+    )
+    conn.commit()
+    conn.close()
+    metric = _metric(
+        _score(core, transcript_roots={"claude": claude_root, "codex": codex_root}),
+        "closeout_trace_join_rate",
+    )
+    # 20 claude + 1 codex are countable; the hermes closeout has no root here
+    # and must not sit in the denominator as an automatic miss.
+    assert metric["status"] != NOT_MEASURED
+    assert metric["detail"]["unjoinable_closeouts"] == 1
+    assert metric["detail"]["families"]["claude"] == {
+        "closeouts": 20,
+        "joined": 1,
+        "root": str(claude_root),
+        "root_present": True,
+    }
+    assert metric["detail"]["families"]["codex"]["joined"] == 1
+    assert metric["detail"]["families"]["unjoinable"]["closeouts"] == 1
+    assert metric["value"] == pytest.approx(2 / 21)
 
 
 # --------------------------------------------------------------------------- #
