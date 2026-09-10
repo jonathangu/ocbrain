@@ -1177,3 +1177,26 @@ def test_v1_stdio_delivery_target_is_selectable(tmp_path, monkeypatch):
 
     initialize = json.loads(output.getvalue().splitlines()[0])
     assert initialize["result"]["serverInfo"]["deliveryTarget"] == "hosted_model"
+
+
+def test_v1_context_accepts_as_of_and_rejects_non_iso(tmp_path):
+    conn = _seed_v1(tmp_path)
+    arguments = {
+        "query": "Shared Context bridge runtimes",
+        "context": {"project": "ocbrain", "runtime": "codex", "task": "v1-acceptance"},
+        "as_of": "2026-09-12T00:00:00+00:00",
+    }
+    context = _payload(handle_request(conn, _tool_call("brain.context", arguments)))
+    assert context["schema_version"] == "ocbrain.context.v1"
+    assert context["coverage"]["as_of"] == "2026-09-12T00:00:00.000000+00:00"
+    assert context["coverage"]["returned"] == 1
+    assert context["items"][0]["era"]["valid_until"] is None
+
+    rejected = handle_request(
+        conn, _tool_call("brain.context", {**arguments, "as_of": "yesterday"}, request_id=2)
+    )
+    assert rejected == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "error": {"code": -32602, "message": "as_of must be an ISO-8601 timestamp"},
+    }

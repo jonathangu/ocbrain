@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1685,3 +1686,138 @@ def test_reprojection_rewrites_entity_mentions_when_a_body_changes(
     _seed_belief(conn, belief_id=belief_id, body="The slt retrain cadence is quarterly.")
     conn.commit()
     assert _mention_entities(conn, belief_id) == set()
+
+
+def _seed_recency_pair(conn, *, lifecycle: str, prefix: str) -> tuple[str, str]:
+    old_id = f"curated:test:{prefix}-old"
+    new_id = f"curated:test:{prefix}-new"
+    attributes = {"source_quality": 0.95, "lifecycle": lifecycle}
+    _seed_belief(
+        conn,
+        belief_id=old_id,
+        body=f"citrus grove note {prefix} record one",
+        attributes=attributes,
+    )
+    _seed_belief(
+        conn,
+        belief_id=new_id,
+        body=f"citrus grove note {prefix} record two",
+        attributes=attributes,
+    )
+    compiled = (datetime.now(UTC) - timedelta(days=90)).isoformat(timespec="microseconds")
+    conn.execute(
+        "UPDATE current_beliefs SET last_compiled_at=?, pinned=1 WHERE belief_id=?",
+        (compiled, old_id),
+    )
+    conn.commit()
+    return old_id, new_id
+
+
+def test_current_lifecycle_recency_lifts_the_newer_belief(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id, new_id = _seed_recency_pair(conn, lifecycle="current", prefix="current")
+    packet = search_core_v1(
+        conn,
+        "citrus grove note",
+        context=ScopeContext(project="bountiful"),
+        limit=5,
+    )
+    items = [item for item in packet["items"] if item["belief_id"] in {old_id, new_id}]
+    assert [item["belief_id"] for item in items] == [new_id, old_id]
+    assert items[0]["ranking"]["recency_model"] == "current"
+    assert items[0]["ranking"]["recency_half_life_days"] == 30.0
+
+
+def test_durable_recency_does_not_reorder_the_pair(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id, new_id = _seed_recency_pair(conn, lifecycle="durable", prefix="durable")
+    packet = search_core_v1(
+        conn,
+        "citrus grove note",
+        context=ScopeContext(project="bountiful"),
+        limit=5,
+    )
+    items = [item for item in packet["items"] if item["belief_id"] in {old_id, new_id}]
+    assert [item["belief_id"] for item in items] == [old_id, new_id]
+    assert items[0]["ranking"]["recency_model"] == "durable"
+    assert items[0]["ranking"]["recency_half_life_days"] == 365.0
+
+
+def test_expired_belief_is_excluded_at_read_time_and_counted(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    target = "curated:test:expired-window"
+    _seed_belief(
+        conn,
+        belief_id=target,
+        body="Quince paste sets hardest when the fruit is barely ripe.",
+        attributes={
+            "source_quality": 0.95,
+            "valid_from": "2019-01-01T00:00:00+00:00",
+            "valid_until": "2020-01-01T00:00:00+00:00",
+        },
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+    query = "quince paste sets hardest"
+
+    current_view = search_core_v1(conn, query, context=context, limit=5)
+    assert current_view["items"] == []
+    assert current_view["expired_excluded"] == 1
+
+    past_view = search_core_v1(
+        conn, query, context=context, limit=5, as_of="2019-06-01T00:00:00+00:00"
+    )
+    assert [item["belief_id"] for item in past_view["items"]] == [target]
+    assert past_view["items"][0]["era"] == {
+        "valid_from": "2019-01-01T00:00:00+00:00",
+        "valid_until": "2020-01-01T00:00:00+00:00",
+    }
+
+
+def test_as_of_serves_the_belief_that_was_current_then(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id = "curated:test:quay-old"
+    new_id = "curated:test:quay-new"
+    _seed_belief(
+        conn,
+        belief_id=old_id,
+        body="The quay gate closes at dusk in winter.",
+        attributes={"source_quality": 0.95, "valid_from": "2020-01-01T00:00:00+00:00"},
+    )
+    _seed_belief(
+        conn,
+        belief_id=new_id,
+        body="The quay gate closes at dawn in winter.",
+        attributes={"source_quality": 0.95, "valid_from": "2026-01-01T00:00:00+00:00"},
+    )
+    append_core_event(
+        conn,
+        "correction_recorded",
+        {
+            "target_layer": "belief",
+            "target_id": old_id,
+            "op": "supersede",
+            "successor_id": new_id,
+            "author": "test",
+        },
+        writer="test",
+        project=True,
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+    query = "quay gate closes winter"
+
+    current_view = search_core_v1(conn, query, context=context, limit=5)
+    assert [item["belief_id"] for item in current_view["items"]] == [new_id]
+
+    past_view = search_core_v1(
+        conn, query, context=context, limit=5, as_of="2025-06-01T00:00:00+00:00"
+    )
+    assert [item["belief_id"] for item in past_view["items"]] == [old_id]
+    assert past_view["items"][0]["status"] == "retracted"
+    assert past_view["items"][0]["era"]["valid_until"] is not None
+    assert past_view["retired_included"] >= 1

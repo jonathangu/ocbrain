@@ -155,6 +155,7 @@ def build_context_v1(
     limit: int,
     cross_scope: bool = False,
     delivery_target: str = LOCAL_MODEL_TARGET,
+    as_of: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build one context packet. One retrieval, one ranking, no retry.
 
@@ -176,6 +177,7 @@ def build_context_v1(
         limit=limit,
         cross_scope=cross_scope,
         delivery_target=delivery_target,
+        as_of=as_of,
     )
     handles: list[dict[str, Any]] = []
     items: list[dict[str, Any]] = []
@@ -206,39 +208,40 @@ def build_context_v1(
         excerpt, excerpt_truncated = _bounded_excerpt(
             str(raw_item.get("body") or ""), max_chars=MAX_ITEM_EXCERPT_CHARS
         )
-        items.append(
-            {
-                "id": str(raw_item["belief_id"]),
-                "kind": "core_v1",
-                "excerpt": excerpt,
-                "excerpt_truncated": excerpt_truncated,
-                "scope": dict(raw_item.get("scope") or {}),
-                "score": float(raw_item.get("score") or 0.0),
-                "relevance": float(raw_item.get("relevance") or 0.0),
-                # `confidence` and `confidence_band` used to sit here. They were
-                # an authored reliability score with no measurable provenance,
-                # and joined to recorded feedback they ran backwards: on the
-                # reference corpus, packets judged irrelevant or harmful held
-                # items averaging 0.8707 confidence against 0.7263 for packets
-                # judged used or helpful. A reader weighting on that field was
-                # being pointed at the rows readers liked least. These two are
-                # facts about the record instead -- how many evidence objects
-                # back it, and when the newest of them was recorded -- so a
-                # reader can go and check rather than defer.
-                "evidence_count": int(raw_item.get("evidence_count") or 0),
-                "evidence_latest_at": raw_item.get("evidence_latest_at"),
-                "status": "current",
-                "evidence_ids": _evidence_ids_for_delivery(
-                    conn,
-                    raw_item.get("evidence_ids") or [],
-                    context=context,
-                    delivery_target=delivery_target,
-                    cross_scope=cross_scope,
-                ),
-                "sources": [_public_source_handle(value) for value in item_handles],
-                "ranking": dict(raw_item.get("ranking") or {}),
-            }
-        )
+        item_payload: dict[str, Any] = {
+            "id": str(raw_item["belief_id"]),
+            "kind": "core_v1",
+            "excerpt": excerpt,
+            "excerpt_truncated": excerpt_truncated,
+            "scope": dict(raw_item.get("scope") or {}),
+            "score": float(raw_item.get("score") or 0.0),
+            "relevance": float(raw_item.get("relevance") or 0.0),
+            # `confidence` and `confidence_band` used to sit here. They were
+            # an authored reliability score with no measurable provenance,
+            # and joined to recorded feedback they ran backwards: on the
+            # reference corpus, packets judged irrelevant or harmful held
+            # items averaging 0.8707 confidence against 0.7263 for packets
+            # judged used or helpful. A reader weighting on that field was
+            # being pointed at the rows readers liked least. These two are
+            # facts about the record instead -- how many evidence objects
+            # back it, and when the newest of them was recorded -- so a
+            # reader can go and check rather than defer.
+            "evidence_count": int(raw_item.get("evidence_count") or 0),
+            "evidence_latest_at": raw_item.get("evidence_latest_at"),
+            "status": str(raw_item.get("status") or "current"),
+            "evidence_ids": _evidence_ids_for_delivery(
+                conn,
+                raw_item.get("evidence_ids") or [],
+                context=context,
+                delivery_target=delivery_target,
+                cross_scope=cross_scope,
+            ),
+            "sources": [_public_source_handle(value) for value in item_handles],
+            "ranking": dict(raw_item.get("ranking") or {}),
+        }
+        if as_of is not None:
+            item_payload["era"] = dict(raw_item.get("era") or {})
+        items.append(item_payload)
     handles = _dedupe_handles(handles)
     # Recomputed from what survived delivery gating rather than reusing the
     # ranker's mix, so the histogram describes the packet the caller is holding.
@@ -273,6 +276,9 @@ def build_context_v1(
             "exclusion_count_basis": str(
                 raw.get("exclusion_count_basis") or "current_serving_inventory"
             ),
+            "expired_excluded": int(raw.get("expired_excluded") or 0),
+            "as_of": raw.get("as_of"),
+            "retired_included": int(raw.get("retired_included") or 0),
             "excluded_sample": (
                 [] if delivery_target != LOCAL_MODEL_TARGET else list(raw.get("excluded") or [])
             ),
@@ -782,6 +788,7 @@ def search_v1(
     cross_scope: bool,
     delivery_target: str = LOCAL_MODEL_TARGET,
     provenance: Provenance | None = None,
+    as_of: str | None = None,
 ) -> dict[str, Any]:
     exact_matches = exact_lookup_v1(
         conn,
@@ -791,7 +798,7 @@ def search_v1(
         delivery_target=delivery_target,
         limit=min(limit, EXACT_MATCH_LIMIT),
     )
-    if exact_matches or _looks_like_exact_locator(query):
+    if as_of is None and (exact_matches or _looks_like_exact_locator(query)):
         payload = {
             "schema_version": "ocbrain.search.v1",
             "delivery_target": delivery_target,
@@ -835,6 +842,7 @@ def search_v1(
         limit=limit,
         cross_scope=cross_scope,
         delivery_target=delivery_target,
+        as_of=as_of,
     )
     payload = {
         "schema_version": "ocbrain.search.v1",

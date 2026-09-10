@@ -383,7 +383,14 @@ def test_retired_belief_leaves_the_search_index_and_stops_being_served(tmp_path:
         context=ScopeContext(project="bountiful"),
         limit=5,
     )
-    assert [item["belief_id"] for item in before["items"]] == [target]
+    assert before["items"] == []
+    assert before["expired_excluded"] == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM search_documents WHERE doc_id=?", (target,)
+        ).fetchone()[0]
+        == 1
+    )
 
     apply_retirements(conn, plan_retirements(conn, classes=("expired",), now=NOW))
     after = search_core_v1(

@@ -122,6 +122,11 @@ class RetrievalConfig:
     feedback_weight: float = 0.125
     feedback_clamp: float = 0.25
     feedback_prior_observations: float = 3.0
+    # Recency weighting, split by lifecycle. `current` beliefs decay on a
+    # half-life; everything else keeps the flat 365-day curve and a 1% weight.
+    current_recency_half_life_days: float = 30.0
+    current_recency_weight: float = 0.35
+    durable_recency_weight: float = 0.01
 
 
 @dataclass(frozen=True)

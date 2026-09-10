@@ -1225,6 +1225,7 @@ def call_tool_v1(
             limit=limit,
             cross_scope=bool_arg(arguments, "cross_scope"),
             delivery_target=delivery_target,
+            as_of=optional_string(arguments, "as_of"),
         )
         packet, handles = prepare_retrieval_packet_v1(packet, handles)
         retrieval_id = record_context_v1(
@@ -1271,6 +1272,7 @@ def call_tool_v1(
             cross_scope=bool_arg(arguments, "cross_scope"),
             delivery_target=delivery_target,
             provenance=provenance,
+            as_of=optional_string(arguments, "as_of"),
         )
         conn.commit()
         return text_result(payload)
@@ -1649,6 +1651,14 @@ def tool_list(
                             "mode left to widen. Accepted so existing callers keep working."
                         ),
                     },
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 timestamp. Answer from the beliefs that were valid "
+                            "at that moment, including ones since retired. Omit for the "
+                            "current view."
+                        ),
+                    },
                     "at_ts": {"type": "string"},
                 },
                 "required": ["query"],
@@ -1722,6 +1732,14 @@ def tool_list(
                             "Deprecated and ignored. Local retrieval ranks every scope "
                             "by affinity instead of filtering, so there is no narrower "
                             "mode left to widen. Accepted so existing callers keep working."
+                        ),
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 timestamp. Answer from the beliefs that were valid "
+                            "at that moment, including ones since retired. Omit for the "
+                            "current view."
                         ),
                     },
                     "at_ts": {"type": "string"},
