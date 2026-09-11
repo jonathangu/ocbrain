@@ -2158,7 +2158,9 @@ def search_core_v1(
         scope_params = list(compatible)
     delivery_gate = _servable_knowledge_sql(delivery_target)
     if as_of is not None:
-        delivery_sql = f"{delivery_gate} AND {_era_sql(as_of)}"
+        delivery_sql = (
+            f"{delivery_gate} AND {_historical_lifecycle_sql()} AND {_era_sql(as_of)}"
+        )
     elif now is not None:
         delivery_sql = f"{delivery_gate} AND {_unexpired_sql(now)}"
     else:
@@ -3056,6 +3058,38 @@ def _unexpired_sql(now: str) -> str:
         "(json_extract(cb.attributes_json, '$.valid_until') IS NULL "
         f"OR json_extract(cb.attributes_json, '$.valid_until') >= '{now}')"
     )
+
+
+def _historical_lifecycle_sql() -> str:
+    """History is not a route around forget or hard-correction restrictions.
+
+    Only current beliefs and retired beliefs with a bounded recorded era are
+    eligible. Terminal events stay authoritative even after later projection
+    events change the row's status, and apply before every ranking/count arm.
+    """
+    return """
+        (cb.status='current' AND cb.serve=1 OR
+         cb.status='retracted' AND json_extract(cb.attributes_json, '$.valid_until') IS NOT NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM brain_events terminal
+            WHERE (
+                terminal.kind='tombstone_recorded'
+                AND json_extract(terminal.body_json, '$.target') IN (
+                    SELECT cb.belief_id UNION ALL
+                    SELECT alias_id FROM object_aliases WHERE canonical_id=cb.belief_id
+                )
+            ) OR (
+                terminal.kind='correction_recorded'
+                AND json_extract(terminal.body_json, '$.target_layer') IN ('belief', 'knowledge')
+                AND json_extract(terminal.body_json, '$.target_id') IN (
+                    SELECT cb.belief_id UNION ALL
+                    SELECT alias_id FROM object_aliases WHERE canonical_id=cb.belief_id
+                )
+                AND json_extract(terminal.body_json, '$.hard')=1
+                AND json_extract(terminal.body_json, '$.op') IN ('mark_wrong', 'retract', 'demote')
+            )
+        )
+    """
 
 
 def _era_sql(as_of: str) -> str:
