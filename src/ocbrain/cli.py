@@ -114,6 +114,7 @@ from ocbrain.mcp_v1 import (
     record_context_v1,
     search_v1,
 )
+from ocbrain.retrieval_eval import build_golden, compare, evaluate
 from ocbrain.retrieve import retrieve
 from ocbrain.scope import (
     DEFAULT_GLOBAL_SCOPE_ID,
@@ -727,6 +728,31 @@ def build_parser() -> argparse.ArgumentParser:
     ledger.add_argument("--task-ref", help="One task's full attempt chain, ignoring scope")
     ledger.add_argument("--limit", type=int, default=25)
     ledger.set_defaults(func=cmd_ledger)
+    retrieval_eval = commands.add_parser(
+        "retrieval-eval",
+        help="Freeze judged retrievals into a golden file and re-run today's ranker",
+    )
+    retrieval_eval_commands = retrieval_eval.add_subparsers(dest="retrieval_eval_command")
+    retrieval_eval_build = retrieval_eval_commands.add_parser(
+        "build", help="Freeze judged retrievals into a golden file"
+    )
+    retrieval_eval_build.add_argument("--out", type=Path, required=True)
+    retrieval_eval_build.add_argument("--since", help="only retrievals served at or after this ISO")
+    retrieval_eval_build.set_defaults(func=cmd_retrieval_eval_build)
+    retrieval_eval_run = retrieval_eval_commands.add_parser(
+        "run", help="Score the current ranker against a golden file"
+    )
+    retrieval_eval_run.add_argument("--golden", type=Path, required=True)
+    retrieval_eval_run.add_argument("--out", type=Path, help="also write the report here")
+    retrieval_eval_run.add_argument("--k", type=int, default=12)
+    retrieval_eval_run.set_defaults(func=cmd_retrieval_eval_run)
+    retrieval_eval_compare = retrieval_eval_commands.add_parser(
+        "compare", help="Report per-metric deltas between two evaluation reports"
+    )
+    retrieval_eval_compare.add_argument("baseline", type=Path)
+    retrieval_eval_compare.add_argument("candidate", type=Path)
+    retrieval_eval_compare.set_defaults(func=cmd_retrieval_eval_compare)
+    retrieval_eval.set_defaults(func=cmd_retrieval_eval_usage)
     mcp_parser = commands.add_parser("mcp", help="Run the core stdio MCP server")
     mcp_parser.add_argument("--profile", choices=["runtime", "admin"], default="runtime")
     mcp_parser.add_argument(
@@ -3566,6 +3592,34 @@ def cmd_ledger(args: argparse.Namespace) -> int:
             limit=args.limit,
         ),
     )
+    return 0
+
+
+def cmd_retrieval_eval_usage(args: argparse.Namespace) -> int:
+    print("retrieval-eval requires one of: build, run, compare", file=sys.stderr)
+    return 2
+
+
+def cmd_retrieval_eval_build(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    output(args, build_golden(conn, since=args.since, out_path=args.out))
+    return 0
+
+
+def cmd_retrieval_eval_run(args: argparse.Namespace) -> int:
+    conn = open_db(args)
+    golden = json.loads(args.golden.read_text())
+    report = evaluate(conn, golden, k=args.k)
+    if args.out:
+        args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    output(args, report)
+    return 0
+
+
+def cmd_retrieval_eval_compare(args: argparse.Namespace) -> int:
+    baseline = json.loads(args.baseline.read_text())
+    candidate = json.loads(args.candidate.read_text())
+    output(args, compare(baseline, candidate))
     return 0
 
 

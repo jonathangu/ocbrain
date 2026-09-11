@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from ocbrain.core_v1 import (
+    KEYWORD_QUERY_HINT,
     _retrieval_feedback_scores,
     append_core_event,
     get_core_v1_belief,
@@ -17,17 +20,25 @@ from ocbrain.curation import apply_curated_manifest
 from ocbrain.db import connect
 from ocbrain.hybrid import (
     DEFAULT_EMBED_DOCUMENT_BYTES,
+    LocalEmbeddingUnavailable,
     _bounded_embedding_text,
+    _corpus_fingerprint,
     _document_text,
+    _serving_rows,
     build_vector_index,
+    embed_missing_beliefs,
+    semantic_neighbors,
+    vector_db_path,
     vector_status,
 )
 from ocbrain.mcp import handle_request
 from ocbrain.mcp_v1 import (
     build_context_v1,
     decide_proposal_v1,
+    finish_vector_refresh,
     prepare_retrieval_packet_v1,
     search_v1,
+    supersede_v1,
 )
 from ocbrain.scope import ScopeContext, ScopeTag
 
@@ -126,38 +137,58 @@ def test_vector_build_cleans_temporary_sidecar_when_interrupted(
     assert not list(tmp_path.glob(".core-vectors.sqlite.*.tmp"))
 
 
-def test_hybrid_dense_recall_and_stale_sidecar_fallback(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "core.sqlite"
-    conn = connect(path)
-    init_core_v1(conn)
-    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Meyer lemons are ready.")
-    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
-    conn.commit()
-
-    embedded_texts = []
-
-    def fake_embed(texts, **_kwargs):
-        embedded_texts.extend(texts)
-        result = []
-        for text in texts:
-            lowered = text.lower()
-            if "citrus" in lowered or "lemon" in lowered:
-                result.append([1.0, 0.0])
-            else:
-                result.append([0.0, 1.0])
-        return result
-
+def _local_dense_arm(monkeypatch) -> list[str]:
     monkeypatch.setenv("OCBRAIN_EMBED_MODEL", "test-local")
     monkeypatch.setenv("OCBRAIN_EMBED_DIMENSIONS", "2")
-    monkeypatch.setattr("ocbrain.hybrid.embed_texts", fake_embed)
+    monkeypatch.setattr(
+        "ocbrain.hybrid.embed_texts",
+        lambda texts, **_kwargs: [
+            [1.0, 0.0]
+            if "citrus" in str(text).lower() or "lemon" in str(text).lower()
+            else [0.0, 1.0]
+            for text in texts
+        ],
+    )
     installed_digest = ["sha256:test-model-v1"]
     monkeypatch.setattr(
         "ocbrain.hybrid._ollama_model_metadata",
         lambda *_args, **_kwargs: {"digest": installed_digest[0]},
     )
+    return installed_digest
+
+
+def _search(conn, query: str, *, limit: int = 2) -> dict:
+    return search_core_v1(
+        conn,
+        query,
+        context=ScopeContext(project="bountiful"),
+        limit=limit,
+        delivery_target="hosted_model",
+    )
+
+
+def test_stale_fingerprint_with_high_coverage_still_serves_dense(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A corpus that moved on must not switch the dense arm off.
+
+    The sidecar rebuilds hourly and the corpus changes every few minutes, so a
+    whole-corpus fingerprint mismatch was the normal state, not the exception:
+    ranking refused and every retrieval ran lexical-only. What the ranker needs
+    is the share of serving beliefs it can still answer for.
+    """
+    path = tmp_path / "core.sqlite"
+    conn = connect(path)
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+
+    installed_digest = _local_dense_arm(monkeypatch)
     built = build_vector_index(path, model="test-local")
-    assert built["rows"] == 2
-    assert built["embedded_rows"] == 2
+    assert built["rows"] == 3
+    assert built["embedded_rows"] == 3
     assert built["reused_rows"] == 0
     assert vector_status(path)["healthy"] is True
 
@@ -173,60 +204,203 @@ def test_hybrid_dense_recall_and_stale_sidecar_fallback(tmp_path: Path, monkeypa
     assert after_ledger_only_event["corpus_fresh"] is True
     assert after_ledger_only_event["healthy"] is True
 
-    result = search_core_v1(
-        conn,
-        "citrus harvest",
-        context=ScopeContext(project="bountiful"),
-        limit=2,
-        delivery_target="hosted_model",
-    )
+    result = _search(conn, "citrus harvest")
     assert result["ranking"]["mode"] == "hybrid_rrf"
     assert result["items"][0]["belief_id"] == "curated:bountiful:citrus"
+    assert result["ranking"]["dense_coverage"] == 1.0
+    assert result["ranking"]["dense_stale_rows"] == 0
 
     monkeypatch.setenv("OCBRAIN_EMBED_DIMENSIONS", "1")
-    dimension_drift = search_core_v1(
-        conn,
-        "citrus harvest",
-        context=ScopeContext(project="bountiful"),
-        limit=2,
-        delivery_target="hosted_model",
-    )
-    assert dimension_drift["ranking"]["mode"] == "lexical"
-    assert dimension_drift["ranking"]["dense_fallback"] == "vector_dimension_config_mismatch"
+    dimension_drift = _search(conn, "citrus harvest")
+    assert dimension_drift["ranking"]["mode"] == "hybrid_rrf"
+    assert dimension_drift["ranking"]["dense_fallback"] is None
+    dimension_status = vector_status(path)
+    assert dimension_status["configured_dimensions_differ"] is True
+    assert dimension_status["healthy"] is True
     monkeypatch.setenv("OCBRAIN_EMBED_DIMENSIONS", "2")
 
     installed_digest[0] = "sha256:test-model-v2"
-    digest_drift = search_core_v1(
-        conn,
-        "citrus harvest",
-        context=ScopeContext(project="bountiful"),
-        limit=2,
-        delivery_target="hosted_model",
-    )
+    digest_drift = _search(conn, "citrus harvest")
     assert digest_drift["ranking"]["mode"] == "lexical"
     assert digest_drift["ranking"]["dense_fallback"] == "vector_model_digest_mismatch"
     installed_digest[0] = "sha256:test-model-v1"
 
-    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
-    conn.commit()
-    stale = search_core_v1(
-        conn,
-        "pears",
-        context=ScopeContext(project="bountiful"),
-        limit=2,
-        delivery_target="hosted_model",
+    conn.execute(
+        "UPDATE current_beliefs SET body=? WHERE belief_id=?",
+        ("Tomatoes are ripe.", "curated:bountiful:tomato"),
     )
-    assert stale["ranking"]["mode"] == "lexical"
-    assert stale["ranking"]["dense_fallback"] == "vector_sidecar_stale"
-    assert stale["items"][0]["belief_id"] == "curated:bountiful:pear"
+    conn.commit()
+    drifted = _search(conn, "citrus harvest")
+    assert drifted["ranking"]["mode"] == "hybrid_rrf"
+    assert drifted["ranking"]["dense_fallback"] is None
+    assert drifted["ranking"]["dense_serving_rows"] == 3
+    assert drifted["ranking"]["dense_usable_rows"] == 2
+    assert drifted["ranking"]["dense_stale_rows"] == 1
+    assert drifted["ranking"]["dense_coverage"] == pytest.approx(2 / 3)
+    assert drifted["items"][0]["belief_id"] == "curated:bountiful:citrus"
 
-    embedded_before = len(embedded_texts)
     rebuilt = build_vector_index(path, model="test-local")
     assert rebuilt["rows"] == 3
     assert rebuilt["embedded_rows"] == 1
     assert rebuilt["reused_rows"] == 2
-    assert len(embedded_texts) == embedded_before + 1
     assert vector_status(path)["healthy"] is True
+
+
+def test_sparse_sidecar_falls_back_with_a_typed_reason(tmp_path: Path, monkeypatch) -> None:
+    """Below the coverage floor the dense arm stands down and says why.
+
+    Answering from a remnant of the corpus is worse than answering lexically:
+    the nearest neighbour of a belief the sidecar never saw is whatever it did
+    see, and that is a confident wrong answer rather than a missing one.
+    """
+    path = tmp_path / "core.sqlite"
+    conn = connect(path)
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+    _local_dense_arm(monkeypatch)
+    build_vector_index(path, model="test-local")
+
+    conn.execute(
+        "UPDATE current_beliefs SET body='Tomatoes are ripe.' "
+        "WHERE belief_id='curated:bountiful:tomato'"
+    )
+    conn.execute(
+        "UPDATE current_beliefs SET body='Pears are ripe.' "
+        "WHERE belief_id='curated:bountiful:pear'"
+    )
+    conn.commit()
+
+    sparse = _search(conn, "citrus harvest")
+    assert sparse["ranking"]["mode"] == "lexical"
+    assert sparse["ranking"]["dense_fallback"] == "vector_sidecar_sparse"
+    assert sparse["ranking"]["dense_serving_rows"] == 3
+    assert sparse["ranking"]["dense_usable_rows"] == 1
+    assert sparse["ranking"]["dense_stale_rows"] == 2
+    assert sparse["ranking"]["dense_coverage"] == pytest.approx(1 / 3)
+
+
+def test_embed_missing_beliefs_fills_the_gap_and_updates_meta(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "core.sqlite"
+    conn = connect(path)
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    conn.commit()
+    _local_dense_arm(monkeypatch)
+    build_vector_index(path, model="test-local")
+
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE", "0")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+    monkeypatch.delenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE")
+    assert vector_status(path)["coverage"]["dense_stale_rows"] == 1
+
+    refresh = embed_missing_beliefs(conn)
+    assert refresh == {"embedded": 1, "remaining": 0, "skipped_reason": None}
+
+    sidecar = sqlite3.connect(vector_db_path(path))
+    sidecar.row_factory = sqlite3.Row
+    try:
+        stored = sidecar.execute(
+            "SELECT content_hash FROM belief_vectors WHERE belief_id=?",
+            ("curated:bountiful:pear",),
+        ).fetchone()
+        meta = {str(row[0]): str(row[1]) for row in sidecar.execute("SELECT key, value FROM meta")}
+    finally:
+        sidecar.close()
+    assert stored is not None
+    assert str(stored["content_hash"]) == hashlib.sha256(b"Pears are ready.").hexdigest()
+    assert meta["corpus_sha256"] == _corpus_fingerprint(_serving_rows(conn))
+    assert meta["corpus_rows"] == "3"
+    assert meta["rows"] == "3"
+    status = vector_status(path)
+    assert status["coverage"]["dense_coverage"] == 1.0
+    assert status["healthy"] is True
+
+
+def test_embed_missing_beliefs_never_raises_when_ollama_is_down(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "core.sqlite"
+    conn = connect(path)
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    conn.commit()
+    _local_dense_arm(monkeypatch)
+    build_vector_index(path, model="test-local")
+
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE", "0")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+    monkeypatch.delenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE")
+
+    def down(*_args, **_kwargs):
+        raise LocalEmbeddingUnavailable("ollama is down")
+
+    monkeypatch.setattr("ocbrain.hybrid.embed_texts", down)
+    refresh = embed_missing_beliefs(conn)
+    assert refresh["embedded"] == 0
+    assert refresh["skipped_reason"] == "local_embedding_unavailable:LocalEmbeddingUnavailable"
+    assert vector_status(path)["coverage"]["dense_stale_rows"] == 1
+
+
+def test_supersede_v1_reports_vector_refresh(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    target = "curated:bountiful:citrus"
+    _seed_belief(conn, belief_id=target, body="Citrus lemons are ready.")
+    conn.commit()
+    marker = {"embedded": 7, "remaining": 0, "skipped_reason": None}
+    monkeypatch.setattr("ocbrain.mcp_v1.embed_missing_beliefs", lambda *_args, **_kwargs: marker)
+
+    payload = supersede_v1(
+        conn,
+        target=target,
+        body="Citrus lemons are ready for pickup.",
+        reason="the pickup detail was missing",
+        context=ScopeContext(project="bountiful"),
+        actor="agent:test",
+    )
+    assert payload["vector_refresh"]["skipped_reason"] == "deferred_until_commit"
+    assert conn.in_transaction
+    conn.commit()
+    assert finish_vector_refresh(conn, payload)["vector_refresh"] == marker
+
+
+def test_vector_refresh_runs_once_after_the_dispatcher_commits(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    target = "curated:bountiful:citrus"
+    _seed_belief(conn, belief_id=target, body="Citrus lemons are ready.")
+    conn.commit()
+    seen: list[bool] = []
+
+    def fake_embed(active_conn, **_kwargs):
+        seen.append(active_conn.in_transaction)
+        return {"embedded": 1, "remaining": 0, "skipped_reason": None}
+
+    monkeypatch.setattr("ocbrain.mcp_v1.embed_missing_beliefs", fake_embed)
+    monkeypatch.setattr("ocbrain.mcp.connect", lambda *_args, **_kwargs: conn, raising=False)
+    payload = supersede_v1(
+        conn,
+        target=target,
+        body="Citrus lemons are ready for pickup.",
+        reason="the pickup detail was missing",
+        context=ScopeContext(project="bountiful"),
+        actor="agent:test",
+    )
+    assert seen == []
+    conn.commit()
+    finished = finish_vector_refresh(conn, payload)
+    assert seen == [False]
+    assert finished["vector_refresh"]["embedded"] == 1
+    assert finish_vector_refresh(conn, finished)["vector_refresh"]["embedded"] == 1
+    assert seen == [False]
 
 
 def test_irrelevant_fresh_dense_candidate_cannot_outrank_exact_lexical_match(
@@ -252,6 +426,7 @@ def test_irrelevant_fresh_dense_candidate_cannot_outrank_exact_lexical_match(
                 {"belief_id": relevant, "similarity": 1.0},
             ],
             None,
+            {},
         ),
     )
     result = search_core_v1(
@@ -296,6 +471,7 @@ def test_hybrid_relevance_gate_returns_empty_instead_of_same_scope_filler(
                 for belief_id in sorted(candidate_ids or [])
             ],
             None,
+            {},
         ),
     )
 
@@ -335,7 +511,7 @@ def test_hybrid_relevance_gate_keeps_strong_dense_only_recall(tmp_path: Path, mo
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([{"belief_id": relevant, "similarity": 0.72}], None),
+        lambda *_args, **_kwargs: ([{"belief_id": relevant, "similarity": 0.72}], None, {}),
     )
 
     result = search_core_v1(
@@ -367,6 +543,7 @@ def test_hybrid_dense_only_floor_includes_boundary_and_rejects_below(
                 {"belief_id": boundary, "similarity": 0.55},
             ],
             None,
+            {},
         ),
     )
 
@@ -405,7 +582,7 @@ def test_multi_term_lexical_query_drops_single_generic_token_filler(
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], "test_lexical_only"),
+        lambda *_args, **_kwargs: ([], "test_lexical_only", {}),
     )
 
     result = search_core_v1(
@@ -442,7 +619,7 @@ def test_multi_term_lexical_query_preserves_distinctive_single_term_coverage(
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], "test_lexical_only"),
+        lambda *_args, **_kwargs: ([], "test_lexical_only", {}),
     )
 
     result = search_core_v1(
@@ -990,6 +1167,7 @@ def test_lexical_hit_below_dense_floor_is_rejected(tmp_path: Path, monkeypatch) 
                 for belief_id in sorted(candidate_ids or [])
             ],
             None,
+            {},
         ),
     )
 
@@ -1016,7 +1194,7 @@ def test_lexical_hit_below_dense_floor_survives_exact_locator(
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([{"belief_id": target, "similarity": 0.01}], None),
+        lambda *_args, **_kwargs: ([{"belief_id": target, "similarity": 0.01}], None, {}),
     )
 
     result = search_core_v1(
@@ -1043,7 +1221,7 @@ def test_lexical_hit_kept_when_dense_arm_is_unavailable(tmp_path: Path, monkeypa
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], "vector_sidecar_missing"),
+        lambda *_args, **_kwargs: ([], "vector_sidecar_missing", {}),
     )
 
     result = search_core_v1(
@@ -1095,6 +1273,7 @@ def test_degraded_mode_drops_procedures_but_keeps_gotchas(
                 {"belief_id": "gotcha:bountiful:release", "similarity": 0.90},
             ],
             None,
+            {},
         ),
     )
     healthy = search_core_v1(conn, query, context=context, limit=10)
@@ -1106,7 +1285,7 @@ def test_degraded_mode_drops_procedures_but_keeps_gotchas(
 
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], "vector_sidecar_missing"),
+        lambda *_args, **_kwargs: ([], "vector_sidecar_missing", {}),
     )
     degraded = search_core_v1(conn, query, context=context, limit=10)
 
@@ -1131,7 +1310,7 @@ def test_uncorroborated_multi_term_query_drops_every_lexical_row(
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], None),
+        lambda *_args, **_kwargs: ([], None, {}),
     )
 
     result = search_core_v1(
@@ -1155,7 +1334,7 @@ def test_retrieval_thresholds_honor_env_overrides(tmp_path: Path, monkeypatch) -
     conn.commit()
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([{"belief_id": target, "similarity": 0.40}], None),
+        lambda *_args, **_kwargs: ([{"belief_id": target, "similarity": 0.40}], None, {}),
     )
     probe = "otherwise unmatched semantic probe"
     context = ScopeContext(project="bountiful")
@@ -1191,6 +1370,7 @@ def test_retrieval_feedback_can_reorder_results(tmp_path: Path, monkeypatch) -> 
                 {"belief_id": liked, "similarity": 0.70},
             ],
             None,
+            {},
         ),
     )
     probe = "meyer lemons ripen winter"
@@ -1244,6 +1424,7 @@ def test_deduplicated_candidates_counts_only_duplicates(tmp_path: Path, monkeypa
                 for belief_id in sorted(candidate_ids or [])
             ],
             None,
+            {},
         ),
     )
 
@@ -1278,16 +1459,520 @@ def test_uncorroborated_lexical_rows_survive_when_dense_arm_is_down(
 
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], None),
+        lambda *_args, **_kwargs: ([], None, {}),
     )
     healthy = search_core_v1(conn, probe, context=context, limit=10, delivery_target="hosted_model")
     assert healthy["items"] == []
 
     monkeypatch.setattr(
         "ocbrain.core_v1.semantic_neighbors",
-        lambda *_args, **_kwargs: ([], "vector_sidecar_missing"),
+        lambda *_args, **_kwargs: ([], "vector_sidecar_missing", {}),
     )
     degraded = search_core_v1(
         conn, probe, context=context, limit=10, delivery_target="hosted_model"
     )
     assert [item["belief_id"] for item in degraded["items"]] == [target]
+
+
+def _rerank_fixture(conn, monkeypatch) -> list[str]:
+    ids = [f"curated:bountiful:rerank-{index}" for index in range(5)]
+    for index, belief_id in enumerate(ids):
+        _seed_belief(conn, belief_id=belief_id, body=f"Rerank candidate number {index}.")
+    conn.commit()
+    similarities = {belief_id: 0.90 - 0.02 * index for index, belief_id in enumerate(ids)}
+    monkeypatch.setattr(
+        "ocbrain.core_v1.semantic_neighbors",
+        lambda *_args, candidate_ids=None, **_kwargs: (
+            [
+                {"belief_id": belief_id, "similarity": similarity}
+                for belief_id, similarity in similarities.items()
+            ],
+            None,
+            {},
+        ),
+    )
+    return ids
+
+
+def test_rerank_stage_promotes_a_low_ranked_candidate_into_the_packet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    ids = _rerank_fixture(conn, monkeypatch)
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
+    monkeypatch.setenv("OCBRAIN_RERANK_ENABLED", "true")
+
+    class _Scorer:
+        def score(self, query: str, documents: list[str]) -> list[float]:
+            return [10.0 if "number 4" in document else 0.0 for document in documents]
+
+    monkeypatch.setattr("ocbrain.rerank.get_scorer", lambda _config: _Scorer())
+
+    result = search_core_v1(
+        conn,
+        "unmatched semantic probe",
+        context=ScopeContext(project="bountiful"),
+        limit=3,
+        delivery_target="hosted_model",
+    )
+
+    assert result["ranking"]["rerank"]["mode"] == "applied"
+    assert result["ranking"]["rerank"]["candidates"] == 5
+    served = [item["belief_id"] for item in result["items"]]
+    assert served == [ids[4], ids[0], ids[1]]
+    assert result["items"][0]["ranking"]["pre_rerank_rank"] == 5
+    assert result["items"][0]["ranking"]["rerank_score"] == 10.0
+
+
+def test_rerank_stage_off_by_default_changes_nothing(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    ids = _rerank_fixture(conn, monkeypatch)
+    monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
+    monkeypatch.delenv("OCBRAIN_RERANK_ENABLED", raising=False)
+
+    result = search_core_v1(
+        conn,
+        "unmatched semantic probe",
+        context=ScopeContext(project="bountiful"),
+        limit=3,
+        delivery_target="hosted_model",
+    )
+
+    assert result["ranking"]["rerank"] == {"mode": "off"}
+    assert [item["belief_id"] for item in result["items"]] == ids[:3]
+    assert all("rerank_score" not in item["ranking"] for item in result["items"])
+
+
+ASA2_VOCABULARY = {"asa2": ["asa2", "applied-science-analytics-2"]}
+
+
+def _entity_vocabulary(monkeypatch) -> None:
+    monkeypatch.setenv("OCBRAIN_ENTITIES_VOCABULARY", json.dumps(ASA2_VOCABULARY))
+
+
+def _mention_entities(conn, belief_id: str) -> set[str]:
+    return {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT entity FROM entity_mentions WHERE belief_id=?", (belief_id,)
+        )
+    }
+
+
+def test_a_query_entity_with_enough_corpus_filters_the_candidate_pool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A query naming one thing must not serve beliefs about another.
+
+    Five asa2 beliefs and three slt beliefs all say "cadence"; the entity is the
+    only thing that separates them.
+    """
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    asa2_ids = [f"curated:bountiful:asa2-{index}" for index in range(5)]
+    slt_ids = [f"curated:bountiful:slt-{index}" for index in range(3)]
+    for index, belief_id in enumerate(asa2_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The asa2 headroom leg cadence is weekly ({index}).",
+        )
+    for index, belief_id in enumerate(slt_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The slt retrain cadence is quarterly ({index}).",
+        )
+    conn.commit()
+
+    result = search_core_v1(
+        conn,
+        "asa2 headroom leg cadence",
+        context=ScopeContext(project="bountiful"),
+        limit=8,
+        delivery_target="hosted_model",
+    )
+    assert result["ranking"]["entities"] == {
+        "query": ["asa2"],
+        "mode": "filter",
+        "candidates": 5,
+    }
+    assert {item["belief_id"] for item in result["items"]} == set(asa2_ids)
+
+
+def test_a_query_entity_with_a_thin_corpus_boosts_instead_of_filtering(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two mentions is not enough evidence to hide the beliefs that answer
+    without repeating the entity name."""
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    asa2_ids = ["curated:bountiful:asa2-a", "curated:bountiful:asa2-b"]
+    for index, belief_id in enumerate(asa2_ids):
+        _seed_belief(
+            conn,
+            belief_id=belief_id,
+            body=f"The asa2 headroom leg cadence is weekly ({index}).",
+        )
+    for index in range(3):
+        _seed_belief(
+            conn,
+            belief_id=f"curated:bountiful:slt-{index}",
+            body=f"The slt retrain cadence is quarterly ({index}).",
+        )
+    conn.commit()
+
+    result = search_core_v1(
+        conn,
+        "asa2 headroom leg cadence",
+        context=ScopeContext(project="bountiful"),
+        limit=8,
+        delivery_target="hosted_model",
+    )
+    assert result["ranking"]["entities"]["mode"] == "boost"
+    assert {item["belief_id"] for item in result["items"][:2]} == set(asa2_ids)
+    assert result["items"][0]["ranking"]["entity_boost"] > 0
+    assert result["items"][0]["ranking"]["matched_entities"] >= 1
+
+
+def test_query_shape_and_the_keyword_hint_reach_the_caller(tmp_path: Path, monkeypatch) -> None:
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_belief(
+        conn, belief_id="curated:bountiful:cadence", body="The asa2 cadence is weekly."
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+
+    question = search_core_v1(
+        conn, "What is the asa2 cadence?", context=context, limit=3, delivery_target="hosted_model"
+    )
+    assert question["ranking"]["query_shape"] == "question"
+    assert question["ranking"]["hint"] is None
+
+    keywords = search_core_v1(
+        conn,
+        "cadence retrain notes",
+        context=context,
+        limit=3,
+        delivery_target="hosted_model",
+    )
+    assert keywords["ranking"]["query_shape"] == "keywords"
+    assert keywords["ranking"]["hint"] == KEYWORD_QUERY_HINT
+
+    packet, _handles = build_context_v1(
+        conn,
+        "cadence retrain notes",
+        context=context,
+        limit=3,
+        delivery_target="hosted_model",
+    )
+    assert packet["coverage"]["ranking"]["query_shape"] == "keywords"
+    assert packet["coverage"]["ranking"]["hint"] == KEYWORD_QUERY_HINT
+
+
+def test_reprojection_rewrites_entity_mentions_when_a_body_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _entity_vocabulary(monkeypatch)
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    belief_id = "curated:bountiful:constraint"
+    _seed_belief(conn, belief_id=belief_id, body="The asa2 headroom leg is the constraint.")
+    conn.commit()
+    assert _mention_entities(conn, belief_id) == {"asa2"}
+
+    _seed_belief(conn, belief_id=belief_id, body="The slt retrain cadence is quarterly.")
+    conn.commit()
+    assert _mention_entities(conn, belief_id) == set()
+
+
+def _seed_recency_pair(conn, *, lifecycle: str, prefix: str) -> tuple[str, str]:
+    old_id = f"curated:test:{prefix}-old"
+    new_id = f"curated:test:{prefix}-new"
+    attributes = {"source_quality": 0.95, "lifecycle": lifecycle}
+    _seed_belief(
+        conn,
+        belief_id=old_id,
+        body=f"citrus grove note {prefix} record one",
+        attributes=attributes,
+    )
+    _seed_belief(
+        conn,
+        belief_id=new_id,
+        body=f"citrus grove note {prefix} record two",
+        attributes=attributes,
+    )
+    compiled = (datetime.now(UTC) - timedelta(days=90)).isoformat(timespec="microseconds")
+    conn.execute(
+        "UPDATE current_beliefs SET last_compiled_at=?, pinned=1 WHERE belief_id=?",
+        (compiled, old_id),
+    )
+    conn.commit()
+    return old_id, new_id
+
+
+def test_current_lifecycle_recency_lifts_the_newer_belief(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id, new_id = _seed_recency_pair(conn, lifecycle="current", prefix="current")
+    packet = search_core_v1(
+        conn,
+        "citrus grove note",
+        context=ScopeContext(project="bountiful"),
+        limit=5,
+    )
+    items = [item for item in packet["items"] if item["belief_id"] in {old_id, new_id}]
+    assert [item["belief_id"] for item in items] == [new_id, old_id]
+    assert items[0]["ranking"]["recency_model"] == "current"
+    assert items[0]["ranking"]["recency_half_life_days"] == 30.0
+
+
+def test_durable_recency_does_not_reorder_the_pair(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id, new_id = _seed_recency_pair(conn, lifecycle="durable", prefix="durable")
+    packet = search_core_v1(
+        conn,
+        "citrus grove note",
+        context=ScopeContext(project="bountiful"),
+        limit=5,
+    )
+    items = [item for item in packet["items"] if item["belief_id"] in {old_id, new_id}]
+    assert [item["belief_id"] for item in items] == [old_id, new_id]
+    assert items[0]["ranking"]["recency_model"] == "durable"
+    assert items[0]["ranking"]["recency_half_life_days"] == 365.0
+
+
+def test_expired_belief_is_excluded_at_read_time_and_counted(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    target = "curated:test:expired-window"
+    _seed_belief(
+        conn,
+        belief_id=target,
+        body="Quince paste sets hardest when the fruit is barely ripe.",
+        attributes={
+            "source_quality": 0.95,
+            "valid_from": "2019-01-01T00:00:00+00:00",
+            "valid_until": "2020-01-01T00:00:00+00:00",
+        },
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+    query = "quince paste sets hardest"
+
+    current_view = search_core_v1(conn, query, context=context, limit=5)
+    assert current_view["items"] == []
+    assert current_view["expired_excluded"] == 1
+
+    past_view = search_core_v1(
+        conn, query, context=context, limit=5, as_of="2019-06-01T00:00:00+00:00"
+    )
+    assert [item["belief_id"] for item in past_view["items"]] == [target]
+    assert past_view["items"][0]["era"] == {
+        "valid_from": "2019-01-01T00:00:00+00:00",
+        "valid_until": "2020-01-01T00:00:00+00:00",
+    }
+
+
+def test_as_of_serves_the_belief_that_was_current_then(tmp_path: Path) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    old_id = "curated:test:quay-old"
+    new_id = "curated:test:quay-new"
+    _seed_belief(
+        conn,
+        belief_id=old_id,
+        body="The quay gate closes at dusk in winter.",
+        attributes={"source_quality": 0.95, "valid_from": "2020-01-01T00:00:00+00:00"},
+    )
+    _seed_belief(
+        conn,
+        belief_id=new_id,
+        body="The quay gate closes at dawn in winter.",
+        attributes={"source_quality": 0.95, "valid_from": "2026-01-01T00:00:00+00:00"},
+    )
+    append_core_event(
+        conn,
+        "correction_recorded",
+        {
+            "target_layer": "belief",
+            "target_id": old_id,
+            "op": "supersede",
+            "successor_id": new_id,
+            "author": "test",
+        },
+        writer="test",
+        project=True,
+    )
+    conn.commit()
+    context = ScopeContext(project="bountiful")
+    query = "quay gate closes winter"
+
+    current_view = search_core_v1(conn, query, context=context, limit=5)
+    assert [item["belief_id"] for item in current_view["items"]] == [new_id]
+
+    past_view = search_core_v1(
+        conn, query, context=context, limit=5, as_of="2025-06-01T00:00:00+00:00"
+    )
+    assert [item["belief_id"] for item in past_view["items"]] == [old_id]
+    assert past_view["items"][0]["status"] == "retracted"
+    assert past_view["items"][0]["era"]["valid_until"] is not None
+    assert past_view["retired_included"] >= 1
+
+
+def _seed_dense_pair(conn, tmp_path: Path, monkeypatch) -> Path:
+    path = tmp_path / "core.sqlite"
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    conn.commit()
+    _local_dense_arm(monkeypatch)
+    build_vector_index(path, model="test-local")
+    return path
+
+
+def test_sidecar_model_is_authoritative_over_the_configured_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    path = _seed_dense_pair(conn, tmp_path, monkeypatch)
+    build_vector_index(path, model="model-a")
+
+    monkeypatch.setenv("OCBRAIN_EMBED_MODEL", "model-b")
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert fallback is None
+    assert neighbors[0]["belief_id"] == "curated:bountiful:citrus"
+
+    status = vector_status(path)
+    assert status["sidecar_model"] == "model-a"
+    assert status["configured_model"] == "model-b"
+    assert status["model_matches_configured"] is False
+    assert status["identity_fresh"] is True
+    assert status["healthy"] is True
+
+
+def test_sidecar_model_ollama_does_not_know_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "ocbrain.hybrid._ollama_model_metadata", lambda *_a, **_k: {"digest": "unknown"}
+    )
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert neighbors == []
+    assert fallback == "vector_model_identity_unavailable"
+
+
+def test_sidecar_dimension_metadata_must_match_the_stored_blob(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    path = _seed_dense_pair(conn, tmp_path, monkeypatch)
+    sidecar = sqlite3.connect(vector_db_path(path))
+    try:
+        sidecar.execute("UPDATE meta SET value='3' WHERE key='dimensions'")
+        sidecar.commit()
+    finally:
+        sidecar.close()
+    neighbors, fallback, _stats = semantic_neighbors(conn, "citrus harvest")
+    assert neighbors == []
+    assert fallback == "vector_dimension_config_mismatch"
+
+
+def test_embed_missing_beliefs_uses_the_sidecar_model(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+    seen: list[str] = []
+
+    def _record(texts, *, model, **kwargs):
+        seen.append(model)
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("ocbrain.hybrid.embed_texts", _record)
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE", "0")
+    _seed_belief(conn, belief_id="curated:bountiful:pear", body="Pears are ready.")
+    conn.commit()
+    monkeypatch.delenv("OCBRAIN_RETRIEVAL_EMBED_ON_WRITE")
+    monkeypatch.setenv("OCBRAIN_EMBED_MODEL", "model-b")
+
+    refresh = embed_missing_beliefs(conn)
+    assert refresh["embedded"] == 1
+    assert seen == ["test-local"]
+
+
+def test_fusion_weights_follow_the_query_shape(tmp_path: Path, monkeypatch) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+
+    question = _search(conn, "What is the citrus harvest like?")
+    assert question["ranking"]["query_shape"] == "question"
+    assert question["ranking"]["fusion"] == {
+        "lexical_weight": pytest.approx(0.35),
+        "dense_weight": pytest.approx(0.65),
+        "reason": "question",
+    }
+
+    identifier = _search(conn, "belief_0123456789abcdef citrus")
+    assert identifier["ranking"]["fusion"]["reason"] == "identifiers"
+    assert identifier["ranking"]["fusion"]["lexical_weight"] == pytest.approx(0.65)
+
+    keywords = _search(conn, "citrus harvest")
+    assert keywords["ranking"]["query_shape"] == "keywords"
+    assert keywords["ranking"]["fusion"] == {
+        "lexical_weight": pytest.approx(0.65),
+        "dense_weight": pytest.approx(0.35),
+        "reason": "keywords",
+    }
+
+    question_with_identifier = _search(conn, "What changed in belief_0123456789abcdef?")
+    assert question_with_identifier["ranking"]["fusion"]["reason"] == "identifiers"
+
+
+def test_adaptive_fusion_off_reproduces_the_unweighted_fusion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_dense_pair(conn, tmp_path, monkeypatch)
+
+    monkeypatch.setenv("OCBRAIN_RETRIEVAL_ADAPTIVE_FUSION", "0")
+    result = _search(conn, "citrus harvest", limit=5)
+    assert result["ranking"]["fusion"] == {
+        "lexical_weight": 0.5,
+        "dense_weight": 0.5,
+        "reason": "disabled",
+    }
+    assert result["items"]
+    for item in result["items"]:
+        unweighted = item["ranking"]["lexical_component"] + item["ranking"]["dense_component"]
+        assert item["relevance"] == pytest.approx(unweighted)
+
+
+def test_fusion_reports_dense_unavailable_when_the_arm_is_down(
+    tmp_path: Path, monkeypatch
+) -> None:
+    conn = connect(tmp_path / "core.sqlite")
+    init_core_v1(conn)
+    _seed_belief(conn, belief_id="curated:bountiful:citrus", body="Citrus lemons are ready.")
+    _seed_belief(conn, belief_id="curated:bountiful:tomato", body="Tomatoes are available.")
+    conn.commit()
+
+    result = _search(conn, "What is the citrus harvest like?")
+    assert result["ranking"]["dense_fallback"] == "vector_sidecar_missing"
+    assert result["ranking"]["fusion"] == {
+        "lexical_weight": 0.5,
+        "dense_weight": 0.5,
+        "reason": "dense_unavailable",
+    }

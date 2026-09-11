@@ -75,6 +75,39 @@ def test_describe_config_attributes_every_value_to_its_layer(tmp_path: Path, mon
     )
 
 
+def test_entities_section_round_trips_its_vocabulary_from_file_and_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The vocabulary is operator data: it must survive both config layers."""
+    monkeypatch.delenv("OCBRAIN_ENTITIES_VOCABULARY", raising=False)
+    monkeypatch.delenv("OCBRAIN_ENTITIES_MIN_FILTER_CANDIDATES", raising=False)
+    assert load_config(tmp_path / "absent.json").entities.vocabulary == {}
+
+    config_path = tmp_path / "ocbrain.config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "entities": {
+                    "vocabulary": {"asa2": ["asa2", "applied-science-analytics-2"]},
+                    "min_filter_candidates": 7,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    from_file = load_config(config_path)
+    assert from_file.entities.vocabulary == {"asa2": ["asa2", "applied-science-analytics-2"]}
+    assert from_file.entities.min_filter_candidates == 7
+
+    monkeypatch.setenv(
+        "OCBRAIN_ENTITIES_VOCABULARY", json.dumps({"recs worker": ["recs-api"]})
+    )
+    monkeypatch.setenv("OCBRAIN_ENTITIES_MIN_FILTER_CANDIDATES", "2")
+    from_env = load_config(config_path)
+    assert from_env.entities.vocabulary == {"recs worker": ["recs-api"]}
+    assert from_env.entities.min_filter_candidates == 2
+
+
 def test_describe_config_reports_defaults_when_no_file_exists(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("OCBRAIN_CONFIG", str(tmp_path / "absent.json"))
     report = describe_config()
@@ -128,11 +161,50 @@ def _write_cfg(tmp_path: Path, data: dict) -> Path:
 def test_defaults_cover_every_surviving_section(tmp_path: Path) -> None:
     cfg = load_config(tmp_path / "missing.json")
     assert cfg.retrieval.hybrid_rrf_k == 60
+    assert cfg.retrieval.adaptive_fusion is True
+    assert cfg.retrieval.keyword_lexical_weight == 0.65
+    assert cfg.retrieval.question_dense_weight == 0.65
     assert cfg.scopes.fold_enabled is True
     assert cfg.scopes.aliases == {}
     assert cfg.curator.provider == "anthropic"
     assert cfg.deslop.reject_closeout_slop is False
     assert cfg.goals.repo_roots == []
+    assert cfg.rerank.enabled is False
+    assert cfg.rerank.model == "BAAI/bge-reranker-v2-m3"
+
+
+def test_dense_serving_knobs_load_from_file_and_env(tmp_path: Path) -> None:
+    default = load_config(tmp_path / "missing.json").retrieval
+    assert default.min_dense_coverage == 0.60
+    assert default.embed_on_write is True
+
+    path = _write_cfg(
+        tmp_path, {"retrieval": {"min_dense_coverage": 0.25, "embed_on_write": False}}
+    )
+    configured = load_config(path).retrieval
+    assert configured.min_dense_coverage == 0.25
+    assert configured.embed_on_write is False
+
+    env = {"OCBRAIN_RETRIEVAL_MIN_DENSE_COVERAGE": "0.9", "OCBRAIN_RETRIEVAL_EMBED_ON_WRITE": "0"}
+    overridden = load_config(path, env=env).retrieval
+    assert overridden.min_dense_coverage == 0.9
+    assert overridden.embed_on_write is False
+
+
+def test_adaptive_fusion_weights_load_from_file_and_env(tmp_path: Path) -> None:
+    path = _write_cfg(
+        tmp_path,
+        {"retrieval": {"adaptive_fusion": False, "question_dense_weight": 0.8}},
+    )
+    configured = load_config(path).retrieval
+    assert configured.adaptive_fusion is False
+    assert configured.question_dense_weight == 0.8
+    assert configured.keyword_lexical_weight == 0.65
+
+    env = {"OCBRAIN_RETRIEVAL_ADAPTIVE_FUSION": "1"}
+    overridden = load_config(path, env=env).retrieval
+    assert overridden.adaptive_fusion is True
+    assert overridden.keyword_lexical_weight == 0.65
 
 
 def test_json_then_env_override_a_scalar(tmp_path: Path) -> None:
@@ -252,3 +324,29 @@ def test_config_cache_respects_env_overrides(tmp_path: Path, monkeypatch: pytest
     assert load_config(path).supersede.direct_cap == 7
     monkeypatch.delenv("OCBRAIN_SUPERSEDE_DIRECT_CAP")
     assert load_config(path).supersede.direct_cap == 3
+
+
+def test_rerank_section_loads_from_file_and_env(tmp_path: Path) -> None:
+    path = _write_cfg(
+        tmp_path,
+        {
+            "rerank": {
+                "enabled": True,
+                "candidates": 8,
+                "model": "BAAI/bge-reranker-v2-m3",
+            }
+        },
+    )
+    cfg = load_config(path)
+    assert cfg.rerank.enabled is True
+    assert cfg.rerank.candidates == 8
+    assert cfg.rerank.min_candidates == 3
+
+    overridden = load_config(
+        path,
+        env={"OCBRAIN_RERANK_DEVICE": "cpu", "OCBRAIN_RERANK_MIN_CANDIDATES": "5"},
+    )
+    assert overridden.rerank.enabled is True
+    assert overridden.rerank.device == "cpu"
+    assert overridden.rerank.min_candidates == 5
+    assert overridden.rerank.max_document_chars == 1200

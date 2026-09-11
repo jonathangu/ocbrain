@@ -669,6 +669,7 @@ def test_pre_pr59_mcp_bootstrap_migrates_first_read_and_write(
     """Actual 11c69f6 stores choose their dialect and survive their first I/O."""
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("OCBRAIN_SESSION_ID", raising=False)
+    monkeypatch.delenv("OCBRAIN_DELIVERY_TARGET", raising=False)
     path = _materialize_pre_pr59_fixture(tmp_path, fixture_name)
     before = connect(path)
     assert is_core_v1(before) is strict_v1

@@ -4,6 +4,10 @@ The semantic event/evidence ledger remains authoritative.  This module stores
 only derived vectors in a separate SQLite file and talks only to a loopback
 Ollama endpoint.  A missing model, server, or sidecar degrades to lexical-only
 retrieval; no hosted embedding fallback exists.
+
+The sidecar's recorded model is authoritative: queries are embedded with the
+model the sidecar was built with, so ``OCBRAIN_EMBED_MODEL`` only decides what
+``vector-build`` builds when ``--model`` is not given.
 """
 
 from __future__ import annotations
@@ -33,6 +37,15 @@ DEFAULT_QUERY_INSTRUCTION = (
 )
 VECTOR_SCHEMA_VERSION = "ocbrain.vectors.v2"
 VECTOR_DOCUMENT_FORMAT = "belief_body_head_tail_1800b.v1"
+DEFAULT_MIN_DENSE_COVERAGE = 0.60
+DEFAULT_EMBED_ON_WRITE_TIMEOUT_SECONDS = 8.0
+DEFAULT_EMBED_ON_WRITE_ROWS = 32
+
+_SERVING_BELIEF_SQL = (
+    "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
+    "last_compiled_at FROM current_beliefs "
+    "WHERE serve=1 AND status='current' ORDER BY belief_id"
+)
 
 
 class LocalEmbeddingUnavailable(RuntimeError):
@@ -82,13 +95,7 @@ def build_vector_index(
     source.row_factory = sqlite3.Row
     try:
         source.execute("BEGIN")
-        rows = list(
-            source.execute(
-                "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
-                "last_compiled_at FROM current_beliefs "
-                "WHERE serve=1 AND status='current' ORDER BY belief_id"
-            )
-        )
+        rows = list(source.execute(_SERVING_BELIEF_SQL))
         head = source.execute(
             "SELECT event_seq, event_hash FROM brain_events ORDER BY event_seq DESC LIMIT 1"
         ).fetchone()
@@ -259,15 +266,14 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             head = core.execute(
                 "SELECT event_seq, event_hash FROM brain_events ORDER BY event_seq DESC LIMIT 1"
             ).fetchone()
-            corpus_rows = list(
-                core.execute(
-                    "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
-                    "last_compiled_at FROM current_beliefs "
-                    "WHERE serve=1 AND status='current' ORDER BY belief_id"
-                )
-            )
+            corpus_rows = list(core.execute(_SERVING_BELIEF_SQL))
         finally:
             core.close()
+        coverage = _coverage_stats(
+            corpus_rows,
+            _usable_belief_ids(corpus_rows, _stored_content_hashes(conn)),
+        )
+        min_coverage = _min_dense_coverage()
         current_seq = str(head[0] if head else 0)
         current_hash = str(head[1] if head else "")
         event_fresh = (
@@ -280,21 +286,23 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             and meta.get("corpus_rows") == str(len(corpus_rows))
         )
         configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-        configured_dimensions = int(
-            os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
+        sidecar_model = meta.get("model") or DEFAULT_EMBED_MODEL
+        model_matches_configured = sidecar_model == configured_model
+        env_dimensions = os.environ.get("OCBRAIN_EMBED_DIMENSIONS")
+        configured_dimensions = int(env_dimensions or DEFAULT_EMBED_DIMENSIONS)
+        configured_dimensions_differ = bool(env_dimensions) and (
+            meta.get("dimensions") != str(configured_dimensions)
         )
         configured_instruction_hash = _sha256(DEFAULT_QUERY_INSTRUCTION)
         endpoint = os.environ.get("OCBRAIN_OLLAMA_URL") or DEFAULT_OLLAMA_URL
         try:
             _require_loopback(endpoint)
-            installed = _ollama_model_metadata(endpoint, configured_model)
+            installed = _ollama_model_metadata(endpoint, sidecar_model)
             installed_digest = installed.get("digest", "")
         except ValueError:
             installed_digest = "invalid_endpoint"
         identity_fresh = (
-            meta.get("model") == configured_model
-            and meta.get("dimensions") == str(configured_dimensions)
-            and meta.get("query_instruction_sha256") == configured_instruction_hash
+            meta.get("query_instruction_sha256") == configured_instruction_hash
             and meta.get("model_digest", "unknown") == installed_digest
         )
         # Retrieval receipts, feedback, and other ledger-only events do not
@@ -304,7 +312,8 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             meta.get("schema_version") == VECTOR_SCHEMA_VERSION
             and rows == int(meta.get("rows", "-1"))
             and integrity == "ok"
-            and fresh
+            and identity_fresh
+            and coverage["dense_coverage"] >= min_coverage
         )
         return {
             "status": "ok" if healthy else "failed",
@@ -316,8 +325,13 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
             "event_fresh": event_fresh,
             "corpus_fresh": corpus_fresh,
             "identity_fresh": identity_fresh,
+            "coverage": coverage,
+            "min_dense_coverage": min_coverage,
             "configured_model": configured_model,
+            "sidecar_model": sidecar_model,
+            "model_matches_configured": model_matches_configured,
             "configured_dimensions": configured_dimensions,
+            "configured_dimensions_differ": configured_dimensions_differ,
             "configured_query_instruction_sha256": configured_instruction_hash,
             "installed_model_digest": installed_digest,
             "current_core_event_seq": int(current_seq),
@@ -330,49 +344,28 @@ def vector_status(core_path: Path, *, sidecar_path: Path | None = None) -> dict[
 
 
 def _verify_sidecar(
-    conn: sqlite3.Connection,
     sidecar: sqlite3.Connection,
-    *,
-    require_corpus_fresh: bool,
 ) -> tuple[dict[str, str], str, int, str] | str:
     """Check one sidecar's identity, or return the typed reason it is unusable.
 
-    Extracted so the two readers of this sidecar cannot drift apart on which
-    guards they run: every reason string, and the order they are evaluated in,
-    is shared. ``require_corpus_fresh`` is the single difference between them.
-    ``semantic_neighbors`` answers "what is this corpus's nearest belief" and a
-    whole-corpus fingerprint mismatch makes that unanswerable; the duplicate
-    gate asks about named candidates and verifies each one's vector by its own
-    ``content_hash``, so a corpus that has moved elsewhere does not disqualify
-    the rows it did not move.
+    Extracted so the readers of this sidecar cannot drift apart on which guards
+    they run: every reason string, and the order they are evaluated in, is
+    shared. Whole-corpus freshness is deliberately not one of them -- a corpus
+    that moved elsewhere does not disqualify the rows it did not move, and each
+    reader checks the rows it uses by their own ``content_hash``.
     """
     meta = {str(row[0]): str(row[1]) for row in sidecar.execute("SELECT key, value FROM meta")}
     if meta.get("schema_version") != VECTOR_SCHEMA_VERSION:
         return "vector_schema_mismatch"
-    if require_corpus_fresh:
-        corpus_rows = list(
-            conn.execute(
-                "SELECT belief_id, body, scope_type, scope_id, visibility, egress_policy, "
-                "last_compiled_at FROM current_beliefs "
-                "WHERE serve=1 AND status='current' ORDER BY belief_id"
-            )
-        )
-        if meta.get("corpus_sha256") != _corpus_fingerprint(
-            corpus_rows
-        ) or meta.get("corpus_rows") != str(len(corpus_rows)):
-            return "vector_sidecar_stale"
     model = meta.get("model") or DEFAULT_EMBED_MODEL
-    configured_model = os.environ.get("OCBRAIN_EMBED_MODEL") or DEFAULT_EMBED_MODEL
-    if model != configured_model:
-        return "vector_model_config_mismatch"
     try:
         dimensions = int(meta.get("dimensions") or 0)
-        configured_dimensions = int(
-            os.environ.get("OCBRAIN_EMBED_DIMENSIONS") or DEFAULT_EMBED_DIMENSIONS
-        )
     except ValueError:
         return "vector_dimension_metadata_invalid"
-    if dimensions <= 0 or dimensions != configured_dimensions:
+    if dimensions <= 0:
+        return "vector_dimension_config_mismatch"
+    sample = sidecar.execute("SELECT vector FROM belief_vectors LIMIT 1").fetchone()
+    if sample is not None and len(bytes(sample[0])) != dimensions * array("f").itemsize:
         return "vector_dimension_config_mismatch"
     if meta.get("query_instruction_sha256") != _sha256(DEFAULT_QUERY_INSTRUCTION):
         return "vector_query_instruction_mismatch"
@@ -387,27 +380,86 @@ def _verify_sidecar(
     return meta, model, dimensions, endpoint
 
 
+def _serving_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute(_SERVING_BELIEF_SQL))
+
+
+def _stored_content_hashes(sidecar: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row[0]): str(row[1])
+        for row in sidecar.execute("SELECT belief_id, content_hash FROM belief_vectors")
+    }
+
+
+def _usable_belief_ids(
+    serving_rows: Iterable[sqlite3.Row], stored: dict[str, str]
+) -> set[str]:
+    """Serving beliefs whose stored vector still hashes to the belief's body."""
+    return {
+        str(row["belief_id"])
+        for row in serving_rows
+        if stored.get(str(row["belief_id"])) == _sha256(str(row["body"]))
+    }
+
+
+def _coverage_stats(serving_rows: list[sqlite3.Row], usable: set[str]) -> dict[str, Any]:
+    serving_count = len({str(row["belief_id"]) for row in serving_rows})
+    usable_count = len(usable & {str(row["belief_id"]) for row in serving_rows})
+    return {
+        "dense_coverage": round(usable_count / serving_count, 6) if serving_count else 0.0,
+        "dense_usable_rows": usable_count,
+        "dense_serving_rows": serving_count,
+        "dense_stale_rows": serving_count - usable_count,
+    }
+
+
+def _retrieval_setting(name: str, fallback: Any) -> Any:
+    try:
+        from ocbrain.config import load_config
+
+        return getattr(load_config().retrieval, name)
+    except Exception:  # noqa: BLE001 - config problems must not break serving
+        return fallback
+
+
+def _min_dense_coverage() -> float:
+    return float(_retrieval_setting("min_dense_coverage", DEFAULT_MIN_DENSE_COVERAGE))
+
+
 def semantic_neighbors(
     conn: sqlite3.Connection,
     query: str,
     *,
     candidate_ids: Iterable[str] | None = None,
     limit: int = 100,
-) -> tuple[list[dict[str, Any]], str | None]:
-    """Return exact cosine neighbors, or an explicit lexical-fallback reason."""
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+    """Return exact cosine neighbors, or an explicit lexical-fallback reason.
+
+    Ranking covers only the sidecar rows that still hash to their serving
+    belief, so a corpus that moved on no longer disqualifies the rows it did
+    not move. The third element reports how much of the corpus that was; a
+    sidecar below ``min_dense_coverage`` falls back with
+    ``vector_sidecar_sparse`` rather than answering from a remnant.
+    """
     core_path = connection_path(conn)
+    stats = _coverage_stats([], set())
     if core_path is None:
-        return [], "core_path_unavailable"
+        return [], "core_path_unavailable", stats
     path = vector_db_path(core_path)
     if not path.is_file():
-        return [], "vector_sidecar_missing"
+        return [], "vector_sidecar_missing", stats
     sidecar = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     sidecar.row_factory = sqlite3.Row
     try:
-        verified = _verify_sidecar(conn, sidecar, require_corpus_fresh=True)
+        verified = _verify_sidecar(sidecar)
         if isinstance(verified, str):
-            return [], verified
+            return [], verified, stats
         _meta, model, dimensions, endpoint = verified
+        serving = _serving_rows(conn)
+        usable = _usable_belief_ids(serving, _stored_content_hashes(sidecar))
+        stats = _coverage_stats(serving, usable)
+        if stats["dense_coverage"] < _min_dense_coverage():
+            return [], "vector_sidecar_sparse", stats
         query_vectors = embed_texts(
             [query],
             model=model,
@@ -417,18 +469,21 @@ def semantic_neighbors(
             dimensions=dimensions,
         )
         if not query_vectors:
-            return [], "empty_query_embedding"
+            return [], "empty_query_embedding", stats
         query_vector = query_vectors[0]
         if len(query_vector) != dimensions:
-            return [], "vector_query_dimension_mismatch"
+            return [], "vector_query_dimension_mismatch", stats
         allowed = set(candidate_ids) if candidate_ids is not None else None
         scored: list[tuple[float, sqlite3.Row]] = []
         for row in sidecar.execute("SELECT * FROM belief_vectors ORDER BY belief_id"):
-            if allowed is not None and str(row["belief_id"]) not in allowed:
+            belief_id = str(row["belief_id"])
+            if belief_id not in usable:
+                continue
+            if allowed is not None and belief_id not in allowed:
                 continue
             vector = _decode_vector(row["vector"])
             if len(vector) != len(query_vector):
-                return [], "vector_row_dimension_mismatch"
+                return [], "vector_row_dimension_mismatch", stats
             scored.append((_dot(query_vector, vector), row))
         scored.sort(key=lambda item: (-item[0], str(item[1]["belief_id"])))
         return [
@@ -438,9 +493,9 @@ def semantic_neighbors(
                 "content_hash": str(row["content_hash"]),
             }
             for score, row in scored[: max(limit, 1)]
-        ], None
+        ], None, stats
     except (OSError, sqlite3.Error, LocalEmbeddingUnavailable, ValueError) as exc:
-        return [], f"local_embedding_unavailable:{type(exc).__name__}"
+        return [], f"local_embedding_unavailable:{type(exc).__name__}", stats
     finally:
         sidecar.close()
 
@@ -471,17 +526,14 @@ def document_neighbors(
     scale ``compact.find_clusters`` calibrated its floor on. A query-side score
     is not comparable to either.
 
-    And it verifies each candidate's vector by that candidate's own
-    ``content_hash`` rather than by the whole-corpus fingerprint. On this install
+    And it answers for a candidate the sidecar holds no current vector for by
+    embedding that candidate on demand, up to ``embed_budget``. On this install
     the sidecar is rebuilt at the end of the hourly maintenance pass, so the
-    first belief a curation cycle writes invalidates the corpus fingerprint and
-    every later claim in the same cycle would read ``vector_sidecar_stale`` --
-    the gate would switch itself off for the rest of the run, silently, at
-    exactly the point in a cycle where restatements pile up. A candidate whose
-    body still hashes to its stored vector is comparable regardless. Whatever is
-    left over is embedded on demand up to ``embed_budget``, and anything past
-    that is reported as ``uncovered`` rather than skipped quietly: the caller
-    decides what an incomplete comparison means.
+    first belief a curation cycle writes is one the sidecar has never seen --
+    silently, at exactly the point in a cycle where restatements pile up.
+    Whatever is left over past the budget is reported as ``uncovered`` rather
+    than skipped quietly: the caller decides what an incomplete comparison
+    means.
     """
     wanted = [str(value) for value in dict.fromkeys(candidate_ids)]
     coverage = {"candidates": len(wanted), "reused": 0, "embedded": 0, "uncovered": 0}
@@ -497,7 +549,7 @@ def document_neighbors(
     sidecar = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     sidecar.row_factory = sqlite3.Row
     try:
-        verified = _verify_sidecar(conn, sidecar, require_corpus_fresh=False)
+        verified = _verify_sidecar(sidecar)
         if isinstance(verified, str):
             return [], verified, coverage
         _meta, model, dimensions, endpoint = verified
@@ -573,6 +625,109 @@ def document_neighbors(
         return scored[: max(limit, 1)], None, coverage
     except (OSError, sqlite3.Error, LocalEmbeddingUnavailable, ValueError) as exc:
         return [], f"local_embedding_unavailable:{type(exc).__name__}", coverage
+    finally:
+        sidecar.close()
+
+
+def embed_missing_beliefs(
+    conn: sqlite3.Connection,
+    *,
+    timeout_seconds: float = DEFAULT_EMBED_ON_WRITE_TIMEOUT_SECONDS,
+    max_rows: int = DEFAULT_EMBED_ON_WRITE_ROWS,
+) -> dict[str, Any]:
+    """Embed serving beliefs the sidecar holds no current vector for.
+
+    Called from a write path, so it is best effort by construction: the belief
+    is already committed and every failure -- absent sidecar, unreachable
+    embedder, identity drift, timeout -- comes back as a ``skipped_reason``
+    instead of an exception. ``meta`` is rewritten for the corpus as it now
+    stands, which is what keeps ``corpus_sha256`` honest after the write.
+    """
+    core_path = connection_path(conn)
+    if core_path is None:
+        return {"embedded": 0, "remaining": 0, "skipped_reason": "core_path_unavailable"}
+    path = vector_db_path(core_path)
+    if not path.is_file():
+        return {"embedded": 0, "remaining": 0, "skipped_reason": "vector_sidecar_missing"}
+    sidecar = sqlite3.connect(path)
+    sidecar.row_factory = sqlite3.Row
+    try:
+        verified = _verify_sidecar(sidecar)
+        if isinstance(verified, str):
+            return {"embedded": 0, "remaining": 0, "skipped_reason": verified}
+        _meta, model, dimensions, endpoint = verified
+        serving = _serving_rows(conn)
+        stored = _stored_content_hashes(sidecar)
+        missing = [
+            row
+            for row in serving
+            if stored.get(str(row["belief_id"])) != _sha256(str(row["body"]))
+        ]
+        pending = missing[: max(max_rows, 0)]
+        if not pending:
+            return {"embedded": 0, "remaining": 0, "skipped_reason": None}
+        vectors = embed_texts(
+            [_document_text(row) for row in pending],
+            model=model,
+            endpoint=endpoint,
+            query=False,
+            timeout_seconds=timeout_seconds,
+            dimensions=dimensions,
+        )
+        if len(vectors) != len(pending):
+            return {
+                "embedded": 0,
+                "remaining": len(missing),
+                "skipped_reason": "embedding_response_count_mismatch",
+            }
+        if any(len(vector) != dimensions for vector in vectors):
+            return {
+                "embedded": 0,
+                "remaining": len(missing),
+                "skipped_reason": "embedding_dimension_mismatch",
+            }
+        for row, vector in zip(pending, vectors, strict=True):
+            sidecar.execute(
+                "INSERT OR REPLACE INTO belief_vectors VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(row["belief_id"]),
+                    _sha256(str(row["body"])),
+                    model,
+                    dimensions,
+                    _encode_vector(vector),
+                    str(row["scope_type"]),
+                    str(row["scope_id"]),
+                    str(row["visibility"]),
+                    str(row["egress_policy"]),
+                    str(row["last_compiled_at"]),
+                ),
+            )
+        head = conn.execute(
+            "SELECT event_seq, event_hash FROM brain_events ORDER BY event_seq DESC LIMIT 1"
+        ).fetchone()
+        sidecar.executemany(
+            "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+            {
+                "corpus_sha256": _corpus_fingerprint(serving),
+                "corpus_rows": str(len(serving)),
+                "rows": str(sidecar.execute("SELECT COUNT(*) FROM belief_vectors").fetchone()[0]),
+                "core_event_hash": str(head["event_hash"] if head else ""),
+                "core_event_seq": str(head["event_seq"] if head else 0),
+                "built_at": datetime.now(UTC).isoformat(timespec="microseconds"),
+            }.items(),
+        )
+        sidecar.commit()
+        return {
+            "embedded": len(pending),
+            "remaining": len(missing) - len(pending),
+            "skipped_reason": None,
+        }
+    except (OSError, sqlite3.Error, LocalEmbeddingUnavailable, ValueError) as exc:
+        return {
+            "embedded": 0,
+            "remaining": 0,
+            "skipped_reason": f"local_embedding_unavailable:{type(exc).__name__}",
+        }
     finally:
         sidecar.close()
 
@@ -798,11 +953,13 @@ __all__ = [
     "DEFAULT_EMBED_DIMENSIONS",
     "DEFAULT_EMBED_DOCUMENT_BYTES",
     "DEFAULT_EMBED_MODEL",
+    "DEFAULT_MIN_DENSE_COVERAGE",
     "DEFAULT_OLLAMA_URL",
     "VECTOR_DOCUMENT_FORMAT",
     "LocalEmbeddingUnavailable",
     "build_vector_index",
     "document_neighbors",
+    "embed_missing_beliefs",
     "embed_texts",
     "semantic_neighbors",
     "vector_db_path",

@@ -17,16 +17,19 @@ import math
 import re
 import sqlite3
 from collections.abc import Iterable
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from ocbrain.closeout import normalize_task_ref, resolve_session_identity
+from ocbrain.entities import extract_entities
 from ocbrain.history_window import is_body_ref
 from ocbrain.hybrid import semantic_neighbors
 from ocbrain.ids import stable_id
 from ocbrain.provenance import EMPTY_PROVENANCE, Provenance
+from ocbrain.rerank import rerank
 from ocbrain.scope import (
     LOCAL_MODEL_TARGET,
     ScopeContext,
@@ -129,6 +132,37 @@ def looks_like_exact_locator(query: str) -> bool:
     )
 
 
+_ENTITIES_FALLBACK = SimpleNamespace(vocabulary={}, min_filter_candidates=5)
+
+# Held for one projection call so the vocabulary is read once, not once per row.
+_ENTITY_VOCABULARY: ContextVar[dict[str, list[str]] | None] = ContextVar(
+    "ocbrain_projection_entity_vocabulary", default=None
+)
+
+# Said to a caller whose query is a keyword list naming nothing.
+KEYWORD_QUERY_HINT = (
+    "State a question that names the thing you need and the attribute: e.g. "
+    "'What is the current TOMS repack cadence and who owns it?' Entity names "
+    "and ids anchor retrieval."
+)
+
+
+def _entities_config() -> Any:
+    try:
+        from ocbrain.config import load_config
+
+        return load_config().entities
+    except Exception:  # noqa: BLE001 - config problems must not break retrieval
+        return _ENTITIES_FALLBACK
+
+
+def _projection_vocabulary() -> dict[str, list[str]]:
+    active = _ENTITY_VOCABULARY.get()
+    if active is not None:
+        return active
+    return dict(_entities_config().vocabulary or {})
+
+
 _RETRIEVAL_FALLBACK = SimpleNamespace(
     hybrid_rrf_k=HYBRID_RRF_K,
     min_dense_cosine=MIN_DENSE_COSINE,
@@ -140,6 +174,9 @@ _RETRIEVAL_FALLBACK = SimpleNamespace(
     feedback_weight=0.125,
     feedback_clamp=0.25,
     feedback_prior_observations=3.0,
+    current_recency_half_life_days=30.0,
+    current_recency_weight=0.35,
+    durable_recency_weight=0.01,
 )
 
 
@@ -155,6 +192,19 @@ def _retrieval_tuning() -> Any:
         return load_config().retrieval
     except Exception:  # noqa: BLE001 - config problems must not break serving
         return _RETRIEVAL_FALLBACK
+
+
+def _rerank_tuning() -> Any:
+    """Resolve the rerank stage's settings; a broken config means off, not down."""
+    try:
+        from ocbrain.config import load_config
+
+        return load_config().rerank
+    except Exception:  # noqa: BLE001 - config problems must not break serving
+        from ocbrain.config import RerankConfig
+
+        return RerankConfig()
+
 
 LEGACY_IMPORT_KINDS = {
     "legacy_evidence_imported",
@@ -180,6 +230,7 @@ CORE_V1_TABLES: tuple[str, ...] = (
     "task_closeout_retrievals",
     "search_documents",
     "search_index",
+    "entity_mentions",
 )
 
 # SQLite creates these implementation tables for the one FTS5 virtual table.
@@ -481,6 +532,14 @@ CREATE TABLE IF NOT EXISTS search_documents (
   path
 );
 
+CREATE TABLE IF NOT EXISTS entity_mentions (
+  belief_id TEXT NOT NULL,
+  entity TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  PRIMARY KEY (belief_id, entity)
+);
+CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
   kind,
   title,
@@ -575,6 +634,19 @@ _ADDITIVE_CORE_V1_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("task_closeouts", "unresolved", "TEXT"),
 )
 
+# Tables added to a v1 core after the first release; see the columns below.
+_ADDITIVE_CORE_V1_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "entity_mentions",
+        (
+            "CREATE TABLE IF NOT EXISTS entity_mentions ("
+            " belief_id TEXT NOT NULL, entity TEXT NOT NULL, kind TEXT NOT NULL,"
+            " PRIMARY KEY (belief_id, entity))",
+            "CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity ON entity_mentions(entity)",
+        ),
+    ),
+)
+
 _ADDITIVE_CORE_V1_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_retrieval_uses_session_hint "
     "ON retrieval_uses(client_session_hint, served_at)",
@@ -586,20 +658,27 @@ _ADDITIVE_CORE_V1_INDEXES: tuple[str, ...] = (
 
 
 def migrate_core_v1_columns(conn: sqlite3.Connection) -> list[str]:
-    """Apply the additive column set to an already-initialized v1 core.
+    """Apply the additive schema surface to an already-initialized v1 core.
 
     Idempotent and cheap enough to run on every open: it is one
     ``PRAGMA table_info`` per table when there is nothing to do. Run it there
     rather than behind a separate migrate command, because the MCP server opens
     an existing core without calling :func:`init_core_v1` at all, and a write
-    path that referenced a column the running server had never added would fail
-    at the first ``brain.context`` after deploy.
+    path that referenced a column or table the running server had never added
+    would fail at the first ``brain.context`` after deploy.
     """
     added: list[str] = []
     tables = {
         str(row[0])
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
+    for table, statements in _ADDITIVE_CORE_V1_TABLES:
+        if table in tables:
+            continue
+        for statement in statements:
+            conn.execute(statement)
+        tables.add(table)
+        added.append(f"table:{table}")
     by_table: dict[str, set[str]] = {}
     for table, column, decl in _ADDITIVE_CORE_V1_COLUMNS:
         if table not in tables:
@@ -622,12 +701,13 @@ def migrate_core_v1_columns(conn: sqlite3.Connection) -> list[str]:
 def init_core_v1(conn: sqlite3.Connection) -> None:
     """Initialize a fresh v1 core; refuse to layer it over legacy tables."""
     if is_core_v1(conn):
-        assert_core_v1_inventory(conn)
         # Migrate columns before replaying the current schema. The schema also
         # declares indexes on additive columns; on an older core those indexes
         # cannot be prepared until the columns exist.
         migrate_core_v1_columns(conn)
         conn.executescript(CORE_V1_SCHEMA)
+        # The replay creates a table added to CORE_V1_TABLES since this core was.
+        assert_core_v1_inventory(conn)
         return
     existing = [
         str(row[0])
@@ -842,14 +922,18 @@ def project_core_v1(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
     last_rowid = cursor
     last_hash = expected_previous
     constraints = _constraint_cache(conn)
-    for event in events:
-        if event["prev_hash"] != last_hash:
-            raise RuntimeError(f"event-chain boundary mismatch at rowid {event['rid']}")
-        _verify_one_event(event)
-        _apply_event(conn, event, constraints=constraints)
-        applied += 1
-        last_rowid = int(event["rid"])
-        last_hash = str(event["event_hash"])
+    vocabulary_token = _ENTITY_VOCABULARY.set(dict(_entities_config().vocabulary or {}))
+    try:
+        for event in events:
+            if event["prev_hash"] != last_hash:
+                raise RuntimeError(f"event-chain boundary mismatch at rowid {event['rid']}")
+            _verify_one_event(event)
+            _apply_event(conn, event, constraints=constraints)
+            applied += 1
+            last_rowid = int(event["rid"])
+            last_hash = str(event["event_hash"])
+    finally:
+        _ENTITY_VOCABULARY.reset(vocabulary_token)
     cursor_updated_at = (
         str(conn.execute("SELECT ts FROM brain_events WHERE rowid=?", (last_rowid,)).fetchone()[0])
         if last_rowid
@@ -887,6 +971,7 @@ def _clear_projections(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM evidence_objects")
     conn.execute("DELETE FROM current_beliefs")
     conn.execute("DELETE FROM search_documents")
+    conn.execute("DELETE FROM entity_mentions")
     conn.execute("DELETE FROM projection_cursor")
 
 
@@ -1718,6 +1803,7 @@ def _write_belief(
         )
     else:
         conn.execute("DELETE FROM search_documents WHERE doc_id=?", (belief_id,))
+        conn.execute("DELETE FROM entity_mentions WHERE belief_id=?", (belief_id,))
 
 
 def _replace_belief_row(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
@@ -1814,6 +1900,19 @@ def _replace_search_row(
         """,
         (doc_id, kind, title, body, path),
     )
+    _replace_entity_mentions(conn, doc_id, title=title, body=body)
+
+
+def _replace_entity_mentions(
+    conn: sqlite3.Connection, belief_id: str, *, title: str, body: str
+) -> None:
+    conn.execute("DELETE FROM entity_mentions WHERE belief_id=?", (belief_id,))
+    text = " ".join(part for part in (title, body) if part)
+    for entity, kind in extract_entities(text, _projection_vocabulary()):
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_mentions(belief_id, entity, kind) VALUES (?, ?, ?)",
+            (belief_id, entity, kind),
+        )
 
 
 def resolve_object_id(conn: sqlite3.Connection, object_id: str) -> str:
@@ -2012,6 +2111,7 @@ def _exact_locator_result(
             # this is how many records it named.
             "exact_locator": True,
             "exact_locator_matches": len(items),
+            "query_shape": _query_shape(query),
         },
     }
 
@@ -2024,6 +2124,7 @@ def search_core_v1(
     limit: int = 12,
     cross_scope: bool = False,
     delivery_target: str = "local_model",
+    as_of: str | None = None,
 ) -> dict[str, Any]:
     """Return hybrid lexical/dense retrieval for ``ocbrain.context.v1``.
 
@@ -2041,6 +2142,8 @@ def search_core_v1(
     passing it keep working; there is no longer a narrower mode for it to widen.
     """
     context = context or ScopeContext()
+    as_of = _normalize_as_of(as_of)
+    now = now_iso() if as_of is None else None
     fts = _normalize_fts_query(query)
     if delivery_target == LOCAL_MODEL_TARGET:
         # No scope prefilter. Scoping the SQL dropped, on average, 3.8 relevant
@@ -2053,32 +2156,75 @@ def search_core_v1(
         placeholders = ",".join("?" for _ in compatible)
         scope_sql = f"(cb.scope_type='global' OR cb.scope_id IN ({placeholders}))"
         scope_params = list(compatible)
-    delivery_sql = _servable_knowledge_sql(delivery_target)
+    delivery_gate = _servable_knowledge_sql(delivery_target)
+    if as_of is not None:
+        delivery_sql = (
+            f"{delivery_gate} AND {_historical_lifecycle_sql()} AND {_era_sql(as_of)}"
+        )
+    elif now is not None:
+        delivery_sql = f"{delivery_gate} AND {_unexpired_sql(now)}"
+    else:
+        delivery_sql = delivery_gate
+    lifecycle_sql = "1" if as_of is not None else "cb.serve=1 AND cb.status='current'"
     visibility_counts = _serving_visibility_counts(
         conn,
         scope_sql=scope_sql,
         scope_params=scope_params,
         delivery_sql=delivery_sql,
+        lifecycle_sql=lifecycle_sql,
+    )
+    expired_excluded = 0
+    if as_of is None:
+        expired_row = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM current_beliefs cb
+            WHERE cb.serve=1 AND cb.status='current' AND {scope_sql}
+              AND ({_delivery_sql(delivery_target)})
+              AND COALESCE(cb.belief_type, '') <> '{GOAL_BELIEF_TYPE}'
+              AND json_extract(cb.attributes_json, '$.valid_until') IS NOT NULL
+              AND json_extract(cb.attributes_json, '$.valid_until') < ?
+            """,  # noqa: S608 - clauses are selected from fixed local constants
+            (*scope_params, now),
+        ).fetchone()
+        expired_excluded = int(expired_row[0] or 0)
+    retired_included = 0
+    if as_of is not None:
+        retired_row = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM current_beliefs cb
+            WHERE {scope_sql} AND {delivery_sql}
+              AND NOT (cb.serve=1 AND cb.status='current')
+            """,  # noqa: S608 - clauses are selected from fixed local constants
+            scope_params,
+        ).fetchone()
+        retired_included = int(retired_row[0] or 0)
+    era_columns = (
+        ", COALESCE(json_extract(cb.attributes_json, '$.valid_from'), "
+        "(SELECT e.ts FROM brain_events e WHERE e.id = cb.approved_event_id)) "
+        "AS era_valid_from, json_extract(cb.attributes_json, '$.valid_until') "
+        "AS era_valid_until"
+        if as_of is not None
+        else ""
     )
     eligible_rows = list(
         conn.execute(
             f"""
-            SELECT cb.* FROM current_beliefs cb
-            WHERE cb.serve=1 AND cb.status='current' AND {scope_sql} AND {delivery_sql}
+            SELECT cb.*{era_columns} FROM current_beliefs cb
+            WHERE {lifecycle_sql} AND {scope_sql} AND {delivery_sql}
             ORDER BY cb.belief_id
             """,  # noqa: S608 - clauses are selected from fixed local constants
             scope_params,
         )
     )
     eligible = {str(row["belief_id"]): row for row in eligible_rows}
-    if looks_like_exact_locator(query):
+    if as_of is None and looks_like_exact_locator(query):
         # An id-shaped query is a lookup, not a topic. Ranking cannot answer it:
         # a locator shares no terms with any body, so the lexical arm returns
         # nothing and the dense arm returns whatever happens to be nearest --
         # which is how the nonexistent, exactly well-formed
         # `belief_ffffffffffffffff` came back as two confident unrelated beliefs
         # at cosine 0.56 and 0.61. Resolve by equality, and let a miss be empty.
-        return _exact_locator_result(
+        locator_result = _exact_locator_result(
             conn,
             query,
             eligible=eligible,
@@ -2087,6 +2233,49 @@ def search_core_v1(
             cross_scope=cross_scope,
             visibility_counts=visibility_counts,
         )
+        locator_result["expired_excluded"] = expired_excluded
+        locator_result["as_of"] = None
+        locator_result["retired_included"] = 0
+        return locator_result
+    entities_section = _entities_config()
+    query_entities = extract_entities(query, dict(entities_section.vocabulary or {}))
+    query_shape = _query_shape(query)
+    min_filter_candidates = int(entities_section.min_filter_candidates)
+    entity_matches: dict[str, int] = {}
+    if query_entities:
+        entity_values = sorted({entity for entity, _kind in query_entities})
+        placeholders = ",".join("?" for _ in entity_values)
+        entity_matches = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                f"""
+                SELECT em.belief_id, COUNT(DISTINCT em.entity)
+                FROM entity_mentions em
+                JOIN current_beliefs cb ON cb.belief_id=em.belief_id
+                WHERE em.entity IN ({placeholders})
+                  AND cb.serve=1 AND cb.status='current' AND {scope_sql} AND {delivery_sql}
+                GROUP BY em.belief_id
+                """,  # noqa: S608 - clauses are selected from fixed local constants
+                (*entity_values, *scope_params),
+            )
+        }
+    entity_mode = "none"
+    if query_entities:
+        entity_mode = "filter" if len(entity_matches) >= min_filter_candidates else "boost"
+    entity_sql = ""
+    entity_params: list[Any] = []
+    if entity_mode == "filter":
+        entity_ids = sorted(entity_matches)
+        entity_sql = f" AND cb.belief_id IN ({','.join('?' for _ in entity_ids)})"
+        entity_params = list(entity_ids)
+        eligible = {
+            belief_id: row for belief_id, row in eligible.items() if belief_id in entity_matches
+        }
+    entity_provenance: dict[str, Any] = {
+        "query": sorted({entity for entity, _kind in query_entities}),
+        "mode": entity_mode,
+        "candidates": len(entity_matches),
+    }
     tuning = _retrieval_tuning()
     rrf_k = int(tuning.hybrid_rrf_k)
     min_dense_cosine = float(tuning.min_dense_cosine)
@@ -2094,13 +2283,26 @@ def search_core_v1(
     min_lexical_matches = int(tuning.min_lexical_query_term_matches)
     min_redundant_ratio = float(tuning.min_redundant_lexical_strength_ratio)
     require_dense_support = bool(tuning.require_dense_support)
+    if as_of is not None:
+        # Retired beliefs have no vector, so the dense floor would reject every
+        # one of them. An explicit as-of query is answered from the era pool.
+        require_dense_support = False
     confidence_prior_enabled = bool(
         getattr(tuning, "confidence_prior_enabled", CONFIDENCE_PRIOR_ENABLED)
     )
     candidate_limit = max(limit * 10, 120)
     lexical_rows: list[sqlite3.Row] = []
     lexical_uncorroborated = False
-    if fts:
+    if as_of is not None:
+        lexical_rows = _as_of_lexical_rows(
+            conn,
+            fts,
+            scope_sql=scope_sql,
+            scope_params=scope_params,
+            delivery_sql=delivery_sql,
+            limit=candidate_limit,
+        )
+    elif fts:
         lexical_rows = list(
             conn.execute(
                 f"""
@@ -2109,11 +2311,11 @@ def search_core_v1(
                 JOIN search_documents sd ON sd.rowid=search_index.rowid
                 JOIN current_beliefs cb ON cb.belief_id=sd.doc_id
                 WHERE search_index MATCH ? AND cb.serve=1 AND cb.status='current'
-                  AND {scope_sql} AND {delivery_sql}
+                  AND {scope_sql} AND {delivery_sql}{entity_sql}
                 ORDER BY lexical_score, cb.pinned DESC, cb.last_compiled_at DESC, cb.belief_id
                 LIMIT ?
                 """,  # noqa: S608 - clauses are selected from fixed local constants
-                (fts, *scope_params, candidate_limit),
+                (fts, *scope_params, *entity_params, candidate_limit),
             )
         )
         query_terms = {
@@ -2175,7 +2377,7 @@ def search_core_v1(
                 # lexical rank 1-2. Defer the decision: dropping them is only
                 # right if the dense arm is healthy enough to answer instead.
                 lexical_uncorroborated = True
-    dense_rows, dense_fallback = semantic_neighbors(
+    dense_rows, dense_fallback, dense_stats = semantic_neighbors(
         conn,
         query,
         candidate_ids=eligible,
@@ -2189,6 +2391,33 @@ def search_core_v1(
     # is set and every dense score is absent — holding lexical hits to a dense
     # floor then would return nothing at all, so the extra gate stands down.
     dense_arm_healthy = dense_fallback is None
+    adaptive_fusion = bool(getattr(tuning, "adaptive_fusion", True))
+    keyword_lexical_weight = float(getattr(tuning, "keyword_lexical_weight", 0.65))
+    question_dense_weight = float(getattr(tuning, "question_dense_weight", 0.65))
+    has_identifier_entity = any(
+        kind in {"id", "digest", "pr", "host"} for _entity, kind in query_entities
+    )
+    if not adaptive_fusion:
+        lexical_weight, dense_weight, fusion_reason = 0.5, 0.5, "disabled"
+    elif dense_fallback is not None:
+        lexical_weight, dense_weight, fusion_reason = 0.5, 0.5, "dense_unavailable"
+    elif has_identifier_entity:
+        lexical_weight = keyword_lexical_weight
+        dense_weight = 1.0 - keyword_lexical_weight
+        fusion_reason = "identifiers"
+    elif query_shape == "question":
+        lexical_weight = 1.0 - question_dense_weight
+        dense_weight = question_dense_weight
+        fusion_reason = "question"
+    else:
+        lexical_weight = keyword_lexical_weight
+        dense_weight = 1.0 - keyword_lexical_weight
+        fusion_reason = "keywords"
+    fusion_provenance = {
+        "lexical_weight": lexical_weight,
+        "dense_weight": dense_weight,
+        "reason": fusion_reason,
+    }
     degraded_excluded_procedures = 0
     if not dense_arm_healthy:
         # A wrong belief is a wrong sentence; a wrong procedure is a wrong
@@ -2225,9 +2454,13 @@ def search_core_v1(
             "scope_mix": {},
             "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
             "exclusion_count_basis": "current_serving_inventory",
+            "expired_excluded": expired_excluded,
+            "as_of": as_of,
+            "retired_included": retired_included,
             "ranking": {
                 "mode": "lexical" if dense_fallback else "hybrid",
                 "dense_fallback": dense_fallback,
+                **dense_stats,
                 "eligible_count": visibility_counts["eligible_count"],
                 "lexical_candidates": 0,
                 "dense_candidates": 0,
@@ -2238,6 +2471,10 @@ def search_core_v1(
                 "require_dense_support": require_dense_support and dense_arm_healthy,
                 "confidence_prior_enabled": confidence_prior_enabled,
                 "degraded_excluded_procedures": degraded_excluded_procedures,
+                "entities": entity_provenance,
+                "query_shape": query_shape,
+                "hint": _keyword_hint(query_shape, query_entities),
+                "fusion": fusion_provenance,
             },
         }
     feedback = _retrieval_feedback_scores(
@@ -2296,56 +2533,83 @@ def search_core_v1(
         attributes = json.loads(row["attributes_json"] or "{}")
         confidence = float(row["confidence"] if row["confidence"] is not None else 0.65)
         quality = _source_quality(attributes)
-        recency = _recency_score(str(row["last_compiled_at"]))
+        if str(attributes.get("lifecycle") or "") == "current":
+            recency_model = "current"
+            recency_half_life = float(
+                getattr(tuning, "current_recency_half_life_days", 30.0)
+            )
+            recency_weight = float(getattr(tuning, "current_recency_weight", 0.35))
+        else:
+            recency_model = "durable"
+            recency_half_life = 365.0
+            recency_weight = float(getattr(tuning, "durable_recency_weight", 0.01))
+        recency = _recency_score_for(str(row["last_compiled_at"]), recency_half_life)
         lexical_component = 0.0
         if belief_id in lexical_rank:
             lexical_component = 1.0 / (rrf_k + lexical_rank[belief_id])
         dense_component = 0.0
         if belief_id in dense_rank:
             dense_component = dense_similarity[belief_id] / (rrf_k + dense_rank[belief_id])
-        rrf = lexical_component + dense_component
+        rrf = 2.0 * (
+            lexical_weight * lexical_component + dense_weight * dense_component
+        )
         feedback_boost = feedback.get(belief_id, 0.0)
+        matched_entities = int(entity_matches.get(belief_id, 0))
+        entity_boost = (
+            min(1.0, 0.5 * matched_entities) if entity_mode == "boost" else 0.0
+        )
         confidence_term = (0.85 + 0.15 * confidence) if confidence_prior_enabled else 1.0
         ranking_prior = (
             scope_weight
             * confidence_term
             * (0.85 + 0.15 * quality)
-            * (0.99 + 0.01 * recency)
+            * ((1.0 - recency_weight) + recency_weight * recency)
         )
-        score = rrf * ranking_prior * (1.0 + feedback_boost) * (1.0 + exact_boost)
-        ranked.append(
-            (
-                score,
-                belief_id,
-                {
-                    "belief_id": belief_id,
-                    "body": row["body"],
-                    "scope": scope.to_dict(),
-                    "score": round(score, 8),
-                    "relevance": round(rrf, 8),
-                    "scope_weight": scope_weight,
-                    # Evidence support is filled in below, for the served rows
-                    # only. It replaces the `confidence` / `confidence_band`
-                    # pair this item used to carry; see `_evidence_support`.
-                    "evidence_count": 0,
-                    "evidence_latest_at": None,
-                    "evidence_ids": _json_list(row["evidence_ids"]),
-                    "source": "core_v1_hybrid",
-                    "ranking": {
-                        "lexical_rank": lexical_rank.get(belief_id),
-                        "dense_rank": dense_rank.get(belief_id),
-                        "dense_similarity": dense_similarity.get(belief_id),
-                        "lexical_component": round(lexical_component, 8),
-                        "dense_component": round(dense_component, 8),
-                        "source_quality": round(quality, 4),
-                        "recency": round(recency, 4),
-                        "ranking_prior": round(ranking_prior, 6),
-                        "feedback_boost": round(feedback_boost, 6),
-                        "exact_boost": round(exact_boost, 6),
-                    },
-                },
-            )
+        score = (
+            rrf
+            * ranking_prior
+            * (1.0 + feedback_boost)
+            * (1.0 + exact_boost)
+            * (1.0 + entity_boost)
         )
+        item: dict[str, Any] = {
+            "belief_id": belief_id,
+            "body": row["body"],
+            "scope": scope.to_dict(),
+            "score": round(score, 8),
+            "relevance": round(rrf, 8),
+            "scope_weight": scope_weight,
+            "status": str(row["status"]),
+            # Evidence support is filled in below, for the served rows
+            # only. It replaces the `confidence` / `confidence_band`
+            # pair this item used to carry; see `_evidence_support`.
+            "evidence_count": 0,
+            "evidence_latest_at": None,
+            "evidence_ids": _json_list(row["evidence_ids"]),
+            "source": "core_v1_hybrid",
+            "ranking": {
+                "lexical_rank": lexical_rank.get(belief_id),
+                "dense_rank": dense_rank.get(belief_id),
+                "dense_similarity": dense_similarity.get(belief_id),
+                "lexical_component": round(lexical_component, 8),
+                "dense_component": round(dense_component, 8),
+                "source_quality": round(quality, 4),
+                "recency": round(recency, 4),
+                "recency_model": recency_model,
+                "recency_half_life_days": recency_half_life,
+                "ranking_prior": round(ranking_prior, 6),
+                "feedback_boost": round(feedback_boost, 6),
+                "exact_boost": round(exact_boost, 6),
+                "entity_boost": round(entity_boost, 6),
+                "matched_entities": matched_entities,
+            },
+        }
+        if as_of is not None:
+            item["era"] = {
+                "valid_from": row["era_valid_from"],
+                "valid_until": row["era_valid_until"],
+            }
+        ranked.append((score, belief_id, item))
     ranked.sort(key=lambda item: (-item[0], item[1]))
     items: list[dict[str, Any]] = []
     seen_content: set[str] = set()
@@ -2360,8 +2624,8 @@ def search_core_v1(
             continue
         seen_content.add(content_key)
         items.append(item)
-        if len(items) >= limit:
-            break
+    items, rerank_info = rerank(query, items, config=_rerank_tuning())
+    items = items[:limit]
     # One evidence query for the rows that are actually served, not for every
     # ranked candidate: at limit=12 that is 12 ids, against a candidate list of
     # up to 120.
@@ -2384,9 +2648,13 @@ def search_core_v1(
         "scope_mix": scope_mix,
         "delivery_excluded_count": visibility_counts["excluded_delivery_count"],
         "exclusion_count_basis": "current_serving_inventory",
+        "expired_excluded": expired_excluded,
+        "as_of": as_of,
+        "retired_included": retired_included,
         "ranking": {
             "mode": "lexical" if dense_fallback else "hybrid_rrf",
             "dense_fallback": dense_fallback,
+            **dense_stats,
             "eligible_count": visibility_counts["eligible_count"],
             "lexical_candidates": len(lexical_rank),
             "dense_candidates": len(dense_rank),
@@ -2402,6 +2670,11 @@ def search_core_v1(
             # healthy mode; a non-zero value says the packet is deliberately
             # thinner than the corpus could support.
             "degraded_excluded_procedures": degraded_excluded_procedures,
+            "rerank": rerank_info,
+            "entities": entity_provenance,
+            "query_shape": query_shape,
+            "hint": _keyword_hint(query_shape, query_entities),
+            "fusion": fusion_provenance,
         },
     }
 
@@ -2642,6 +2915,41 @@ def reclassify_no_coverage_receipts(
     }
 
 
+_QUESTION_STARTS = frozenset(
+    {
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "why",
+        "how",
+        "is",
+        "does",
+        "can",
+        "should",
+    }
+)
+
+
+def _query_shape(query: str) -> str:
+    text = str(query).strip()
+    if "?" in text:
+        return "question"
+    words = re.findall(r"[a-z]+", text.lower())
+    if words and words[0] in _QUESTION_STARTS:
+        return "question"
+    return "keywords"
+
+
+def _keyword_hint(query_shape: str, query_entities: list[tuple[str, str]]) -> str | None:
+    if query_shape == "keywords" and not query_entities:
+        return KEYWORD_QUERY_HINT
+    return None
+
+
 def _normalize_fts_query(query: str) -> str:
     terms = re.findall(r"[\w-]{2,}", query.lower())
     stopwords = {
@@ -2713,6 +3021,102 @@ def _delivery_sql(target: str) -> str:
     raise ValueError(f"unsupported delivery target: {target}")
 
 
+def _as_of_lexical_rows(
+    conn: sqlite3.Connection,
+    fts: str,
+    *,
+    scope_sql: str,
+    scope_params: list[Any],
+    delivery_sql: str,
+    limit: int,
+) -> list[sqlite3.Row]:
+    terms = sorted({term for term in re.findall(r"[a-z0-9]{2,}", fts.lower()) if term != "or"})
+    if not terms:
+        return []
+    clauses = " OR ".join("instr(lower(cb.body), ?) > 0" for _term in terms)
+    rows = list(
+        conn.execute(
+            f"""
+            SELECT cb.* FROM current_beliefs cb
+            WHERE {scope_sql} AND {delivery_sql} AND ({clauses})
+            LIMIT ?
+            """,  # noqa: S608 - clauses are selected from fixed local constants
+            (*scope_params, *terms, limit),
+        )
+    )
+
+    def overlap(row: sqlite3.Row) -> int:
+        body = str(row["body"]).lower()
+        return sum(1 for term in terms if term in body)
+
+    rows.sort(key=lambda row: (-overlap(row), str(row["belief_id"])))
+    return rows
+
+
+def _unexpired_sql(now: str) -> str:
+    return (
+        "(json_extract(cb.attributes_json, '$.valid_until') IS NULL "
+        f"OR json_extract(cb.attributes_json, '$.valid_until') >= '{now}')"
+    )
+
+
+def _historical_lifecycle_sql() -> str:
+    """History is not a route around forget or hard-correction restrictions.
+
+    Only current beliefs and retired beliefs with a bounded recorded era are
+    eligible. Terminal events stay authoritative even after later projection
+    events change the row's status, and apply before every ranking/count arm.
+    """
+    return """
+        (cb.status='current' AND cb.serve=1 OR
+         cb.status='retracted' AND json_extract(cb.attributes_json, '$.valid_until') IS NOT NULL)
+        AND NOT EXISTS (
+            SELECT 1 FROM brain_events terminal
+            WHERE (
+                terminal.kind='tombstone_recorded'
+                AND json_extract(terminal.body_json, '$.target') IN (
+                    SELECT cb.belief_id UNION ALL
+                    SELECT alias_id FROM object_aliases WHERE canonical_id=cb.belief_id
+                )
+            ) OR (
+                terminal.kind='correction_recorded'
+                AND json_extract(terminal.body_json, '$.target_layer') IN ('belief', 'knowledge')
+                AND json_extract(terminal.body_json, '$.target_id') IN (
+                    SELECT cb.belief_id UNION ALL
+                    SELECT alias_id FROM object_aliases WHERE canonical_id=cb.belief_id
+                )
+                AND json_extract(terminal.body_json, '$.hard')=1
+                AND json_extract(terminal.body_json, '$.op') IN ('mark_wrong', 'retract', 'demote')
+            )
+        )
+    """
+
+
+def _era_sql(as_of: str) -> str:
+    return (
+        "(COALESCE(json_extract(cb.attributes_json, '$.valid_from'), "
+        "(SELECT e.ts FROM brain_events e WHERE e.id = cb.approved_event_id), '') "
+        f"<= '{as_of}') AND "
+        "(json_extract(cb.attributes_json, '$.valid_until') IS NULL "
+        f"OR json_extract(cb.attributes_json, '$.valid_until') > '{as_of}')"
+    )
+
+
+def _normalize_as_of(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("as_of must be an ISO-8601 timestamp") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds")
+
+
 def _servable_knowledge_sql(target: str) -> str:
     """The delivery gate, plus the belief types that are not knowledge at all.
 
@@ -2738,6 +3142,7 @@ def _serving_visibility_counts(
     scope_sql: str,
     scope_params: list[Any],
     delivery_sql: str,
+    lifecycle_sql: str = "cb.serve=1 AND cb.status='current'",
 ) -> dict[str, int]:
     """Partition current serving inventory without exposing excluded objects.
 
@@ -2757,7 +3162,7 @@ def _serving_visibility_counts(
             CASE WHEN {scope_sql} THEN 1 ELSE 0 END AS scope_allowed,
             CASE WHEN {delivery_sql} THEN 1 ELSE 0 END AS delivery_allowed
           FROM current_beliefs cb
-          WHERE cb.serve=1 AND cb.status='current'
+          WHERE {lifecycle_sql}
         )
         SELECT
           COALESCE(SUM(CASE WHEN scope_allowed=1 AND delivery_allowed=0 THEN 1 ELSE 0 END), 0)
@@ -2783,6 +3188,10 @@ def _source_quality(attributes: dict[str, Any]) -> float:
 
 
 def _recency_score(value: str) -> float:
+    return _recency_score_for(value, 365.0)
+
+
+def _recency_score_for(value: str, half_life_days: float) -> float:
     try:
         observed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if observed.tzinfo is None:
@@ -2790,7 +3199,7 @@ def _recency_score(value: str) -> float:
         days = max((datetime.now(UTC) - observed).total_seconds() / 86_400.0, 0.0)
     except (TypeError, ValueError):
         return 0.0
-    return math.exp(-days / 365.0)
+    return math.exp(-days / half_life_days)
 
 
 def retrieval_history_by_lineage(

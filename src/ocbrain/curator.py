@@ -1538,7 +1538,7 @@ def conflict_neighbor(
     """
     if not candidates:
         return None
-    neighbors, unavailable = semantic_neighbors(
+    neighbors, unavailable, _coverage = semantic_neighbors(
         conn, body, candidate_ids=list(candidates), limit=CONTRADICTION_NEIGHBORS
     )
     if unavailable is not None:

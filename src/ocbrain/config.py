@@ -1,11 +1,13 @@
 """ocbrain configuration surface.
 
-Seven sections, one per thing that actually reads configuration: ``retrieval``
+Nine sections, one per thing that actually reads configuration: ``retrieval``
 (the ``search_core_v1`` ranking gates), ``scopes`` (scope folding and the alias
 table), ``curator`` (``scripts/wiki-curator.py``), ``deslop`` (the write-time
 closeout slop gate), ``closeout`` (the write-time closeout identity and failure
-gates), ``supersede`` (how much authority a runtime supersession carries), and
-``goals`` (where a repo-relative goal spec pointer is resolved).
+gates), ``supersede`` (how much authority a runtime supersession carries),
+``goals`` (where a repo-relative goal spec pointer is resolved), ``entities`` (the
+operator vocabulary that anchors entity retrieval), and ``rerank`` (the optional
+cross-encoder second stage).
 There were seventeen; thirteen configured subsystems that were deleted or were
 never read at all.
 
@@ -98,6 +100,11 @@ class RetrievalConfig:
     min_lexical_query_term_matches: int = 2
     min_redundant_lexical_strength_ratio: float = 0.50
     require_dense_support: bool = True
+    # Share of serving beliefs the sidecar must still hold a current vector for
+    # before the dense arm ranks at all; below it, retrieval falls back lexically.
+    min_dense_coverage: float = 0.60
+    # Embed a belief as it is minted, so coverage does not decay between builds.
+    embed_on_write: bool = True
     # Whether `ranking_prior` keeps its `0.85 + 0.15 * confidence` term.
     #
     # `confidence` is authored, not measured: 345 of the 347 serving beliefs on
@@ -115,6 +122,16 @@ class RetrievalConfig:
     feedback_weight: float = 0.125
     feedback_clamp: float = 0.25
     feedback_prior_observations: float = 3.0
+    # Recency weighting, split by lifecycle. `current` beliefs decay on a
+    # half-life; everything else keeps the flat 365-day curve and a 1% weight.
+    current_recency_half_life_days: float = 30.0
+    current_recency_weight: float = 0.35
+    durable_recency_weight: float = 0.01
+    # Weight the lexical and dense arms by query shape; equal weights (0.5/0.5)
+    # reproduce the pre-adaptive fused numbers exactly.
+    adaptive_fusion: bool = True
+    keyword_lexical_weight: float = 0.65
+    question_dense_weight: float = 0.65
 
 
 @dataclass(frozen=True)
@@ -309,6 +326,28 @@ class SupersedeConfig:
 
 
 @dataclass(frozen=True)
+class EntitiesConfig:
+    """Operator vocabulary for entity-anchored retrieval.
+
+    ``vocabulary`` maps a canonical entity name to the aliases that also name
+    it, matched case-insensitively on word boundaries. The shipped table is
+    EMPTY and the operator sets theirs in ``~/.ocbrain/ocbrain.config.json``:
+    real tenant, customer, and host names are operator data, and this repo is
+    public. With an empty table only the code-shaped entities (PRs, record ids,
+    hostnames, digests, dates) anchor a query.
+
+    ``min_filter_candidates`` is how many serving beliefs must mention a query's
+    entities before retrieval restricts the candidate pool to them rather than
+    only boosting them. Restricting a corpus that mentions the entity in one
+    place would hide the beliefs that answer the question without repeating its
+    name, so the floor stays above a handful.
+    """
+
+    vocabulary: dict[str, list[str]] = field(default_factory=dict)
+    min_filter_candidates: int = 5
+
+
+@dataclass(frozen=True)
 class GoalsConfig:
     """Where a repo-relative goal ``source_pointer`` is resolved.
 
@@ -328,6 +367,25 @@ class GoalsConfig:
 
 
 @dataclass(frozen=True)
+class RerankConfig:
+    """The optional cross-encoder second stage over the fused ranking.
+
+    Ships DISABLED: the stage costs a model load and per-query inference, so the
+    operator turns it on after measuring the ordering. ``candidates`` is how many
+    of the fused head get re-scored, which has to exceed the packet ``limit`` for
+    an item below it to be promotable; ``min_candidates`` is the floor below
+    which re-scoring is pointless.
+    """
+
+    enabled: bool = False
+    model: str = "BAAI/bge-reranker-v2-m3"
+    candidates: int = 24
+    min_candidates: int = 3
+    device: str = "auto"
+    max_document_chars: int = 1200
+
+
+@dataclass(frozen=True)
 class OcbrainConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     scopes: ScopesConfig = field(default_factory=ScopesConfig)
@@ -336,6 +394,8 @@ class OcbrainConfig:
     closeout: CloseoutConfig = field(default_factory=CloseoutConfig)
     supersede: SupersedeConfig = field(default_factory=SupersedeConfig)
     goals: GoalsConfig = field(default_factory=GoalsConfig)
+    entities: EntitiesConfig = field(default_factory=EntitiesConfig)
+    rerank: RerankConfig = field(default_factory=RerankConfig)
 
 
 def _coerce(current: Any, incoming: Any) -> Any:

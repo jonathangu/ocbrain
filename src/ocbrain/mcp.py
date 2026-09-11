@@ -64,6 +64,7 @@ from ocbrain.mcp_v1 import (
     digest_v1,
     expand_source_v1,
     feedback_v1,
+    finish_vector_refresh,
     forget_v1,
     get_v1,
     ingest_v1,
@@ -1224,6 +1225,7 @@ def call_tool_v1(
             limit=limit,
             cross_scope=bool_arg(arguments, "cross_scope"),
             delivery_target=delivery_target,
+            as_of=optional_string(arguments, "as_of"),
         )
         packet, handles = prepare_retrieval_packet_v1(packet, handles)
         retrieval_id = record_context_v1(
@@ -1270,6 +1272,7 @@ def call_tool_v1(
             cross_scope=bool_arg(arguments, "cross_scope"),
             delivery_target=delivery_target,
             provenance=provenance,
+            as_of=optional_string(arguments, "as_of"),
         )
         conn.commit()
         return text_result(payload)
@@ -1402,7 +1405,7 @@ def call_tool_v1(
             requested_scope=scope_from_arguments(arguments),
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.closeout":
         context = context_from_arguments(arguments)
         task_ref = optional_string(arguments, "task_ref") or context.task
@@ -1429,7 +1432,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.supersede":
         context = context_from_arguments(arguments)
         payload = supersede_v1(
@@ -1442,7 +1445,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.correct":
         payload = correct_v1(
             conn,
@@ -1468,7 +1471,7 @@ def call_tool_v1(
             provenance=provenance,
         )
         conn.commit()
-        return text_result(payload)
+        return text_result(finish_vector_refresh(conn, payload))
     if name == "brain.proposals":
         if delivery_target == HOSTED_MODEL_TARGET:
             raise PermissionError("brain.proposals is unavailable for hosted_model delivery")
@@ -1619,6 +1622,8 @@ def tool_list(
         {
             "name": "brain.context",
             "description": (
+                "Ask a question that names the entity (tenant, host, service, PR, id) and "
+                "the attribute you need; a list of task keywords retrieves poorly. "
                 "Return the stable ocbrain.context.v1 shared-context envelope, including "
                 "coverage metadata and scope-bound source handles."
             ),
@@ -1644,6 +1649,14 @@ def tool_list(
                             "Deprecated and ignored. Local retrieval ranks every scope "
                             "by affinity instead of filtering, so there is no narrower "
                             "mode left to widen. Accepted so existing callers keep working."
+                        ),
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 timestamp. Answer from the beliefs that were valid "
+                            "at that moment, including ones since retired. Omit for the "
+                            "current view."
                         ),
                     },
                     "at_ts": {"type": "string"},
@@ -1680,6 +1693,8 @@ def tool_list(
         {
             "name": "brain.search",
             "description": (
+                "Ask a question that names the entity (tenant, host, service, PR, id) and "
+                "the attribute you need; a list of task keywords retrieves poorly. "
                 "Search source-backed ocbrain knowledge and evidence. Feedback handles are "
                 "best-effort during a database writer window; do not retry a successful search "
                 "solely when retrieval_use_status is database_busy."
@@ -1717,6 +1732,14 @@ def tool_list(
                             "Deprecated and ignored. Local retrieval ranks every scope "
                             "by affinity instead of filtering, so there is no narrower "
                             "mode left to widen. Accepted so existing callers keep working."
+                        ),
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 timestamp. Answer from the beliefs that were valid "
+                            "at that moment, including ones since retired. Omit for the "
+                            "current view."
                         ),
                     },
                     "at_ts": {"type": "string"},
