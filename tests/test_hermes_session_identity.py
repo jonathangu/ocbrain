@@ -13,13 +13,12 @@ database or transcript payload is read.
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from ocbrain.closeout import (
     HERMES_PROFILES_ROOT_ENV,
-    HERMES_SESSION_SHAPE,
-    RUNTIME_SESSION_SHAPES,
     classify_session_id,
     hermes_profile_from_runtime_key,
     hermes_registry_lookup,
@@ -33,11 +32,19 @@ from ocbrain.provenance import Provenance
 from ocbrain.scope import ScopeContext
 
 # The real-format parent and child that motivated the fix: a Telegram session
-# and a native child it spawned, both registry rows of one profile. An id is
-# metadata, not transcript content.
+# and a native child it spawned, both registry rows of one profile, plus a cron
+# run id exactly as the Hermes scheduler mints it
+# (cron_<12-hex job id>_<YYYYMMDD>_<HHMMSS>). Ids are metadata, not transcript
+# content; the registry fixture below mirrors the live schema's ``sessions.id``
+# key (PRAGMA-confirmed 2026-09-17) rather than a fabricated column.
 PARENT_SESSION = "20260915_175454_9776060d"
 CHILD_SESSION = "20260915_180902_4f19c2ae"
+CRON_SESSION = "cron_0b59d3345a70_20260825_143534"
 PROFILE = "squirtle"
+
+# The live registry this machine actually serves, used only for read-only
+# existence checks; the fixture above carries the behavioural cases.
+LIVE_REGISTRY_DB = Path.home() / ".hermes" / "profiles" / "squirtlecoframe" / "state.db"
 
 
 def _registry(tmp_path, session_ids, profile=PROFILE):
@@ -45,9 +52,17 @@ def _registry(tmp_path, session_ids, profile=PROFILE):
     db = root / profile / "state.db"
     db.parent.mkdir(parents=True)
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE sessions (session_id TEXT PRIMARY KEY, message_count INTEGER)")
+    # Column names and the ``id`` key mirror the live schema so the lookup is
+    # exercised against the shape it will actually read.
+    conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL, "
+        "ended_at REAL, message_count INTEGER DEFAULT 0, parent_session_id TEXT, "
+        "archived INTEGER DEFAULT 0)"
+    )
     conn.executemany(
-        "INSERT INTO sessions VALUES (?, 3)", [(session_id,) for session_id in session_ids]
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, 'telegram', 1.0)",
+        [(session_id,) for session_id in session_ids],
     )
     conn.commit()
     conn.close()
@@ -70,14 +85,15 @@ def test_the_real_format_hermes_ids_are_runtime_shaped():
     """The regression this pass exists for: the old gate called these date_like.
 
     Every id below is byte-for-byte the shape a Hermes gateway mints -- parent
-    with an 8-hex tail, child with the same -- and the old two-shape gate
-    refused them at closeout, so a Hermes gateway could never join its own
-    receipts to its own sessions.
+    with an 8-hex tail, child with the same, and a scheduled run's
+    ``cron_<12-hex>_<date>_<time>`` -- and the old two-shape gate refused them
+    at closeout, so a Hermes gateway could never join its own receipts to its
+    own sessions or its cron runs.
     """
-    for value in (PARENT_SESSION, CHILD_SESSION, "20260801_075651_56e87d"):
-        assert classify_session_id(value) == HERMES_SESSION_SHAPE, value
-        assert is_runtime_session_id(value)
-        assert HERMES_SESSION_SHAPE in RUNTIME_SESSION_SHAPES
+    for value in (PARENT_SESSION, CHILD_SESSION, "20260801_075651_56e87d", CRON_SESSION):
+        assert is_runtime_session_id(value), value
+    assert classify_session_id(PARENT_SESSION) == "runtime_hermes"
+    assert classify_session_id(CRON_SESSION) == "runtime_hermes_cron"
 
 
 @pytest.mark.parametrize(
@@ -90,6 +106,9 @@ def test_the_real_format_hermes_ids_are_runtime_shaped():
         "20261301_075651_56e87d0b",
         "20260801_256551_56e87d0b",
         "20260801_075651_56e87d0",
+        "cron_g59d3345a70z_20260825_143534",
+        "cron_0b59d3345a7_20260825_143534",
+        "cron_0b59d3345a70_20261325_143534",
     ],
 )
 def test_near_misses_of_the_hermes_shape_stay_refused_shapes(value):
@@ -109,8 +128,8 @@ def test_a_verified_hermes_claim_is_stored_with_its_registry_label(tmp_path, mon
     resolved = resolve_session_identity(PARENT_SESSION, _hermes_provenance())
     assert resolved["session_id"] == PARENT_SESSION
     assert resolved["session_id_source"] == "agent_reported"
-    assert resolved["session_id_shape"] == HERMES_SESSION_SHAPE
-    assert resolved["session_id_verified"] == f"hermes_registry:{PROFILE}"
+    assert resolved["session_id_shape"] == "runtime_hermes"
+    assert resolved["session_id_registry"] == f"hermes_registry:{PROFILE}"
 
 
 def test_a_verified_hermes_child_lands_in_the_closeout_identity_column(tmp_path, monkeypatch):
@@ -133,7 +152,7 @@ def test_a_verified_hermes_child_lands_in_the_closeout_identity_column(tmp_path,
     ).fetchone()
     assert row["session_id"] == CHILD_SESSION
     assert row["session_id_source"] == "agent_reported"
-    assert receipt["provenance"]["session_identity"]["session_id_verified"] == (
+    assert receipt["provenance"]["session_identity"]["session_id_registry"] == (
         f"hermes_registry:{PROFILE}"
     )
 
@@ -172,6 +191,40 @@ def test_two_children_in_one_connection_keep_separate_identities(tmp_path, monke
     assert parent["provenance"]["session_identity"]["session_id"] != (
         child["provenance"]["session_identity"]["session_id"]
     )
+
+
+def test_a_cron_id_the_registry_holds_is_stored(tmp_path, monkeypatch):
+    """A scheduled run's ``cron_<12-hex>_<date>_<time>`` id gates exactly like a
+    native one: shape plus a registry row in the bound profile."""
+    root = _registry(tmp_path, [CRON_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    conn = _core(tmp_path)
+    receipt = record_closeout(
+        conn,
+        task_ref="HERMES-CRON",
+        status="completed",
+        summary="Scheduled run filed under its own cron id.",
+        context=ScopeContext(project="coframe", runtime="hermes", session=CRON_SESSION),
+        provenance=_hermes_provenance(),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT session_id, session_id_source FROM task_closeouts WHERE id=?",
+        (receipt["id"],),
+    ).fetchone()
+    assert row["session_id"] == CRON_SESSION
+    assert row["session_id_source"] == "agent_reported"
+    assert receipt["provenance"]["session_identity"]["session_id_registry"] == (
+        f"hermes_registry:{PROFILE}"
+    )
+
+
+def test_a_cron_id_the_registry_does_not_hold_is_refused(tmp_path, monkeypatch):
+    root = _registry(tmp_path, [PARENT_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    with pytest.raises(ValueError) as excinfo:
+        resolve_session_identity(CRON_SESSION, _hermes_provenance())
+    assert "does not hold this id" in str(excinfo.value)
 
 
 def test_a_claim_the_registry_does_not_hold_is_refused_with_the_reason(tmp_path, monkeypatch):
@@ -221,14 +274,16 @@ def test_quarantine_keeps_an_unverified_hermes_claim_out_of_the_column(tmp_path,
     assert resolved["session_id_claim"] == PARENT_SESSION
 
 
-def test_a_hermes_shaped_hint_never_wins_without_verification(tmp_path, monkeypatch):
-    """A per-process environment value is at best a parent stamp: one Hermes MCP
-    child serves every session of a profile, so an env id copied to every child
-    would give them all one transcript. Verified, a hint may win; unverified, it
-    loses to the connection."""
+def test_a_hermes_shaped_hint_never_wins_even_when_the_registry_holds_it(
+    tmp_path, monkeypatch
+):
+    """One Hermes MCP child serves every session of a profile, so a process-level
+    env hint names at best the parent that spawned the child. Even a hint the
+    registry holds is dropped: with no per-call claim there is no parent stamp,
+    and the connection id serves instead."""
     root = _registry(tmp_path, [PARENT_SESSION])
     monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
-    verified = resolve_session_identity(
+    resolved = resolve_session_identity(
         None,
         Provenance(
             server_connection_id="cafe" * 8,
@@ -236,18 +291,40 @@ def test_a_hermes_shaped_hint_never_wins_without_verification(tmp_path, monkeypa
             client_runtime_key=f"hermes:{PROFILE}",
         ),
     )
-    assert verified["session_id"] == PARENT_SESSION
-    assert verified["session_id_source"] == "harness_attested"
-    unverified = resolve_session_identity(
-        None,
+    assert resolved["session_id"] == f"conn:{'cafe' * 8}"
+    assert resolved["session_id_source"] == "server_connection"
+
+
+def test_a_verified_child_claim_beats_a_registry_held_parent_hint(tmp_path, monkeypatch):
+    """The multiplexed-child case the review flagged: the env carries the parent's
+    id while the call claims the child's. Both are registry rows of the profile,
+    but only the per-call claim is this call's session, so the child wins and the
+    hint leaves no trace."""
+    root = _registry(tmp_path, [PARENT_SESSION, CHILD_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    resolved = resolve_session_identity(
+        CHILD_SESSION,
         Provenance(
             server_connection_id="cafe" * 8,
-            client_session_hint=CHILD_SESSION,
+            client_session_hint=PARENT_SESSION,
             client_runtime_key=f"hermes:{PROFILE}",
         ),
     )
-    assert unverified["session_id"] == f"conn:{'cafe' * 8}"
-    assert unverified["session_id_source"] == "server_connection"
+    assert resolved["session_id"] == CHILD_SESSION
+    assert resolved["session_id_source"] == "agent_reported"
+    assert resolved["session_id_registry"] == f"hermes_registry:{PROFILE}"
+    assert "session_id_claim" not in resolved
+
+
+def test_a_uuid_hint_still_wins_for_non_hermes_runtimes():
+    """Only the Hermes shapes are dropped; a harness-attested UUID hint keeps its
+    pre-gate meaning when no claim is made."""
+    uuid_hint = "5e2dc531-45b2-483b-bdfd-14b6d9767b4b"
+    resolved = resolve_session_identity(
+        None, Provenance(server_connection_id="cafe" * 8, client_session_hint=uuid_hint)
+    )
+    assert resolved["session_id"] == uuid_hint
+    assert resolved["session_id_source"] == "harness_attested"
 
 
 @pytest.mark.parametrize(
@@ -290,3 +367,15 @@ def test_a_foreign_registry_schema_could_not_be_consulted(tmp_path):
     db.parent.mkdir(parents=True)
     sqlite3.connect(db).close()
     assert hermes_registry_lookup(PARENT_SESSION, PROFILE, profiles_root=root) is None
+
+
+@pytest.mark.skipif(
+    not LIVE_REGISTRY_DB.is_file(), reason="live Hermes registry not present on this machine"
+)
+def test_the_live_registry_holds_the_real_format_ids_read_only():
+    """Independent of any fixture: the registry this machine actually serves
+    holds the real-format parent id and a real cron row, and does not hold a
+    shape-valid id it never issued. Existence checks only, read-only."""
+    assert hermes_registry_lookup(PARENT_SESSION, "squirtlecoframe") is True
+    assert hermes_registry_lookup(CRON_SESSION, "squirtlecoframe") is True
+    assert hermes_registry_lookup("20990101_000000_000000aa", "squirtlecoframe") is False

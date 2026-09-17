@@ -71,13 +71,14 @@ def normalize_task_ref(task_ref: Any) -> str:
 # Session identity
 # --------------------------------------------------------------------------- #
 
-# The three shapes a runtime actually mints. Claude Code writes a hyphenated UUID
+# The four shapes a runtime actually mints. Claude Code writes a hyphenated UUID
 # that is byte-identical to its transcript filename; Codex writes a UUIDv7 in the
 # same shape; a bare 32- or 40-char hex digest is the other machine-minted form
-# seen in the wild (Hermes runtime ids); and a Hermes gateway mints
-# ``YYYYMMDD_HHMMSS_<6 or 8 hex>`` in its per-profile session registry. Everything
-# else in the live corpus is a human typing something they thought was
-# descriptive.
+# seen in the wild (Hermes runtime ids); a Hermes gateway mints
+# ``YYYYMMDD_HHMMSS_<6 or 8 hex>`` for its sessions and
+# ``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>`` for its scheduled runs, both keyed on
+# ``sessions.id`` in a per-profile registry. Everything else in the live corpus
+# is a human typing something they thought was descriptive.
 _UUID_SESSION = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -89,14 +90,26 @@ _HERMES_SESSION = re.compile(
     r"_(?:[01]\d|2[0-3])(?:[0-5]\d){2}"
     r"_[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$"
 )
+# Hermes cron runs mint ``cron_<12-hex job id>_<YYYYMMDD>_<HHMMSS>`` (the
+# scheduler's own construction, cron/scheduler.py; job ids are 12-char hex).
+_HERMES_CRON_SESSION = re.compile(
+    r"^cron_[0-9a-f]{12}"
+    r"_(?:\d{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))"
+    r"_(?:[01]\d|2[0-3])(?:[0-5]\d){2}$"
+)
 _DATE_SESSION = re.compile(r"^\d{4}-?\d{2}-?\d{2}")
 _PATH_SESSION = re.compile(r"[/\\]|^~")
 
 # Shapes that ARE a runtime id. Membership, not a regex, so a caller can ask.
-# ``runtime_hermes`` is shape-valid only; storing one additionally requires the
-# registry verification in ``resolve_session_identity``.
-RUNTIME_SESSION_SHAPES = frozenset({"runtime_uuid", "runtime_hex", "runtime_hermes"})
+# The two Hermes shapes are shape-valid only; storing one additionally requires
+# the registry check in ``resolve_session_identity``.
+RUNTIME_SESSION_SHAPES = frozenset(
+    {"runtime_uuid", "runtime_hex", "runtime_hermes", "runtime_hermes_cron"}
+)
 HERMES_SESSION_SHAPE = "runtime_hermes"
+HERMES_CRON_SESSION_SHAPE = "runtime_hermes_cron"
+# Both Hermes shapes resolve through the same per-profile registry check.
+HERMES_REGISTRY_SHAPES = frozenset({HERMES_SESSION_SHAPE, HERMES_CRON_SESSION_SHAPE})
 
 # Where the id in ``task_closeouts.session_id`` came from, in descending trust.
 # Recorded beside the value so nobody has to guess later which rows are joinable.
@@ -127,18 +140,19 @@ def classify_session_id(value: Any) -> str:
     for a machine-minted id, and otherwise the specific way it is wrong --
     ``filesystem_path``, ``contains_space``, ``date_like``, ``slug`` -- so the
     refusal can say what the caller actually sent. A Hermes native id
-    (``YYYYMMDD_HHMMSS_<6 or 8 hex>``) classifies ``runtime_hermes``; shape
-    alone never puts one in the identity column -- see
-    :func:`resolve_session_identity`.
+    (``YYYYMMDD_HHMMSS_<6 or 8 hex>``) classifies ``runtime_hermes`` and a cron
+    run id (``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>``) classifies
+    ``runtime_hermes_cron``; shape alone never puts either in the identity
+    column -- see :func:`resolve_session_identity`.
 
     Measured over the 1,239 closeouts in a read-only backup of the live core
     taken 2026-08-28 12:30 PDT: 211 ``runtime_uuid``, 431 ``absent``, 296
     ``date_like``, 239 ``slug``, 35 ``contains_space``, 27 ``filesystem_path``.
     Every one of the 94 closeouts that joins a Claude Code transcript is
     ``runtime_uuid``; the other 1,145 join nothing, which is what makes this a
-    shape question rather than a taste question. The ``runtime_hermes`` carve-out
-    postdates the census: the Hermes native ids it lifts out of ``date_like``
-    were refused under the old two-shape gate.
+    shape question rather than a taste question. The Hermes carve-outs
+    postdate the census: the native and cron ids they lift out of ``date_like``
+    and ``slug`` were refused under the old two-shape gate.
     """
     if not isinstance(value, str) or not value.strip():
         return "absent"
@@ -147,6 +161,8 @@ def classify_session_id(value: Any) -> str:
         return "runtime_uuid"
     if _HEX_SESSION.match(text):
         return "runtime_hex"
+    if _HERMES_CRON_SESSION.match(text):
+        return HERMES_CRON_SESSION_SHAPE
     if _HERMES_SESSION.match(text):
         return HERMES_SESSION_SHAPE
     if _PATH_SESSION.search(text):
@@ -196,16 +212,23 @@ def hermes_profile_from_runtime_key(runtime_key: Any) -> str | None:
 def hermes_registry_lookup(
     session_id: str, profile: str, *, profiles_root: Path | None = None
 ) -> bool | None:
-    """Check one Hermes native session id against a profile's own registry.
+    """Check one Hermes session id against a profile's own registry.
 
-    Read-only by construction: the database is opened ``mode=ro`` against
+    The live registry keys sessions on ``sessions.id`` (PRAGMA-confirmed on a
+    real profile 2026-09-17), so that is the column this reads. Read-only by
+    construction: the database is opened ``mode=ro`` against
     ``<root>/<profile>/state.db``, both path segments validated, and the id is
     a bound parameter. Returns ``True`` when the registry holds the id,
     ``False`` when the registry was read and does not, and ``None`` when it
     could not be consulted at all -- missing file, unreadable, or a schema this
     check does not recognize. ``None`` is deliberately distinct: an
-    infrastructure failure must be reported as "could not verify", not as
+    infrastructure failure must be reported as "could not check", not as
     "no such session".
+
+    What a ``True`` means is narrow: the id exists in that profile's registry.
+    It does not attest that the id names the session making this call, only
+    that a claim of it is a real session of the bound profile rather than an
+    invented or cross-profile label.
     """
     root = profiles_root
     if root is None:
@@ -222,7 +245,7 @@ def hermes_registry_lookup(
         return None
     try:
         row = conn.execute(
-            "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1", (session_id,)
+            "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
         ).fetchone()
     except sqlite3.Error:
         return None
@@ -234,11 +257,15 @@ def hermes_registry_lookup(
 def _verify_hermes_session(
     session_id: str, observed: Provenance | None, registry: Any
 ) -> tuple[bool, str | None]:
-    """Verify a Hermes-shaped claim against the connection's own profile.
+    """Check a Hermes-shaped claim against the connection's own profile.
 
-    Returns ``(True, None)`` when verified, or ``(False, reason)`` naming why
-    not: no profile bound to this connection, an unreadable registry, or a
-    registry that does not hold the id (the wrong-profile / stale-claim case).
+    Returns ``(True, None)`` when the bound profile's registry holds the id,
+    or ``(False, reason)`` naming why not: no profile bound to this
+    connection, an unreadable registry, or a registry that does not hold the
+    id (the wrong-profile / stale-claim case). Existence in the registry is
+    the gate; it is not a claim that this call *is* that session -- that is
+    the caller's own assertion, recorded as ``agent_reported`` beside the
+    registry label.
     """
     profile = (
         hermes_profile_from_runtime_key(observed.client_runtime_key) if observed else None
@@ -260,15 +287,15 @@ def _verify_hermes_session(
 
 def _hermes_session_error(claim: str, reason: str) -> str:
     return (
-        f"context.session {claim!r} looks like a Hermes native session id but could not "
-        f"be verified: {reason}. A Hermes native id is only accepted from a connection "
-        f"whose server-observed runtime key binds it to the profile that owns the session. "
-        f"A valid one is a UUID like {_EXAMPLE_SESSION_ID}, a bare 32/40-character hex id, "
-        "or a Hermes native id verified against the profile's session registry. Claude Code "
+        f"context.session {claim!r} looks like a Hermes session id but is not held in "
+        f"the bound profile's session registry: {reason}. A Hermes native or cron id is "
+        f"only stored when the profile bound to this connection's runtime key holds it "
+        f"in its registry. A valid one is a UUID like {_EXAMPLE_SESSION_ID}, a bare "
+        "32/40-character hex id, or such a registry-held Hermes id. Claude Code "
         "exports it as $CLAUDE_CODE_SESSION_ID; any other client can export "
-        "$OCBRAIN_SESSION_ID and the server will read it from its own environment. If this "
-        "runtime has no session id, omit context.session entirely and the server records "
-        "its own connection id instead. Do not invent one."
+        "$OCBRAIN_SESSION_ID and the server will read it from its own environment. If "
+        "this runtime has no session id, omit context.session entirely and the server "
+        "records its own connection id instead. Do not invent one."
     )
 
 
@@ -276,9 +303,9 @@ def _session_id_error(claim: str, shape: str) -> str:
     return (
         f"context.session must be the runtime's own session id, not {claim!r} ({shape}). "
         f"A valid one is a UUID like {_EXAMPLE_SESSION_ID}, a bare 32/40-character "
-        "hex id, or a Hermes native id (YYYYMMDD_HHMMSS_hex) verified against the "
-        "profile's session registry. Claude Code exports it as $CLAUDE_CODE_SESSION_ID; "
-        "any other client "
+        "hex id, or a Hermes native or cron id the bound profile's session registry "
+        "actually holds. Claude Code exports it as $CLAUDE_CODE_SESSION_ID; any other "
+        "client "
         "can export $OCBRAIN_SESSION_ID and the server will read it from its own "
         "environment. If this runtime has no session id, omit context.session "
         "entirely and the server records its own connection id instead. Do not "
@@ -314,16 +341,20 @@ def resolve_session_identity(
     channel that has ever reached the agent, and six weeks of prose guidance
     moved the UUID rate from 15.1% (July) to 19.6% (August).
 
-    A Hermes native id is shape-valid but never shape-sufficient. One Hermes
-    MCP child multiplexes every session of a gateway profile, so neither a
-    startup environment variable nor a bare runtime key can attest a specific
-    session -- only the per-profile registry can. An unverified Hermes claim is
-    refused with the reason under ``enforce`` and quarantined (recorded, never
-    stored) under ``quarantine``, the same way any other non-runtime-shaped
-    claim is handled; a verified one is stored with
-    ``session_id_verified`` naming the registry that confirmed it. The same
-    check applies to a Hermes-shaped *hint*: an environment value is per-process,
-    so storing it unverified would stamp one session's id onto every child.
+    A Hermes native or cron id is shape-valid but never shape-sufficient. One
+    Hermes MCP child multiplexes every session of a gateway profile, so a
+    startup environment variable can never name THIS call's session: a
+    hermes-shaped hint is dropped outright rather than consulted -- even one
+    the registry holds, because a real parent id in the env of every child is
+    exactly how a parent stamp would be copied onto all of them. Hermes
+    identity comes only from a per-call claim, and only when the bound
+    profile's registry holds the id. Existence there is the gate, not the
+    attestation: the receipt still says ``agent_reported``, beside a
+    ``session_id_registry`` label naming the profile whose registry was read.
+    An unheld claim is refused with the reason under ``enforce`` and
+    quarantined (recorded, never stored) under ``quarantine``, the same way any
+    other non-runtime-shaped claim is handled. Non-Hermes (UUID/hex) hints keep
+    their existing precedence and behavior.
 
     The caller's claim is never destroyed. It stays verbatim in
     ``context.session`` inside the receipt, and is echoed as ``session_id_claim``
@@ -348,14 +379,14 @@ def resolve_session_identity(
             "session_id_shape": shape,
         }
     problem: str | None = None
-    verified = None
+    registry_label: str | None = None
     if claimed is not None:
-        if shape == HERMES_SESSION_SHAPE:
-            ok, reason = _verify_hermes_session(claimed, observed, registry)
-            if ok:
-                verified = f"hermes_registry:{_hermes_profile(observed)}"
+        if shape in HERMES_REGISTRY_SHAPES:
+            held, reason = _verify_hermes_session(claimed, observed, registry)
+            if held:
+                registry_label = f"hermes_registry:{_hermes_profile(observed)}"
             else:
-                problem = _hermes_session_error(claimed, reason or "unverified")
+                problem = _hermes_session_error(claimed, reason or "not held")
         elif shape not in RUNTIME_SESSION_SHAPES:
             problem = _session_id_error(claimed, shape)
         if problem is not None:
@@ -365,12 +396,12 @@ def resolve_session_identity(
 
     hint = observed.client_session_hint if observed else None
     hint = hint.strip() if isinstance(hint, str) and hint.strip() else None
-    if hint is not None and classify_session_id(hint) == HERMES_SESSION_SHAPE:
-        # Per-process env cannot attest one session of a multiplexing gateway;
-        # an unverified Hermes-shaped hint is dropped, not stored.
-        ok, _reason = _verify_hermes_session(hint, observed, registry)
-        if not ok:
-            hint = None
+    if hint is not None and classify_session_id(hint) in HERMES_REGISTRY_SHAPES:
+        # A Hermes gateway exports process-level env over a shared MCP child:
+        # the value names at best the parent that spawned this child, and
+        # registry existence does not make it this call's session. Hermes
+        # identity comes only from a per-call claim; drop the hint entirely.
+        hint = None
     resolved: dict[str, Any] = {"session_id_shape": shape}
     if hint is not None and is_runtime_session_id(hint):
         resolved["session_id"] = hint
@@ -378,8 +409,8 @@ def resolve_session_identity(
     elif claimed is not None:
         resolved["session_id"] = claimed
         resolved["session_id_source"] = "agent_reported"
-        if verified is not None:
-            resolved["session_id_verified"] = verified
+        if registry_label is not None:
+            resolved["session_id_registry"] = registry_label
     elif observed is not None and observed.server_connection_id:
         resolved["session_id"] = (
             f"{SERVER_CONNECTION_SESSION_PREFIX}{observed.server_connection_id}"
