@@ -46,6 +46,12 @@ CRON_SESSION = "cron_0b59d3345a70_20260825_143534"
 # same ``sessions.id`` registry. This is the real planner row that motivated
 # the admission (see the live test below).
 API_SESSION = "api-77806f5ba8ae308d"
+# The api-server platform also mints ``api_<10-digit epoch>_<8 lowercase hex>``
+# for a native peer POST /api/sessions row (and its fork) —
+# f"api_{int(time.time())}_{uuid4().hex[:8]}", gateway/platforms/api_server.py
+# 2817/2977. This is the real thinkercoframe planner row that motivated the
+# admission.
+API_PEER_SESSION = "api_1789673743_bed6bf3c"
 PROFILE = "squirtle"
 
 # The live registry this machine actually serves, used only for read-only
@@ -295,6 +301,71 @@ def test_an_api_conversation_id_of_another_profile_is_refused(tmp_path, monkeypa
     assert "does not hold this id" in str(excinfo.value)
 
 
+def test_the_real_format_api_peer_session_id_is_runtime_shaped():
+    """Only the mint's exact form -- ``api_`` plus a 10-digit epoch and 8
+    lowercase hex -- admits; lookalikes stay slugs, and the hyphenated
+    conversation shape stays its own shape."""
+    assert classify_session_id(API_PEER_SESSION) == "runtime_hermes_api_peer"
+    assert is_runtime_session_id(API_PEER_SESSION)
+    for value in (
+        "api_178967374_bed6bf3c",
+        "api_1789673743_bed6bf3c0",
+        "api_1789673743_BED6BF3C",
+        "api-1789673743_bed6bf3c",
+        "api_1789673743-bed6bf3c",
+    ):
+        assert not is_runtime_session_id(value), value
+        assert classify_session_id(value) == "slug", value
+    # A bare epoch+hex pair without the api_ prefix stays date_like, exactly as
+    # it was before this shape existed.
+    assert classify_session_id("1789673743_bed6bf3c") == "date_like"
+    assert not is_runtime_session_id("1789673743_bed6bf3c")
+
+
+def test_a_verified_api_peer_session_id_is_stored_end_to_end(tmp_path, monkeypatch):
+    """A peer POST session id gates exactly like the derived conversation shape:
+    registry row in the profile bound to the connection, never shape alone."""
+    root = _registry(tmp_path, [PARENT_SESSION, API_PEER_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    conn = _core(tmp_path)
+    receipt = record_closeout(
+        conn,
+        task_ref="HERMES-API-PEER",
+        status="completed",
+        summary="Planner peer POST session filed under its own api_ id.",
+        context=ScopeContext(project="coframe", runtime="hermes", session=API_PEER_SESSION),
+        provenance=_hermes_provenance(),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT session_id, session_id_source FROM task_closeouts WHERE id=?",
+        (receipt["id"],),
+    ).fetchone()
+    assert row["session_id"] == API_PEER_SESSION
+    assert row["session_id_source"] == "agent_reported"
+    assert receipt["provenance"]["session_identity"]["session_id_registry"] == (
+        f"hermes_registry:{PROFILE}"
+    )
+
+
+def test_an_api_peer_session_id_absent_from_the_registry_is_refused(tmp_path, monkeypatch):
+    root = _registry(tmp_path, [PARENT_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    with pytest.raises(ValueError) as excinfo:
+        resolve_session_identity(API_PEER_SESSION, _hermes_provenance())
+    assert "does not hold this id" in str(excinfo.value)
+
+
+def test_an_api_peer_session_id_of_another_profile_is_refused(tmp_path, monkeypatch):
+    """The id is a real row, but of a profile this connection is not bound to."""
+    _registry(tmp_path, [PARENT_SESSION])
+    _registry(tmp_path, [API_PEER_SESSION], profile="bulbasaur")
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(tmp_path / "profiles"))
+    with pytest.raises(ValueError) as excinfo:
+        resolve_session_identity(API_PEER_SESSION, _hermes_provenance())
+    assert "does not hold this id" in str(excinfo.value)
+
+
 def test_an_api_shaped_hint_still_never_overrides_a_child_claim(tmp_path, monkeypatch):
     """The api shape rides the same registry path as native and cron, so a
     process-level env hint naming the parent conversation is dropped the same
@@ -492,3 +563,5 @@ def test_the_live_thinkercoframe_registry_holds_the_real_api_conversation_id():
     """The motivating row: a planner API conversation the old gate called a slug."""
     assert hermes_registry_lookup(API_SESSION, "thinkercoframe") is True
     assert hermes_registry_lookup("api-" + "0" * 16, "thinkercoframe") is False
+    assert hermes_registry_lookup(API_PEER_SESSION, "thinkercoframe") is True
+    assert hermes_registry_lookup("api_" + "0" * 10 + "_" + "0" * 8, "thinkercoframe") is False

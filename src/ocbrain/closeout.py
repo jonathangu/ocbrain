@@ -71,15 +71,16 @@ def normalize_task_ref(task_ref: Any) -> str:
 # Session identity
 # --------------------------------------------------------------------------- #
 
-# The five shapes a runtime actually mints. Claude Code writes a hyphenated UUID
+# The six shapes a runtime actually mints. Claude Code writes a hyphenated UUID
 # that is byte-identical to its transcript filename; Codex writes a UUIDv7 in the
 # same shape; a bare 32- or 40-char hex digest is the other machine-minted form
 # seen in the wild (Hermes runtime ids); a Hermes gateway mints
 # ``YYYYMMDD_HHMMSS_<6 or 8 hex>`` for its sessions and
 # ``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>`` for its scheduled runs, and its
-# api-server platform derives ``api-<16 lowercase hex>`` per conversation, all
-# three keyed on ``sessions.id`` in a per-profile registry. Everything else in
-# the live corpus is a human typing something they thought was descriptive.
+# api-server platform derives ``api-<16 lowercase hex>`` per conversation and
+# mints ``api_<epoch>_<8 hex>`` for a peer POST session row, all four keyed on
+# ``sessions.id`` in a per-profile registry. Everything else in the live corpus
+# is a human typing something they thought was descriptive.
 _UUID_SESSION = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -102,21 +103,30 @@ _HERMES_CRON_SESSION = re.compile(
 # (sha256 of system prompt + first user message, gateway/platforms/api_server.py
 # ``_derive_chat_session_id``), keyed on the same ``sessions.id`` registry.
 _HERMES_API_SESSION = re.compile(r"^api-[0-9a-f]{16}$")
+# The same platform also mints ``api_<10-digit epoch>_<8 lowercase hex>`` for a
+# native peer POST /api/sessions row (and its fork), ``f"api_{int(time.time())}_"
+# f"{uuid4().hex[:8]}"`` at gateway/platforms/api_server.py:2817/2977 — a
+# caller-supplied id is passed through unvalidated, so this shape too is
+# registry-gated, never accepted on shape alone.
+_HERMES_API_PEER_SESSION = re.compile(r"^api_\d{10}_[0-9a-f]{8}$")
 _DATE_SESSION = re.compile(r"^\d{4}-?\d{2}-?\d{2}")
 _PATH_SESSION = re.compile(r"[/\\]|^~")
 
 # Shapes that ARE a runtime id. Membership, not a regex, so a caller can ask.
-# The three Hermes shapes are shape-valid only; storing one additionally requires
+# The four Hermes shapes are shape-valid only; storing one additionally requires
 # the registry check in ``resolve_session_identity``.
 RUNTIME_SESSION_SHAPES = frozenset(
-    {"runtime_uuid", "runtime_hex", "runtime_hermes", "runtime_hermes_cron", "runtime_hermes_api"}
+    {"runtime_uuid", "runtime_hex", "runtime_hermes", "runtime_hermes_cron",
+     "runtime_hermes_api", "runtime_hermes_api_peer"}
 )
 HERMES_SESSION_SHAPE = "runtime_hermes"
 HERMES_CRON_SESSION_SHAPE = "runtime_hermes_cron"
 HERMES_API_SESSION_SHAPE = "runtime_hermes_api"
+HERMES_API_PEER_SESSION_SHAPE = "runtime_hermes_api_peer"
 # Every Hermes shape resolves through the same per-profile registry check.
 HERMES_REGISTRY_SHAPES = frozenset(
-    {HERMES_SESSION_SHAPE, HERMES_CRON_SESSION_SHAPE, HERMES_API_SESSION_SHAPE}
+    {HERMES_SESSION_SHAPE, HERMES_CRON_SESSION_SHAPE, HERMES_API_SESSION_SHAPE,
+     HERMES_API_PEER_SESSION_SHAPE}
 )
 
 # Where the id in ``task_closeouts.session_id`` came from, in descending trust.
@@ -151,8 +161,10 @@ def classify_session_id(value: Any) -> str:
     (``YYYYMMDD_HHMMSS_<6 or 8 hex>``) classifies ``runtime_hermes`` and a cron
     run id (``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>``) classifies
     ``runtime_hermes_cron``; an api-server conversation id (``api-<16 hex>``)
-    classifies ``runtime_hermes_api``. Shape alone never puts any of the three
-    in the identity column -- see :func:`resolve_session_identity`.
+    classifies ``runtime_hermes_api`` and the platform's peer-session mint
+    (``api_<10-digit epoch>_<8 hex>``) classifies ``runtime_hermes_api_peer``.
+    Shape alone never puts any of the four in the identity column -- see
+    :func:`resolve_session_identity`.
 
     Measured over the 1,239 closeouts in a read-only backup of the live core
     taken 2026-08-28 12:30 PDT: 211 ``runtime_uuid``, 431 ``absent``, 296
@@ -176,6 +188,8 @@ def classify_session_id(value: Any) -> str:
         return HERMES_SESSION_SHAPE
     if _HERMES_API_SESSION.match(text):
         return HERMES_API_SESSION_SHAPE
+    if _HERMES_API_PEER_SESSION.match(text):
+        return HERMES_API_PEER_SESSION_SHAPE
     if _PATH_SESSION.search(text):
         return "filesystem_path"
     if any(char.isspace() for char in text):
