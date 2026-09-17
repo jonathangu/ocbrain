@@ -71,14 +71,15 @@ def normalize_task_ref(task_ref: Any) -> str:
 # Session identity
 # --------------------------------------------------------------------------- #
 
-# The four shapes a runtime actually mints. Claude Code writes a hyphenated UUID
+# The five shapes a runtime actually mints. Claude Code writes a hyphenated UUID
 # that is byte-identical to its transcript filename; Codex writes a UUIDv7 in the
 # same shape; a bare 32- or 40-char hex digest is the other machine-minted form
 # seen in the wild (Hermes runtime ids); a Hermes gateway mints
 # ``YYYYMMDD_HHMMSS_<6 or 8 hex>`` for its sessions and
-# ``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>`` for its scheduled runs, both keyed on
-# ``sessions.id`` in a per-profile registry. Everything else in the live corpus
-# is a human typing something they thought was descriptive.
+# ``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>`` for its scheduled runs, and its
+# api-server platform derives ``api-<16 lowercase hex>`` per conversation, all
+# three keyed on ``sessions.id`` in a per-profile registry. Everything else in
+# the live corpus is a human typing something they thought was descriptive.
 _UUID_SESSION = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -97,19 +98,26 @@ _HERMES_CRON_SESSION = re.compile(
     r"_(?:\d{4}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))"
     r"_(?:[01]\d|2[0-3])(?:[0-5]\d){2}$"
 )
+# The api-server platform derives ``api-<16 lowercase hex>`` per conversation
+# (sha256 of system prompt + first user message, gateway/platforms/api_server.py
+# ``_derive_chat_session_id``), keyed on the same ``sessions.id`` registry.
+_HERMES_API_SESSION = re.compile(r"^api-[0-9a-f]{16}$")
 _DATE_SESSION = re.compile(r"^\d{4}-?\d{2}-?\d{2}")
 _PATH_SESSION = re.compile(r"[/\\]|^~")
 
 # Shapes that ARE a runtime id. Membership, not a regex, so a caller can ask.
-# The two Hermes shapes are shape-valid only; storing one additionally requires
+# The three Hermes shapes are shape-valid only; storing one additionally requires
 # the registry check in ``resolve_session_identity``.
 RUNTIME_SESSION_SHAPES = frozenset(
-    {"runtime_uuid", "runtime_hex", "runtime_hermes", "runtime_hermes_cron"}
+    {"runtime_uuid", "runtime_hex", "runtime_hermes", "runtime_hermes_cron", "runtime_hermes_api"}
 )
 HERMES_SESSION_SHAPE = "runtime_hermes"
 HERMES_CRON_SESSION_SHAPE = "runtime_hermes_cron"
-# Both Hermes shapes resolve through the same per-profile registry check.
-HERMES_REGISTRY_SHAPES = frozenset({HERMES_SESSION_SHAPE, HERMES_CRON_SESSION_SHAPE})
+HERMES_API_SESSION_SHAPE = "runtime_hermes_api"
+# Every Hermes shape resolves through the same per-profile registry check.
+HERMES_REGISTRY_SHAPES = frozenset(
+    {HERMES_SESSION_SHAPE, HERMES_CRON_SESSION_SHAPE, HERMES_API_SESSION_SHAPE}
+)
 
 # Where the id in ``task_closeouts.session_id`` came from, in descending trust.
 # Recorded beside the value so nobody has to guess later which rows are joinable.
@@ -142,8 +150,9 @@ def classify_session_id(value: Any) -> str:
     refusal can say what the caller actually sent. A Hermes native id
     (``YYYYMMDD_HHMMSS_<6 or 8 hex>``) classifies ``runtime_hermes`` and a cron
     run id (``cron_<12-hex>_<YYYYMMDD>_<HHMMSS>``) classifies
-    ``runtime_hermes_cron``; shape alone never puts either in the identity
-    column -- see :func:`resolve_session_identity`.
+    ``runtime_hermes_cron``; an api-server conversation id (``api-<16 hex>``)
+    classifies ``runtime_hermes_api``. Shape alone never puts any of the three
+    in the identity column -- see :func:`resolve_session_identity`.
 
     Measured over the 1,239 closeouts in a read-only backup of the live core
     taken 2026-08-28 12:30 PDT: 211 ``runtime_uuid``, 431 ``absent``, 296
@@ -165,6 +174,8 @@ def classify_session_id(value: Any) -> str:
         return HERMES_CRON_SESSION_SHAPE
     if _HERMES_SESSION.match(text):
         return HERMES_SESSION_SHAPE
+    if _HERMES_API_SESSION.match(text):
+        return HERMES_API_SESSION_SHAPE
     if _PATH_SESSION.search(text):
         return "filesystem_path"
     if any(char.isspace() for char in text):
@@ -288,8 +299,9 @@ def _verify_hermes_session(
 def _hermes_session_error(claim: str, reason: str) -> str:
     return (
         f"context.session {claim!r} looks like a Hermes session id but is not held in "
-        f"the bound profile's session registry: {reason}. A Hermes native or cron id is "
-        f"only stored when the profile bound to this connection's runtime key holds it "
+        f"the bound profile's session registry: {reason}. A Hermes native, cron, or "
+        f"api-server conversation id is only stored when the profile bound to this "
+        f"connection's runtime key holds it "
         f"in its registry. A valid one is a UUID like {_EXAMPLE_SESSION_ID}, a bare "
         "32/40-character hex id, or such a registry-held Hermes id. Claude Code "
         "exports it as $CLAUDE_CODE_SESSION_ID; any other client can export "
@@ -303,7 +315,8 @@ def _session_id_error(claim: str, shape: str) -> str:
     return (
         f"context.session must be the runtime's own session id, not {claim!r} ({shape}). "
         f"A valid one is a UUID like {_EXAMPLE_SESSION_ID}, a bare 32/40-character "
-        "hex id, or a Hermes native or cron id the bound profile's session registry "
+        "hex id, or a Hermes native, cron, or api-server conversation id the bound "
+        "profile's session registry "
         "actually holds. Claude Code exports it as $CLAUDE_CODE_SESSION_ID; any other "
         "client "
         "can export $OCBRAIN_SESSION_ID and the server will read it from its own "
@@ -329,8 +342,8 @@ def resolve_session_identity(
     1. ``client_session_hint`` -- read by the server from its own process
        environment, so no model can type it in.
     2. the caller's ``context.session``, but only if it is runtime-shaped --
-       and, for a Hermes native id, only if the originating profile's session
-       registry confirms it.
+       and, for a Hermes-shaped id (native, cron, or api-server conversation),
+       only if the originating profile's session registry confirms it.
     3. the server's own connection id, prefixed ``conn:``.
     4. nothing.
 
@@ -341,7 +354,7 @@ def resolve_session_identity(
     channel that has ever reached the agent, and six weeks of prose guidance
     moved the UUID rate from 15.1% (July) to 19.6% (August).
 
-    A Hermes native or cron id is shape-valid but never shape-sufficient. One
+    A Hermes-shaped id is shape-valid but never shape-sufficient. One
     Hermes MCP child multiplexes every session of a gateway profile, so a
     startup environment variable can never name THIS call's session: a
     hermes-shaped hint is dropped outright rather than consulted -- even one

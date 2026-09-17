@@ -40,6 +40,12 @@ from ocbrain.scope import ScopeContext
 PARENT_SESSION = "20260915_175454_9776060d"
 CHILD_SESSION = "20260915_180902_4f19c2ae"
 CRON_SESSION = "cron_0b59d3345a70_20260825_143534"
+# The api-server platform derives a stable conversation id per Open WebUI-style
+# chat: ``api-`` plus the first 16 lowercase hex chars of a sha256 digest
+# (gateway/platforms/api_server.py ``_derive_chat_session_id``), keyed on the
+# same ``sessions.id`` registry. This is the real planner row that motivated
+# the admission (see the live test below).
+API_SESSION = "api-77806f5ba8ae308d"
 PROFILE = "squirtle"
 
 # The live registry this machine actually serves, used only for read-only
@@ -227,6 +233,98 @@ def test_a_cron_id_the_registry_does_not_hold_is_refused(tmp_path, monkeypatch):
     assert "does not hold this id" in str(excinfo.value)
 
 
+def test_the_real_format_api_conversation_id_is_runtime_shaped():
+    """Only the mint's exact form -- ``api-`` plus 16 lowercase hex -- admits."""
+    assert classify_session_id(API_SESSION) == "runtime_hermes_api"
+    assert is_runtime_session_id(API_SESSION)
+    for value in (
+        "api-77806f5ba8ae308",
+        "api-77806f5ba8ae308d0",
+        "api-77806F5BA8AE308D",
+        "api_77806f5ba8ae308d",
+        "77806f5ba8ae308d",
+    ):
+        assert not is_runtime_session_id(value), value
+        assert classify_session_id(value) == "slug", value
+
+
+def test_a_verified_api_conversation_id_is_stored_end_to_end(tmp_path, monkeypatch):
+    """An api-server conversation id gates exactly like native and cron: shape
+    plus a registry row in the profile bound to the connection."""
+    root = _registry(tmp_path, [PARENT_SESSION, API_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    conn = _core(tmp_path)
+    receipt = record_closeout(
+        conn,
+        task_ref="HERMES-API",
+        status="completed",
+        summary="Planner API conversation filed under its own api- id.",
+        context=ScopeContext(project="coframe", runtime="hermes", session=API_SESSION),
+        provenance=_hermes_provenance(),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT session_id, session_id_source FROM task_closeouts WHERE id=?",
+        (receipt["id"],),
+    ).fetchone()
+    assert row["session_id"] == API_SESSION
+    assert row["session_id_source"] == "agent_reported"
+    assert receipt["provenance"]["session_identity"]["session_id_registry"] == (
+        f"hermes_registry:{PROFILE}"
+    )
+
+
+def test_an_api_conversation_id_absent_from_the_registry_is_refused(tmp_path, monkeypatch):
+    root = _registry(tmp_path, [PARENT_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    with pytest.raises(ValueError) as excinfo:
+        resolve_session_identity(API_SESSION, _hermes_provenance())
+    assert "does not hold this id" in str(excinfo.value)
+
+
+def test_an_api_conversation_id_of_another_profile_is_refused(tmp_path, monkeypatch):
+    """The id is real, but of a profile this connection is not bound to: the
+    bound profile's registry reads fine and simply does not hold it."""
+    _registry(tmp_path, [PARENT_SESSION])
+    _registry(tmp_path, [API_SESSION], profile="bulbasaur")
+    monkeypatch.setenv(
+        HERMES_PROFILES_ROOT_ENV, str(tmp_path / "profiles")
+    )
+    with pytest.raises(ValueError) as excinfo:
+        resolve_session_identity(API_SESSION, _hermes_provenance())
+    assert "does not hold this id" in str(excinfo.value)
+
+
+def test_an_api_shaped_hint_still_never_overrides_a_child_claim(tmp_path, monkeypatch):
+    """The api shape rides the same registry path as native and cron, so a
+    process-level env hint naming the parent conversation is dropped the same
+    way and the per-call child claim wins untouched."""
+    root = _registry(tmp_path, [PARENT_SESSION, API_SESSION])
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(root))
+    resolved = resolve_session_identity(
+        PARENT_SESSION,
+        Provenance(
+            server_connection_id="cafe" * 8,
+            client_session_hint=API_SESSION,
+            client_runtime_key=f"hermes:{PROFILE}",
+        ),
+    )
+    assert resolved["session_id"] == PARENT_SESSION
+    assert resolved["session_id_registry"] == f"hermes_registry:{PROFILE}"
+    assert "session_id_claim" not in resolved
+
+
+def test_a_uuid_claim_is_unchanged_by_the_api_shape_gate(tmp_path, monkeypatch):
+    """A UUID claim on a Hermes-bound connection never consults the registry."""
+    uuid_claim = "5e2dc531-45b2-483b-bdfd-14b6d9767b4b"
+    monkeypatch.setenv(HERMES_PROFILES_ROOT_ENV, str(tmp_path / "profiles-empty"))
+    resolved = resolve_session_identity(uuid_claim, _hermes_provenance())
+    assert resolved["session_id"] == uuid_claim
+    assert resolved["session_id_source"] == "agent_reported"
+    assert resolved["session_id_shape"] == "runtime_uuid"
+    assert "session_id_registry" not in resolved
+
+
 def test_a_claim_the_registry_does_not_hold_is_refused_with_the_reason(tmp_path, monkeypatch):
     """Wrong profile, stale id, typo: registry readable, id absent."""
     root = _registry(tmp_path, [PARENT_SESSION])
@@ -379,3 +477,18 @@ def test_the_live_registry_holds_the_real_format_ids_read_only():
     assert hermes_registry_lookup(PARENT_SESSION, "squirtlecoframe") is True
     assert hermes_registry_lookup(CRON_SESSION, "squirtlecoframe") is True
     assert hermes_registry_lookup("20990101_000000_000000aa", "squirtlecoframe") is False
+
+
+LIVE_API_REGISTRY_DB = (
+    Path.home() / ".hermes" / "profiles" / "thinkercoframe" / "state.db"
+)
+
+
+@pytest.mark.skipif(
+    not LIVE_API_REGISTRY_DB.is_file(),
+    reason="live thinkercoframe registry not present on this machine",
+)
+def test_the_live_thinkercoframe_registry_holds_the_real_api_conversation_id():
+    """The motivating row: a planner API conversation the old gate called a slug."""
+    assert hermes_registry_lookup(API_SESSION, "thinkercoframe") is True
+    assert hermes_registry_lookup("api-" + "0" * 16, "thinkercoframe") is False
