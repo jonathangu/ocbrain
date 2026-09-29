@@ -8,7 +8,9 @@ charged to the ranker.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -37,7 +39,20 @@ _METRIC_KEYS = (
     "empty_packets",
     "rows",
 )
-_BREAKDOWN_SECTIONS = ("by_delivery_target", "by_query_length")
+_BREAKDOWN_SECTIONS = ("by_delivery_target", "by_query_length", "by_split")
+SPLIT_SALT = "ocbrain-retrieval-eval-split-v1"
+TEST_FRACTION = 0.3
+TRAIN = "train"
+TEST = "test"
+HEADROOM_SATURATION = 0.95
+HEADROOM_METRIC = "positives_recalled_at_k"
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_SEED = 20260929
+_PER_QUERY_FIELDS = {
+    "positives_recalled_at_k": "positive_recall",
+    "mrr_positive": "mrr",
+    "negatives_in_top_k": "negative_hit",
+}
 
 
 def _json_dict(value: Any) -> dict[str, Any]:
@@ -114,9 +129,7 @@ def build_golden(conn, *, since: str | None = None, out_path: Path) -> dict[str,
                 "served_at": str(row["served_at"]),
                 "query": query,
                 "context": context,
-                "delivery_target": _delivery_target(
-                    context, provenance, row["served_to_runtime"]
-                ),
+                "delivery_target": _delivery_target(context, provenance, row["served_to_runtime"]),
                 "outcome": outcome,
                 "served_ids": served,
             }
@@ -191,7 +204,31 @@ def _mean(total: float, count: int) -> float:
     return round(total / count, 6)
 
 
-def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
+def split_of(query_id: str, *, salt: str = SPLIT_SALT, test_fraction: float = TEST_FRACTION) -> str:
+    digest = hashlib.sha256(f"{salt}:{query_id}".encode()).digest()
+    position = int.from_bytes(digest[:8], "big") / 2**64
+    return TEST if position < test_fraction else TRAIN
+
+
+def _row_id(row: dict[str, Any]) -> str:
+    return str(row.get("retrieval_use_id") or row.get("query") or "")
+
+
+def split_rows(
+    golden: dict[str, Any],
+    *,
+    salt: str = SPLIT_SALT,
+    test_fraction: float = TEST_FRACTION,
+) -> dict[str, list[dict[str, Any]]]:
+    parts: dict[str, list[dict[str, Any]]] = {TRAIN: [], TEST: []}
+    for row in golden.get("rows") or []:
+        parts[split_of(_row_id(row), salt=salt, test_fraction=test_fraction)].append(row)
+    return parts
+
+
+def _score(
+    conn, golden: dict[str, Any], *, k: int, salt: str, test_fraction: float
+) -> dict[str, Any]:
     serving = {
         str(row[0])
         for row in conn.execute(
@@ -201,7 +238,9 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
     overall = _Tally()
     by_target: dict[str, _Tally] = defaultdict(_Tally)
     by_bucket: dict[str, _Tally] = defaultdict(_Tally)
+    by_split: dict[str, _Tally] = defaultdict(_Tally)
     skipped: dict[str, int] = defaultdict(int)
+    per_query: list[dict[str, Any]] = []
     for row in golden.get("rows") or []:
         outcome = str(row.get("outcome") or "")
         query = str(row.get("query") or "")
@@ -218,6 +257,14 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
         top = [str(item.get("belief_id")) for item in result.get("items") or []]
         tally = _Tally()
         tally.rows = 1
+        entry: dict[str, Any] = {
+            "id": _row_id(row),
+            "split": split_of(_row_id(row), salt=salt, test_fraction=test_fraction),
+            "positive_recall": None,
+            "mrr": None,
+            "negative_hit": None,
+            "top_digest": hashlib.sha256("\n".join(top).encode()).hexdigest()[:12],
+        }
         if not top:
             tally.empty_packets = 1
         if outcome in POSITIVE_OUTCOMES:
@@ -229,6 +276,8 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
                     if belief_id in still_serving:
                         tally.mrr = 1.0 / rank
                         break
+                entry["positive_recall"] = tally.positives_recalled
+                entry["mrr"] = tally.mrr
             else:
                 skipped["positive_without_still_serving"] += 1
         elif outcome in NEGATIVE_OUTCOMES:
@@ -236,6 +285,7 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
                 retrieved = set(top) & set(still_serving)
                 tally.negatives = 1
                 tally.negatives_hit = len(retrieved) / len(still_serving)
+                entry["negative_hit"] = tally.negatives_hit
                 if outcome == "harmful" and retrieved:
                     tally.harmful_still_served = 1
             else:
@@ -247,16 +297,13 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
         overall.add(tally)
         by_target[target].add(tally)
         by_bucket[_bucket(query)].add(tally)
+        by_split[entry["split"]].add(tally)
+        per_query.append(entry)
     return {
-        "schema_version": EVAL_SCHEMA,
-        "k": k,
         "metrics": overall.metrics(),
-        "by_delivery_target": {
-            key: tally.metrics() for key, tally in sorted(by_target.items())
-        },
-        "by_query_length": {
-            key: tally.metrics() for key, tally in sorted(by_bucket.items())
-        },
+        "by_delivery_target": {key: tally.metrics() for key, tally in sorted(by_target.items())},
+        "by_query_length": {key: tally.metrics() for key, tally in sorted(by_bucket.items())},
+        "by_split": {name: by_split[name].metrics() for name in (TRAIN, TEST)},
         "coverage": {
             "rows": overall.rows,
             "scorable_rows": overall.positives + overall.negatives,
@@ -264,7 +311,88 @@ def evaluate(conn, golden: dict[str, Any], *, k: int = 12) -> dict[str, Any]:
             "scorable_negative_rows": overall.negatives,
             "skipped": dict(sorted(skipped.items())),
         },
+        "per_query": per_query,
     }
+
+
+def _noise(first: list[dict[str, Any]], second: list[dict[str, Any]]) -> dict[str, Any]:
+    differing: list[str] = []
+    wobble = 0.0
+    for before, after in zip(first, second, strict=True):
+        changed = before["top_digest"] != after["top_digest"]
+        for field in _PER_QUERY_FIELDS.values():
+            left, right = before[field], after[field]
+            if left is None or right is None:
+                changed = changed or left != right
+            else:
+                wobble = max(wobble, abs(left - right))
+                changed = changed or left != right
+        if changed:
+            differing.append(before["id"])
+    return {
+        "replicates": 2,
+        "deterministic": not differing,
+        "nondeterministic_queries": differing,
+        "max_score_wobble": round(wobble, 6),
+    }
+
+
+def headroom(report: dict[str, Any]) -> dict[str, Any]:
+    test = (report.get("by_split") or {}).get(TEST) or {}
+    scorable = test.get("scorable_positive_rows", 0)
+    score = test.get(HEADROOM_METRIC) if scorable else None
+    if score is None:
+        advice = "no scorable positive test queries; add cases before climbing anything"
+        saturated = False
+    elif score >= HEADROOM_SATURATION:
+        advice = "climb cost/latency, not quality: test score is saturated"
+        saturated = True
+    else:
+        advice = "quality has headroom on the test split"
+        saturated = False
+    return {
+        "metric": HEADROOM_METRIC,
+        "baseline_test_score": score,
+        "threshold": HEADROOM_SATURATION,
+        "saturated": saturated,
+        "advice": advice,
+    }
+
+
+def evaluate(
+    conn,
+    golden: dict[str, Any],
+    *,
+    k: int = 12,
+    salt: str = SPLIT_SALT,
+    test_fraction: float = TEST_FRACTION,
+    verify_determinism: bool = True,
+) -> dict[str, Any]:
+    scored = _score(conn, golden, k=k, salt=salt, test_fraction=test_fraction)
+    report: dict[str, Any] = {
+        "schema_version": EVAL_SCHEMA,
+        "k": k,
+        "split": {"salt": salt, "test_fraction": test_fraction},
+        **scored,
+    }
+    if verify_determinism:
+        again = _score(conn, golden, k=k, salt=salt, test_fraction=test_fraction)
+        report["noise"] = _noise(scored["per_query"], again["per_query"])
+    report["headroom"] = headroom(report)
+    return report
+
+
+def train_failures(golden: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
+    train_ids = {
+        entry["id"]
+        for entry in report.get("per_query") or []
+        if entry.get("split") == TRAIN
+        and (
+            (entry.get("positive_recall") is not None and entry["positive_recall"] < 1.0)
+            or (entry.get("negative_hit") or 0.0) > 0.0
+        )
+    }
+    return [row for row in golden.get("rows") or [] if _row_id(row) in train_ids]
 
 
 def _section_metrics(payload: dict[str, Any], section: str) -> dict[str, dict[str, Any]]:
@@ -289,12 +417,54 @@ def _compare_metrics(
     return deltas
 
 
+def _bootstrap_delta(pairs: list[tuple[float, float]]) -> dict[str, Any]:
+    if not pairs:
+        return {"n": 0, "delta": None, "low": None, "high": None, "significant": False}
+    diffs = [after - before for before, after in pairs]
+    n = len(diffs)
+    rng = random.Random(BOOTSTRAP_SEED)
+    means = sorted(
+        sum(diffs[rng.randrange(n)] for _ in range(n)) / n for _ in range(BOOTSTRAP_RESAMPLES)
+    )
+    low = means[int(0.025 * BOOTSTRAP_RESAMPLES)]
+    high = means[int(0.975 * BOOTSTRAP_RESAMPLES) - 1]
+    return {
+        "n": n,
+        "delta": round(sum(diffs) / n, 6),
+        "low": round(low, 6),
+        "high": round(high, 6),
+        "significant": low > 0 or high < 0,
+    }
+
+
+def _confidence_intervals(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, dict[str, dict[str, Any]]]:
+    before_rows = {str(e["id"]): e for e in baseline.get("per_query") or []}
+    after_rows = {str(e["id"]): e for e in candidate.get("per_query") or []}
+    shared = sorted(set(before_rows) & set(after_rows))
+    groups: dict[str, list[str]] = {
+        "overall": shared,
+        TRAIN: [i for i in shared if before_rows[i].get("split") == TRAIN],
+        TEST: [i for i in shared if before_rows[i].get("split") == TEST],
+    }
+    intervals: dict[str, dict[str, dict[str, Any]]] = {}
+    for group, ids in groups.items():
+        intervals[group] = {}
+        for metric, field in _PER_QUERY_FIELDS.items():
+            pairs = [
+                (before_rows[i][field], after_rows[i][field])
+                for i in ids
+                if before_rows[i].get(field) is not None and after_rows[i].get(field) is not None
+            ]
+            intervals[group][metric] = _bootstrap_delta(pairs)
+    return intervals
+
+
 def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {
         "schema_version": COMPARE_SCHEMA,
-        "metrics": _compare_metrics(
-            baseline.get("metrics") or {}, candidate.get("metrics") or {}
-        ),
+        "metrics": _compare_metrics(baseline.get("metrics") or {}, candidate.get("metrics") or {}),
     }
     for section in _BREAKDOWN_SECTIONS:
         before = _section_metrics(baseline, section)
@@ -303,4 +473,13 @@ def compare(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, An
             key: _compare_metrics(before.get(key) or {}, after.get(key) or {})
             for key in sorted(set(before) | set(after))
         }
+    if baseline.get("per_query") and candidate.get("per_query"):
+        result["confidence_intervals"] = _confidence_intervals(baseline, candidate)
+        result["headline"] = TEST
+    result["split_mismatch"] = baseline.get("split") != candidate.get("split")
+    result["noise"] = {
+        "baseline": baseline.get("noise"),
+        "candidate": candidate.get("noise"),
+    }
+    result["headroom"] = headroom(baseline)
     return result

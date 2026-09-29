@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import UTC, datetime, timedelta
 
 from ocbrain.closeout import record_closeout
 from ocbrain.core_v1 import (
@@ -1181,14 +1182,15 @@ def test_v1_stdio_delivery_target_is_selectable(tmp_path, monkeypatch):
 
 def test_v1_context_accepts_as_of_and_rejects_non_iso(tmp_path):
     conn = _seed_v1(tmp_path)
+    as_of = datetime.now(UTC) + timedelta(days=1)
     arguments = {
         "query": "Shared Context bridge runtimes",
         "context": {"project": "ocbrain", "runtime": "codex", "task": "v1-acceptance"},
-        "as_of": "2026-09-12T00:00:00+00:00",
+        "as_of": as_of.isoformat(),
     }
     context = _payload(handle_request(conn, _tool_call("brain.context", arguments)))
     assert context["schema_version"] == "ocbrain.context.v1"
-    assert context["coverage"]["as_of"] == "2026-09-12T00:00:00.000000+00:00"
+    assert context["coverage"]["as_of"] == as_of.isoformat(timespec="microseconds")
     assert context["coverage"]["returned"] == 1
     assert context["items"][0]["era"]["valid_until"] is None
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
+from ocbrain import retrieval_eval
 from ocbrain.cli import main
 from ocbrain.core_v1 import append_core_event, init_core_v1
 from ocbrain.db import connect
@@ -135,9 +137,7 @@ def test_build_golden_freezes_judged_rows_and_skips_unjudged(tmp_path, monkeypat
     conn.close()
 
 
-def test_evaluate_scores_recall_and_negatives_then_drops_retired_ids(
-    tmp_path, monkeypatch
-) -> None:
+def test_evaluate_scores_recall_and_negatives_then_drops_retired_ids(tmp_path, monkeypatch) -> None:
     conn = _seeded_core(tmp_path, monkeypatch)
     golden_path = tmp_path / "golden.json"
     build_golden(conn, since=None, out_path=golden_path)
@@ -250,3 +250,193 @@ def test_cli_build_run_compare_round_trip(tmp_path, monkeypatch, capsys) -> None
     compared = json.loads(capsys.readouterr().out)
     assert compared["metrics"]["positives_recalled_at_k"]["delta"] == 0
     assert main(["--db", str(db), "retrieval-eval"]) == 2
+
+
+TOPICS = 24
+
+
+def _topic_belief(index: int) -> str:
+    return f"curated:bountiful:topic-{index}"
+
+
+def _topic_query(index: int) -> str:
+    return f"zebra{index} procedure for quokka{index} rollout"
+
+
+def _topic_core(tmp_path: Path, monkeypatch):
+    def fake_neighbors(_conn, query, *, candidate_ids=None, **_kwargs):
+        rows = [
+            {
+                "belief_id": b,
+                "similarity": 0.9 if query.startswith(f"zebra{b.rsplit('-', 1)[1]} ") else 0.0,
+            }
+            for b in sorted(candidate_ids or [])
+        ]
+        return rows, None, {}
+
+    monkeypatch.setattr("ocbrain.core_v1.semantic_neighbors", fake_neighbors)
+    conn = connect(tmp_path / "topics.sqlite")
+    init_core_v1(conn)
+    for index in range(TOPICS):
+        _seed_belief(
+            conn,
+            belief_id=_topic_belief(index),
+            body=f"The zebra{index} procedure stages the quokka{index} rollout in batches.",
+        )
+        _seed_retrieval(
+            conn,
+            use_id=f"ret_topic_{index}",
+            outcome="helpful",
+            query=_topic_query(index),
+            served_ids=[_topic_belief(index)],
+        )
+    conn.commit()
+    golden_path = tmp_path / "topics-golden.json"
+    build_golden(conn, since=None, out_path=golden_path)
+    return conn, json.loads(golden_path.read_text())
+
+
+def test_split_is_deterministic_salted_and_disjoint() -> None:
+    ids = [f"ret_{index}" for index in range(400)]
+    first = [retrieval_eval.split_of(i) for i in ids]
+    assert first == [retrieval_eval.split_of(i) for i in ids]
+    assert set(first) == {"train", "test"}
+    share = first.count("test") / len(ids)
+    assert 0.2 < share < 0.4
+    other = [retrieval_eval.split_of(i, salt="another-salt") for i in ids]
+    assert other != first
+
+    golden = {"rows": [{"retrieval_use_id": i, "query": i} for i in ids]}
+    parts = retrieval_eval.split_rows(golden)
+    assert len(parts["train"]) + len(parts["test"]) == len(ids)
+    assert not {r["retrieval_use_id"] for r in parts["train"]} & {
+        r["retrieval_use_id"] for r in parts["test"]
+    }
+
+
+def test_evaluate_reports_train_and_test_separately(tmp_path, monkeypatch) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    report = evaluate(conn, golden, k=12)
+
+    train = report["by_split"]["train"]
+    test = report["by_split"]["test"]
+    assert train["rows"] + test["rows"] == report["metrics"]["rows"] == TOPICS
+    assert train["rows"] > 0
+    assert test["rows"] > 0
+    assert {entry["split"] for entry in report["per_query"]} == {"train", "test"}
+    assert report["split"]["salt"] == retrieval_eval.SPLIT_SALT
+
+    deltas = compare(report, report)
+    assert set(deltas["by_split"]) == {"train", "test"}
+    assert deltas["headline"] == "test"
+    conn.close()
+
+
+def test_train_failures_never_expose_test_rows(tmp_path, monkeypatch) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    monkeypatch.setattr(retrieval_eval, "search_core_v1", lambda *a, **k: {"items": []})
+    broken = evaluate(conn, golden, k=12)
+
+    failures = retrieval_eval.train_failures(golden, broken)
+    test_ids = {e["id"] for e in broken["per_query"] if e["split"] == "test"}
+    assert failures
+    assert len(failures) == broken["by_split"]["train"]["rows"]
+    assert not {row["retrieval_use_id"] for row in failures} & test_ids
+    conn.close()
+
+
+def test_compare_reports_bootstrap_ci_for_test_delta(tmp_path, monkeypatch) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    baseline = evaluate(conn, golden, k=12)
+
+    same = compare(baseline, baseline)
+    interval = same["confidence_intervals"]["test"]["positives_recalled_at_k"]
+    assert interval["delta"] == 0
+    assert interval["low"] == interval["high"] == 0
+    assert interval["significant"] is False
+
+    monkeypatch.setattr(retrieval_eval, "search_core_v1", lambda *a, **k: {"items": []})
+    worse = evaluate(conn, golden, k=12)
+    drop = compare(baseline, worse)["confidence_intervals"]
+    for group in ("overall", "train", "test"):
+        entry = drop[group]["positives_recalled_at_k"]
+        assert entry["delta"] < 0
+        assert entry["high"] < 0
+        assert entry["significant"] is True
+    assert compare(baseline, worse) == compare(baseline, worse)
+    conn.close()
+
+
+def test_determinism_check_is_clean_then_flags_a_flaky_retriever(tmp_path, monkeypatch) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    clean = evaluate(conn, golden, k=12)
+    assert clean["noise"]["deterministic"] is True
+    assert clean["noise"]["nondeterministic_queries"] == []
+    assert clean["noise"]["max_score_wobble"] == 0
+
+    real = retrieval_eval.search_core_v1
+    calls = {"n": 0}
+
+    def flaky(conn_, query, **kwargs):
+        calls["n"] += 1
+        result = real(conn_, query, **kwargs)
+        if calls["n"] > TOPICS:
+            return {"items": []}
+        return result
+
+    monkeypatch.setattr(retrieval_eval, "search_core_v1", flaky)
+    noisy = evaluate(conn, golden, k=12)
+    assert noisy["noise"]["deterministic"] is False
+    assert len(noisy["noise"]["nondeterministic_queries"]) == TOPICS
+    assert noisy["noise"]["max_score_wobble"] == 1.0
+    assert compare(clean, noisy)["noise"]["candidate"]["deterministic"] is False
+    conn.close()
+
+
+def test_negative_control_random_and_empty_retrievers_score_clearly_worse(
+    tmp_path, monkeypatch
+) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    real = evaluate(conn, golden, k=3)
+    assert real["metrics"]["positives_recalled_at_k"] == 1.0
+
+    pool = [_topic_belief(index) for index in range(TOPICS)]
+    rng = random.Random(7)
+    monkeypatch.setattr(
+        retrieval_eval,
+        "search_core_v1",
+        lambda *a, **k: {"items": [{"belief_id": b} for b in rng.sample(pool, 3)]},
+    )
+    shuffled = evaluate(conn, golden, k=3, verify_determinism=False)
+    assert shuffled["metrics"]["positives_recalled_at_k"] < 0.5
+
+    monkeypatch.setattr(retrieval_eval, "search_core_v1", lambda *a, **k: {"items": []})
+    empty = evaluate(conn, golden, k=3)
+    assert empty["metrics"]["positives_recalled_at_k"] == 0.0
+    assert empty["metrics"]["empty_packets"] == TOPICS
+
+    for broken in (shuffled, empty):
+        verdict = compare(real, broken)["confidence_intervals"]["test"]
+        assert verdict["mrr_positive"]["significant"] is True
+        assert verdict["mrr_positive"]["high"] < 0
+    conn.close()
+
+
+def test_headroom_says_climb_cost_when_baseline_test_score_is_saturated(
+    tmp_path, monkeypatch
+) -> None:
+    conn, golden = _topic_core(tmp_path, monkeypatch)
+    saturated = evaluate(conn, golden, k=12)
+    assert saturated["headroom"]["saturated"] is True
+    assert "cost/latency" in saturated["headroom"]["advice"]
+    assert compare(saturated, saturated)["headroom"]["saturated"] is True
+
+    monkeypatch.setattr(retrieval_eval, "search_core_v1", lambda *a, **k: {"items": []})
+    weak = evaluate(conn, golden, k=12)
+    assert weak["headroom"]["saturated"] is False
+    assert weak["headroom"]["baseline_test_score"] == 0.0
+    assert "cost/latency" not in weak["headroom"]["advice"]
+
+    empty_golden = {"rows": []}
+    assert retrieval_eval.headroom(evaluate(conn, empty_golden))["baseline_test_score"] is None
+    conn.close()
