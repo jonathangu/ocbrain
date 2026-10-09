@@ -46,7 +46,7 @@ def history_runtime(path: Path) -> str:
     # Codex/Claude transcripts retain their real runtime attribution.
     if ".codex" in parts or "codex-home" in parts or name.startswith("rollout-"):
         return "codex"
-    if ".claude" in parts or "claude-home" in parts:
+    if ".claude" in parts or any(part.startswith(".claude-") for part in parts) or "claude-home" in parts:
         return "claude"
     if ".hermes" in parts or "hermes-home" in parts:
         return "hermes"
