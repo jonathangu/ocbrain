@@ -2123,6 +2123,7 @@ def _hosted_approve_one(
         attributes["approval_reason"] = reason
     if answers_proposal:
         attributes["answers_proposal"] = answers_proposal
+    conn.execute("SAVEPOINT hosted_approve_item")
     proposal_event_id = append_core_event(
         conn,
         "compilation_proposed",
@@ -2143,14 +2144,24 @@ def _hosted_approve_one(
         },
         writer="ocbrain-cli",
     )
-    decision = decide_proposal_v1(
-        conn,
-        proposal_event_id=proposal_event_id,
-        decision="approve",
-        actor=approved_by,
-        edited_body=None,
-        reason=reason or "hosted approval queue",
-    )
+    try:
+        decision = decide_proposal_v1(
+            conn,
+            proposal_event_id=proposal_event_id,
+            decision="approve",
+            actor=approved_by,
+            edited_body=None,
+            reason=reason or "hosted approval queue",
+        )
+    except PermissionError as exc:
+        conn.execute("ROLLBACK TO SAVEPOINT hosted_approve_item")
+        conn.execute("RELEASE SAVEPOINT hosted_approve_item")
+        return refused("belief_not_approvable", str(exc))
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT hosted_approve_item")
+        conn.execute("RELEASE SAVEPOINT hosted_approve_item")
+        raise
+    conn.execute("RELEASE SAVEPOINT hosted_approve_item")
     return {
         "evidence_id": canonical,
         "status": "approved",
