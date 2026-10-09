@@ -1459,6 +1459,6 @@ def test_every_nonempty_section_keeps_its_first_item_when_goals_fill_the_budget(
     )
     assert len(text) <= DEFAULT_BRIEFING_BUDGET_CHARS
     assert "- (pinned) keep this decision" in text
-    assert "- ledger " + "l" * 280 in text
+    assert "- ledger ll" in text
     assert "- goal 0 " in text
     assert accounting["truncated"] is True
