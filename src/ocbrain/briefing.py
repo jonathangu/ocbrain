@@ -1181,13 +1181,15 @@ def _render(
     for key, _header in SECTION_ORDER:
         kept[key] = []
         dropped[key] = 0
-        for line in safe_items[key]:
-            cost = len(line) + 1
-            if cost <= remaining:
-                kept[key].append(line)
-                remaining -= cost
-            else:
-                dropped[key] += 1
+    for first_pass in (True, False):
+        for key, _header in SECTION_ORDER:
+            for line in safe_items[key][:1] if first_pass else safe_items[key][1:]:
+                cost = len(line) + 1
+                if cost <= remaining:
+                    kept[key].append(line)
+                    remaining -= cost
+                else:
+                    dropped[key] += 1
 
     rendered = _assemble_briefing(title, kept, dropped, empty=empty)
     if len(rendered[0]) <= budget and not scope_id_compacted:
@@ -1218,16 +1220,17 @@ def _render_exactly_bounded(
     # skeleton, including all four headers and omission accounting. Items are
     # then admitted in the same deterministic section/item order as the legacy
     # path, but against their fully rendered cost rather than an estimate.
-    for key, _header in SECTION_ORDER:
-        for line in items[key]:
-            kept[key].append(line)
-            dropped[key] -= 1
-            candidate = _assemble_briefing(title, kept, dropped, empty=empty)
-            if len(candidate[0]) <= budget:
-                rendered = candidate
-            else:
-                kept[key].pop()
-                dropped[key] += 1
+    for first_pass in (True, False):
+        for key, _header in SECTION_ORDER:
+            for line in items[key][:1] if first_pass else items[key][1:]:
+                kept[key].append(line)
+                dropped[key] -= 1
+                candidate = _assemble_briefing(title, kept, dropped, empty=empty)
+                if len(candidate[0]) <= budget:
+                    rendered = candidate
+                else:
+                    kept[key].pop()
+                    dropped[key] += 1
 
     # Item content has priority over a verbose identifier. Spend any exact
     # remainder on the scope after the useful section content has been chosen.

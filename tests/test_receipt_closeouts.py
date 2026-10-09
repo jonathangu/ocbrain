@@ -114,3 +114,14 @@ def test_dry_run_prints_arguments_and_writes_nothing(harness, capsys) -> None:
     run("--dry-run", capsys=capsys)
 
     assert rows() == {}
+
+
+def test_leaf_receipt_files_under_its_brief(harness, capsys) -> None:
+    lane, run, rows = harness
+    (lane / "builder-hard-20261009t130452z-77856.md").write_text(
+        "# Receipt\n\nBrief: /x/lanes/OCBrain/BRIEF-Revive-20261009.md\n\nSTATUS: DONE\n"
+    )
+
+    run(capsys=capsys)
+
+    assert set(rows()) == {"ocbrain/brief-revive-20261009"}

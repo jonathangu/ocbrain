@@ -19,6 +19,7 @@ STATUS_RE = re.compile(r"^[#*\-\s]*STATUS:\s*\**\s*(DONE|BLOCKED|FAILED)\b")
 PR_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 TITLE_PREFIX_RE = re.compile(r"^Receipt\s*[:—-]\s*", re.IGNORECASE)
 COMMAND_RE = re.compile(r"`[^`]+`")
+BRIEF_RE = re.compile(r"^\s*[-*]?\s*\**Brief:?\**:?\s*(\S+\.md)", re.MULTILINE)
 CLOSEOUT_STATUS = {"DONE": "completed", "BLOCKED": "blocked", "FAILED": "failed"}
 VERIFIER_STATUS = {"DONE": "passed", "BLOCKED": "unknown", "FAILED": "failed"}
 UNRESOLVED_LIMIT = 500
@@ -99,7 +100,9 @@ def _plan(path: Path, project: str, raw: bytes) -> dict[str, Any] | None:
         return None
     index, match = hit
     word = match.group(1)
-    task_ref = f"{path.parent.name}/{path.stem}".lower()
+    brief = BRIEF_RE.search(text)
+    owner = Path(brief.group(1)) if brief else path
+    task_ref = f"{owner.parent.name}/{owner.stem}".lower()
     digest = hashlib.sha256(raw).hexdigest()
     uri = f"file://{path}"
     pr_urls = list(dict.fromkeys(PR_RE.findall(text)))[:PR_LIMIT]

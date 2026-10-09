@@ -25,6 +25,7 @@ from ocbrain.briefing import (
     MIN_BRIEFING_BUDGET_CHARS,
     SECTION_ORDER,
     GoalError,
+    _render,
     _source_pointer_warning,
     build_briefing,
     build_ledger,
@@ -1443,3 +1444,21 @@ def test_cli_absolute_pointer_checks_its_own_repo(
         else []
     )
     assert payload["warnings"] == expected
+
+
+@pytest.mark.parametrize("scope_id", ["project:coframe", "project:" + "x" * 1000])
+def test_every_nonempty_section_keeps_its_first_item_when_goals_fill_the_budget(scope_id):
+    items = {
+        "goals": [f"- goal {i} " + "g" * 280 for i in range(5)],
+        "ledger": ["- ledger " + "l" * 280, "- ledger two " + "l" * 280],
+        "chain": [],
+        "gotchas": ["- (pinned) keep this decision", "- (pinned) and this one"],
+    }
+    text, accounting, _sections = _render(
+        scope_id, items, budget=DEFAULT_BRIEFING_BUDGET_CHARS, empty=False
+    )
+    assert len(text) <= DEFAULT_BRIEFING_BUDGET_CHARS
+    assert "- (pinned) keep this decision" in text
+    assert "- ledger " + "l" * 280 in text
+    assert "- goal 0 " in text
+    assert accounting["truncated"] is True
