@@ -119,3 +119,40 @@ def test_endpoint_flags_forwarded_when_set() -> None:
     assert argv[argv.index("--model") + 1] == "some model"
     assert argv[argv.index("--api-key-env") + 1] == "LLM_KEY"
     assert argv[argv.index("--env-file") + 1] == "/tmp/env file"
+
+
+def _manifest_apply_argv(**overrides: str) -> list[str]:
+    env = os.environ.copy()
+    env.pop("OCBRAIN_PROMOTE_MANIFEST_ACTOR", None)
+    env.pop("OCBRAIN_PROMOTE_MANIFEST_ALLOW_HOSTED", None)
+    env.update(
+        {
+            "OCBRAIN_DB": "/tmp/ocbrain-shell-test.sqlite",
+            "OCBRAIN_PYTHON": "/tmp/ocbrain-shell-test-python",
+            "OCBRAIN_ROOT": str(ROOT),
+            **overrides,
+        }
+    )
+    completed = subprocess.run(  # noqa: S603 - fixed repository script
+        ["/bin/bash", str(SCRIPT), "--print-manifest-apply-argv"],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+    )
+    assert completed.stdout.endswith(b"\0")
+    return [part.decode() for part in completed.stdout[:-1].split(b"\0")]
+
+
+def test_manifest_apply_argv_without_hosted_flag() -> None:
+    argv = _manifest_apply_argv(OCBRAIN_PROMOTE_MANIFEST_ACTOR="lane-actor")
+
+    assert argv == ["curated-apply", "--actor", "lane-actor"]
+
+
+def test_manifest_apply_argv_with_hosted_flag() -> None:
+    argv = _manifest_apply_argv(
+        OCBRAIN_PROMOTE_MANIFEST_ACTOR="lane-actor",
+        OCBRAIN_PROMOTE_MANIFEST_ALLOW_HOSTED="1",
+    )
+
+    assert argv == ["curated-apply", "--actor", "lane-actor", "--allow-hosted-egress"]

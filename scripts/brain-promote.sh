@@ -77,9 +77,16 @@ CURATE_ARGS=(
 [[ -n "${OCBRAIN_PROMOTE_API_KEY_ENV:-}" ]] && CURATE_ARGS+=(--api-key-env "$OCBRAIN_PROMOTE_API_KEY_ENV")
 [[ -n "${OCBRAIN_PROMOTE_ENV_FILE:-}" ]] && CURATE_ARGS+=(--env-file "$OCBRAIN_PROMOTE_ENV_FILE")
 
+MANIFEST_APPLY_ARGS=(curated-apply --actor "${OCBRAIN_PROMOTE_MANIFEST_ACTOR:-brain-promote}")
+[[ "${OCBRAIN_PROMOTE_MANIFEST_ALLOW_HOSTED:-}" == "1" ]] && MANIFEST_APPLY_ARGS+=(--allow-hosted-egress)
+
 # Side-effect-free probe for deterministic tests of the real shell expansion.
 if [[ "${1:-}" == "--print-curate-argv" ]]; then
   printf '%s\0' "${CURATE_ARGS[@]}"
+  exit 0
+fi
+if [[ "${1:-}" == "--print-manifest-apply-argv" ]]; then
+  printf '%s\0' "${MANIFEST_APPLY_ARGS[@]}"
   exit 0
 fi
 
@@ -188,8 +195,7 @@ if [[ -n "${OCBRAIN_PROMOTE_MANIFEST_CMDS:-}" ]]; then
       echo "manifest command failed: $manifest_cmd; continuing"
       continue
     fi
-    "$PY" -m ocbrain.cli --db "$DB" curated-apply \
-      --actor "${OCBRAIN_PROMOTE_MANIFEST_ACTOR:-brain-promote}" "$manifest_path" \
+    "$PY" -m ocbrain.cli --db "$DB" "${MANIFEST_APPLY_ARGS[@]}" "$manifest_path" \
       || echo "curated-apply failed for $manifest_path; continuing"
   done
 fi
