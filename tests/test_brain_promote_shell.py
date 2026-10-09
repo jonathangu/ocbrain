@@ -16,6 +16,10 @@ def _curate_argv(**overrides: str) -> list[str]:
         "OCBRAIN_PROMOTE_MAX_TOKENS",
         "OCBRAIN_PROMOTE_PROJECT",
         "OCBRAIN_PROMOTE_PROVIDER",
+        "OCBRAIN_PROMOTE_BASE_URL",
+        "OCBRAIN_PROMOTE_MODEL",
+        "OCBRAIN_PROMOTE_API_KEY_ENV",
+        "OCBRAIN_PROMOTE_ENV_FILE",
     ):
         env.pop(name, None)
     env.update(
@@ -91,3 +95,27 @@ def test_curate_argv_preserves_quoting_and_forwards_all_arguments() -> None:
         "7000",
         "--apply",
     ]
+
+
+_ENDPOINT_FLAGS = ("--base-url", "--model", "--api-key-env", "--env-file")
+
+
+def test_endpoint_flags_absent_when_unset() -> None:
+    argv = _curate_argv()
+
+    assert not set(_ENDPOINT_FLAGS) & set(argv)
+    assert argv[-1] == "--apply"
+
+
+def test_endpoint_flags_forwarded_when_set() -> None:
+    argv = _curate_argv(
+        OCBRAIN_PROMOTE_BASE_URL="https://llm.example/v1",
+        OCBRAIN_PROMOTE_MODEL="some model",
+        OCBRAIN_PROMOTE_API_KEY_ENV="LLM_KEY",
+        OCBRAIN_PROMOTE_ENV_FILE="/tmp/env file",
+    )
+
+    assert argv[argv.index("--base-url") + 1] == "https://llm.example/v1"
+    assert argv[argv.index("--model") + 1] == "some model"
+    assert argv[argv.index("--api-key-env") + 1] == "LLM_KEY"
+    assert argv[argv.index("--env-file") + 1] == "/tmp/env file"
