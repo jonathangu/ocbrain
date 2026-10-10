@@ -142,8 +142,9 @@ REPO_ROOT = LAUNCHER.parents[1].resolve()
 
 def _launcher_via(target: Path, *, extra_env: dict[str, str] | None = None) -> list[str]:
     env = {**os.environ, "OCBRAIN_PYTHON": "/bin/echo"}
-    for name in ("OCBRAIN_ROOT", "OCBRAIN_DB", "OCBRAIN_ACTIVE_DB_FILE"):
+    for name in ("OCBRAIN_ROOT", "OCBRAIN_DB"):
         env.pop(name, None)
+    env["OCBRAIN_ACTIVE_DB_FILE"] = str(target.parent / "absent-active-core.path")
     if extra_env:
         env.update(extra_env)
     result = subprocess.run(  # noqa: S603 - fixed local test launcher
