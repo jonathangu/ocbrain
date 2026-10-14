@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -126,3 +127,69 @@ def test_launcher_does_not_impose_idle_timeout_but_preserves_explicit_opt_in(
         env={**base_env, "OCBRAIN_MCP_IDLE_TIMEOUT_SECONDS": "900"},
     )
     assert json.loads(explicit.stdout)["timeout"] == "900"
+
+
+# --------------------------------------------------------------------------- #
+# Symlink resolution
+# --------------------------------------------------------------------------- #
+
+# ~/.local/bin/ocbrain-mcp is a symlink into a repo checkout. The launcher must
+# root itself where the link POINTS, not where the link LIVES; before the chase
+# below existed, ROOT resolved to ~/.local and the import failed with
+# ModuleNotFoundError. REPO_ROOT is the checkout this test file itself runs in.
+REPO_ROOT = LAUNCHER.parents[1].resolve()
+
+
+def _launcher_via(target: Path, *, extra_env: dict[str, str] | None = None) -> list[str]:
+    env = {**os.environ, "OCBRAIN_PYTHON": "/bin/echo"}
+    for name in ("OCBRAIN_ROOT", "OCBRAIN_DB"):
+        env.pop(name, None)
+    env["OCBRAIN_ACTIVE_DB_FILE"] = str(target.parent / "absent-active-core.path")
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(  # noqa: S603 - fixed local test launcher
+        [str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return result.stdout.strip().split()
+
+
+def test_launcher_invoked_through_a_symlink_roots_at_the_target_repo(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    link = bin_dir / "ocbrain-mcp"
+    link.symlink_to(LAUNCHER)
+
+    args = _launcher_via(link)
+
+    assert args[args.index("--db") + 1] == str(REPO_ROOT / "data" / "ocbrain.sqlite")
+
+
+def test_launcher_walks_a_chain_of_relative_symlinks(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy(LAUNCHER, repo / "scripts" / "ocbrain-mcp")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (repo / "ocbrain-mcp-link").symlink_to("scripts/ocbrain-mcp")
+    (bin_dir / "ocbrain-mcp").symlink_to(
+        os.path.relpath(repo / "ocbrain-mcp-link", bin_dir)
+    )
+
+    args = _launcher_via(bin_dir / "ocbrain-mcp")
+
+    assert args[args.index("--db") + 1] == str(repo / "data" / "ocbrain.sqlite")
+
+
+def test_an_explicit_ocbrain_root_wins_even_through_a_symlink(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    link = bin_dir / "ocbrain-mcp"
+    link.symlink_to(LAUNCHER)
+
+    args = _launcher_via(link, extra_env={"OCBRAIN_ROOT": str(tmp_path / "elsewhere")})
+
+    assert args[args.index("--db") + 1] == str(tmp_path / "elsewhere" / "data" / "ocbrain.sqlite")

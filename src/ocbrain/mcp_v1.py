@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ocbrain.closeout import record_closeout
+from ocbrain.closeout import get_closeout, record_closeout
 from ocbrain.config import load_config
 from ocbrain.core_v1 import (
     CORE_V1_SCHEMA_VERSION,
@@ -1003,6 +1003,27 @@ def get_v1(
             "delivery_target": delivery_target,
             "object_kind": "evidence",
             **_evidence_for_delivery(evidence, delivery_target=delivery_target),
+        }
+    receipt = get_closeout(conn, object_id)
+    if receipt is not None:
+        # Closeout receipts are the harness's own local task state -- the same
+        # records brain.ledger serves locally -- and are not egress-filtered,
+        # so a hosted delivery never gets one: a typed refusal instead of the
+        # misleading not-found, and no existence doubt for callers to retry
+        # around. Local runtime clients already file and ledger these receipts,
+        # so read access is the same trust level, not a new one.
+        if delivery_target == HOSTED_MODEL_TARGET:
+            raise PermissionError(
+                "closeout receipts are local-only task state and are not served "
+                "by brain.get for hosted_model delivery; read them from a local "
+                "runtime connection (brain.ledger serves their task state)"
+            )
+        return {
+            "schema_version": "ocbrain.object.v1",
+            "delivery_target": delivery_target,
+            "object_kind": "closeout",
+            "mode": mode,
+            **receipt,
         }
     raise ValueError(f"object not found: {object_id}")
 

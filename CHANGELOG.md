@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Hermes api-server peer session ids (`api_<10-digit epoch>_<8 hex>`, minted by
+  the platform's POST /api/sessions and fork handlers) are admitted as a sixth
+  runtime session shape (`runtime_hermes_api_peer`), through the same
+  per-profile `sessions.id` registry gate as the derived conversation shape —
+  never on shape alone, since a caller-supplied id passes through that handler
+  unvalidated.
+
+- Hermes api-server conversation ids (`api-<16 hex>`, minted by the gateway's
+  `_derive_chat_session_id`) are admitted as a fifth runtime session shape,
+  gated through the same per-profile `sessions.id` registry check as the native
+  and cron shapes — never on shape alone — with the child-claim-over-hint
+  precedence unchanged.
+
 - Harden hosted approval before integration: explicit `brain.ingest` scopes may
   narrow policy only on the same canonical scope identity; scope ids must match
   their declared non-legacy type; project-filtered bulk approval includes the

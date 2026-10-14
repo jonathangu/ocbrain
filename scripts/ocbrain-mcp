@@ -1,8 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${OCBRAIN_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
+# Resolve this script through its symlink chain, so an invocation via
+# ~/.local/bin/ocbrain-mcp finds the repo the link points at rather than the bin
+# directory the link lives in. macOS ships bash 3.2, which has no `readlink -f`,
+# so the chain is walked one hop at a time; relative targets are resolved against
+# the directory of the link they were read from, and the bound stops a cycle.
+_script_path="${BASH_SOURCE[0]}"
+_ocbrain_links=0
+while [ -L "$_script_path" ]; do
+  _link_target="$(readlink "$_script_path")"
+  case "$_link_target" in
+    /*) _script_path="$_link_target" ;;
+    *) _script_path="$(dirname -- "$_script_path")/$_link_target" ;;
+  esac
+  _ocbrain_links=$((_ocbrain_links + 1))
+  if [ "$_ocbrain_links" -ge 40 ]; then
+    echo "ocbrain-mcp: symlink chain longer than 40 links" >&2
+    exit 2
+  fi
+done
+SCRIPT_DIR="$(cd -- "$(dirname -- "$_script_path")" && pwd -P)"
+ROOT="${OCBRAIN_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd -P)}"
 DB="${OCBRAIN_DB:-}"
 ACTIVE_DB_FILE="${OCBRAIN_ACTIVE_DB_FILE:-$ROOT/data/active-core.path}"
 DB_SELECTED_FROM_POINTER=0

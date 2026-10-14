@@ -29,6 +29,53 @@ fi
 # keeps exiting 0 while promoting nothing. Set OCBRAIN_CONFIG yourself to
 # override.
 
+# Claude Code seats live in ~/.claude and in every ~/.claude-*; test each
+# candidate so an unmatched glob never reaches import-history as a literal.
+HISTORY_DIRS=(
+  "$HOME/.codex/sessions"
+  "$HOME/.codex/archived_sessions"
+)
+for claude_projects in "$HOME/.claude/projects" "$HOME"/.claude-*/projects; do
+  [[ -d "$claude_projects" ]] && HISTORY_DIRS+=("$claude_projects")
+done
+HISTORY_DIRS+=(
+  "$HOME/.hermes/sessions"
+  "$HOME/.ocbrain/exports/cursor"
+)
+
+# Agent memory/instruction files. The two ~/.hermes entries are the retired
+# single-gateway home; the fleet now keeps one home per agent profile, each with
+# its own SOUL.md and memories/, and none of those were ever imported.
+MEMORY_PATHS=(
+  "$HOME/.claude/CLAUDE.md"
+  "$HOME/.codex/AGENTS.md"
+  "$HOME/.hermes/SOUL.md"
+  "$HOME/.hermes/memories"
+)
+# Test each candidate rather than passing a glob. import-memory drops a missing
+# directory silently, but an unmatched glob keeps its literal '*' through path
+# selection and is only rejected later, as an unreadable-path skip on every run.
+# A profile need not have both, and an empty memories/ is normal (togepicoframe
+# has one today); import-memory sweeps *.md, so the .lock files beside them and
+# the credentials in the profile root are never candidates.
+for profile_dir in "$HOME/.hermes/profiles"/*/; do
+  profile_dir="${profile_dir%/}"
+  [[ -f "$profile_dir/SOUL.md" ]] && MEMORY_PATHS+=("$profile_dir/SOUL.md")
+  [[ -d "$profile_dir/memories" ]] && MEMORY_PATHS+=("$profile_dir/memories")
+done
+if [[ -n "${OCBRAIN_SYNC_EXTRA_MEMORY_PATHS:-}" ]]; then
+  IFS=: read -r -a extra_memory <<< "$OCBRAIN_SYNC_EXTRA_MEMORY_PATHS"
+  for extra_path in "${extra_memory[@]}"; do
+    [[ -n "$extra_path" && -e "$extra_path" ]] && MEMORY_PATHS+=("$extra_path")
+  done
+fi
+
+if [[ "${1:-}" == "--print-plan" ]]; then
+  for entry in "${HISTORY_DIRS[@]}"; do printf 'history:%s\0' "$entry"; done
+  for entry in "${MEMORY_PATHS[@]}"; do printf 'memory:%s\0' "$entry"; done
+  exit 0
+fi
+
 SYNC_PROJECT="${OCBRAIN_SYNC_PROJECT:-workspace}"
 SYNC_PRIVACY_SCOPE="${OCBRAIN_SYNC_PRIVACY_SCOPE:-workspace}"
 SYNC_BATCH_SIZE="${OCBRAIN_SYNC_BATCH_SIZE:-25}"
@@ -97,39 +144,25 @@ echo "brain_events before: $before"
 # 3. Agent runtime history (Codex, Claude Code, Hermes, Cursor) -> v1 core.
 run_with_budget "$HARVEST_BUDGET_SECONDS" \
   "$PY" -m ocbrain.cli --db "$DB" import-history \
-  "$HOME/.codex/sessions" \
-  "$HOME/.codex/archived_sessions" \
-  "$HOME/.claude/projects" \
-  "$HOME/.hermes/sessions" \
-  "$HOME/.ocbrain/exports/cursor" \
+  "${HISTORY_DIRS[@]}" \
   --project "$SYNC_PROJECT" --privacy-scope "$SYNC_PRIVACY_SCOPE" \
   --batch-size "$SYNC_BATCH_SIZE" --evidence-only
 
-# 4. Agent memory/instruction files. The two ~/.hermes entries are the retired
-# single-gateway home; the fleet now keeps one home per agent profile, each with
-# its own SOUL.md and memories/, and none of those were ever imported.
-MEMORY_PATHS=(
-  "$HOME/.claude/CLAUDE.md"
-  "$HOME/.codex/AGENTS.md"
-  "$HOME/.hermes/SOUL.md"
-  "$HOME/.hermes/memories"
-)
-# Test each candidate rather than passing a glob. import-memory drops a missing
-# directory silently, but an unmatched glob keeps its literal '*' through path
-# selection and is only rejected later, as an unreadable-path skip on every run.
-# A profile need not have both, and an empty memories/ is normal (togepicoframe
-# has one today); import-memory sweeps *.md, so the .lock files beside them and
-# the credentials in the profile root are never candidates.
-for profile_dir in "$HOME/.hermes/profiles"/*/; do
-  profile_dir="${profile_dir%/}"
-  [[ -f "$profile_dir/SOUL.md" ]] && MEMORY_PATHS+=("$profile_dir/SOUL.md")
-  [[ -d "$profile_dir/memories" ]] && MEMORY_PATHS+=("$profile_dir/memories")
-done
+# 4. Agent memory/instruction files (paths are collected above).
 echo "import-memory paths: ${#MEMORY_PATHS[@]}"
 
 "$PY" -m ocbrain.cli --db "$DB" import-memory \
   "${MEMORY_PATHS[@]}" \
   --project "$SYNC_PROJECT" --privacy-scope "$SYNC_PRIVACY_SCOPE" --evidence-only
+
+if [[ -n "${OCBRAIN_RECEIPT_ROOTS:-}" ]]; then
+  run_with_budget "$HARVEST_BUDGET_SECONDS" \
+    "$PY" "$REPO/scripts/receipt-closeouts.py" --db "$DB" \
+    --roots "$OCBRAIN_RECEIPT_ROOTS" \
+    --project "${OCBRAIN_RECEIPT_PROJECT:-workspace}" \
+    --since-days "${OCBRAIN_RECEIPT_SINCE_DAYS:-7}" \
+    || echo "receipt-closeouts failed; continuing"
+fi
 
 # 5. Reconcile core projections. `sync` refuses past its --max-events bound
 # rather than doing partial work, and a cold or long-delayed harvest can enqueue

@@ -18,8 +18,9 @@ from ocbrain.core_v1 import (
     record_core_v1_evidence,
 )
 from ocbrain.db import connect
+from ocbrain.ids import stable_id
 from ocbrain.mcp import tool_list
-from ocbrain.mcp_v1 import build_context_v1, proposals_v1
+from ocbrain.mcp_v1 import build_context_v1, correct_v1, proposals_v1
 from ocbrain.scope import ScopeContext, ScopeTag
 
 APPROVER = "human:test-approver"
@@ -612,4 +613,51 @@ def test_hosted_approval_verbs_are_cli_only(tmp_path):
     assert "hosted-queue" not in names
     assert "hosted-approve" not in names
     assert is_core_v1(conn)
+    conn.close()
+
+
+def test_hosted_approve_refuses_retracted_belief_and_continues(tmp_path, capsys):
+    conn = _seed_core(tmp_path)
+    bad_body = "Retracted belief fixture body."
+    bad = _seed_evidence(conn, body=bad_body)
+    good = _seed_evidence(conn, body="Approvable fixture body.")
+    correct_v1(
+        conn,
+        layer="belief",
+        target=stable_id("belief", bad_body, "project:coframe"),
+        op="retract",
+        body="withdrawn",
+        actor="human:test",
+        hard=True,
+    )
+    conn.commit()
+    events_before = _event_count(conn)
+    db = str(tmp_path / "hosted-queue.sqlite")
+    rc, payload = _run(
+        capsys,
+        db,
+        [
+            "hosted-approve",
+            "--all-from-queue",
+            "--project",
+            "coframe",
+            "--approved-by",
+            APPROVER,
+        ],
+    )
+    assert rc == 0, payload
+    assert [entry["evidence_id"] for entry in payload["approved"]] == [good]
+    assert [(e["evidence_id"], e["reason"]) for e in payload["refused"]] == [
+        (bad, "belief_not_approvable")
+    ]
+    assert "cannot approve" in payload["refused"][0]["detail"]
+    kinds = [
+        row[0]
+        for row in conn.execute(
+            "SELECT kind FROM brain_events ORDER BY event_seq LIMIT -1 OFFSET ?",
+            (events_before,),
+        )
+    ]
+    assert kinds.count("compilation_proposed") == 1
+    assert kinds.count("compilation_decided") == 1
     conn.close()

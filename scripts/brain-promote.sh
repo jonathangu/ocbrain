@@ -72,10 +72,21 @@ CURATE_ARGS=(
   --max-tokens "$PROMOTE_MAX_TOKENS"
   --apply
 )
+[[ -n "${OCBRAIN_PROMOTE_BASE_URL:-}" ]] && CURATE_ARGS+=(--base-url "$OCBRAIN_PROMOTE_BASE_URL")
+[[ -n "${OCBRAIN_PROMOTE_MODEL:-}" ]] && CURATE_ARGS+=(--model "$OCBRAIN_PROMOTE_MODEL")
+[[ -n "${OCBRAIN_PROMOTE_API_KEY_ENV:-}" ]] && CURATE_ARGS+=(--api-key-env "$OCBRAIN_PROMOTE_API_KEY_ENV")
+[[ -n "${OCBRAIN_PROMOTE_ENV_FILE:-}" ]] && CURATE_ARGS+=(--env-file "$OCBRAIN_PROMOTE_ENV_FILE")
+
+MANIFEST_APPLY_ARGS=(curated-apply --actor "${OCBRAIN_PROMOTE_MANIFEST_ACTOR:-brain-promote}")
+[[ "${OCBRAIN_PROMOTE_MANIFEST_ALLOW_HOSTED:-}" == "1" ]] && MANIFEST_APPLY_ARGS+=(--allow-hosted-egress)
 
 # Side-effect-free probe for deterministic tests of the real shell expansion.
 if [[ "${1:-}" == "--print-curate-argv" ]]; then
   printf '%s\0' "${CURATE_ARGS[@]}"
+  exit 0
+fi
+if [[ "${1:-}" == "--print-manifest-apply-argv" ]]; then
+  printf '%s\0' "${MANIFEST_APPLY_ARGS[@]}"
   exit 0
 fi
 
@@ -175,6 +186,19 @@ fi
 run_with_budget "$BUDGET_SECONDS" \
   "${CURATE_ARGS[@]}" \
   || echo "curate step failed or was capped; continuing with retirement"
+
+if [[ -n "${OCBRAIN_PROMOTE_MANIFEST_CMDS:-}" ]]; then
+  IFS=: read -r -a manifest_cmds <<< "$OCBRAIN_PROMOTE_MANIFEST_CMDS"
+  for manifest_cmd in "${manifest_cmds[@]}"; do
+    [[ -n "$manifest_cmd" ]] || continue
+    if ! manifest_path="$("$manifest_cmd" | tail -n 1)" || [[ -z "$manifest_path" ]]; then
+      echo "manifest command failed: $manifest_cmd; continuing"
+      continue
+    fi
+    "$PY" -m ocbrain.cli --db "$DB" "${MANIFEST_APPLY_ARGS[@]}" "$manifest_path" \
+      || echo "curated-apply failed for $manifest_path; continuing"
+  done
+fi
 
 # 2. Retire. Reported either way; only applied when explicitly enabled.
 hygiene_args=(--db "$DB" hygiene $HYGIENE_CLASSES)
